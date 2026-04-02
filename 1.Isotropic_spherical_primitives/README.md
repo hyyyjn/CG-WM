@@ -18,3 +18,29 @@ train.py를 수정하지 않은 이유
 
 train.py는 학습 루프를 실행할 뿐이고, Gaussian의 scale 표현이나 rotation optimizer 설정은 모두 scene/gaussian\_model.py 내부에서 처리된다. 따라서 이번 Stage I 수정은 모델 정의만 바꾸면 충분했기 때문에 train.py는 건드리지 않았다
 
+
+
+
+
+Environment Setup
+
+본 구현은 Windows 환경에서 Python 3.10, PyTorch CUDA 11.8, CUDA Toolkit 11.8, Visual Studio 2022 C++ Build Tools를 기준으로 구성하였다. 학습을 위해서는 CUDA extension 모듈인 simple-knn, fused-ssim, diff-gaussian-rasterization이 정상적으로 설치되어 있어야 하며, 이 과정은 Visual Studio의 x64 C++ 빌드 환경이 올바르게 잡힌 상태에서 진행되어야 한다.
+
+
+
+Dataset Preparation
+
+https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/
+
+데이터셋은 COLMAP 형식을 사용한다. 하나의 장면 폴더 안에 images 디렉터리와 sparse/0 디렉터리가 함께 존재해야 하며, 본 실험에서는 tandt\_db/tandt/train 장면을 사용하였다. 이 구조가 준비되어 있으면 train.py를 통해 바로 학습을 수행할 수 있다.
+
+
+
+Training and Output
+
+학습 결과는 output 폴더 아래에 저장되며, 중간 iteration과 최종 iteration의 Gaussian point cloud가 함께 기록된다. 학습이 끝난 뒤 생성되는 point\_cloud.ply 파일은 Gaussian 결과를 직접 확인할 수 있는 핵심 출력이다. 이 파일은 SuperSplat과 같은 splat viewer에서 열어 Gaussian 분포를 시각적으로 확인할 수 있다.
+
+
+
+한편 render.py는 Gaussian 입자 자체를 보여주는 도구가 아니라, 학습된 Gaussian을 이용해 최종 장면 이미지를 렌더링하는 용도이다. 따라서 Gaussian의 공간적 분포를 직접 보고 싶다면 point\_cloud.ply를 viewer로 여는 방식이 더 적절하다.
+
