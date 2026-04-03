@@ -1,1 +1,0 @@
-Namespace(data_device='cuda', depths='', eval=True, images='images', model_path='output/lego_test_joint_full', resolution=-1, sh_degree=3, source_path='/home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego', train_test_exp=False, white_background=False)
