@@ -49,11 +49,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-    else:
-        gaussians.training_setup(opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -178,30 +177,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-
-                if opt.joint_optimization:
-                    # Every iteration: 1 geometry step + 1 appearance step
-                    gaussians.geom_optimizer.step()
-                    gaussians.app_optimizer.step()
-                    gaussians.geom_optimizer.zero_grad(set_to_none=True)
-                    gaussians.app_optimizer.zero_grad(set_to_none=True)
-                elif opt.alternating_optimization:
-                    cycle = opt.geometry_iters + opt.appearance_iters
-                    in_geom = ((iteration - 1) % cycle) < opt.geometry_iters
-                    if in_geom:
-                        gaussians.geom_optimizer.step()
-                        gaussians.geom_optimizer.zero_grad(set_to_none=True)
-                    else:
-                        gaussians.app_optimizer.step()
-                        gaussians.app_optimizer.zero_grad(set_to_none=True)
+                if use_sparse_adam:
+                    visible = radii > 0
+                    gaussians.optimizer.step(visible, radii.shape[0])
+                    gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
-                    if use_sparse_adam:
-                        visible = radii > 0
-                        gaussians.optimizer.step(visible, radii.shape[0])
-                        gaussians.optimizer.zero_grad(set_to_none = True)
-                    else:
-                        gaussians.optimizer.step()
-                        gaussians.optimizer.zero_grad(set_to_none = True)
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

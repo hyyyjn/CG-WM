@@ -105,6 +105,15 @@ python train.py \
   - SAM2 시도 후 롤백 완료
   - 체크포인트 재개 시 optimizer/exposure 상태 복구
 
+- `scene/gaussian_model.py`:
+  - isotropic spherical Gaussian 제약 추가
+  - `get_scaling`: 3축 scale을 평균값으로 묶어 `(s, s, s)` 형태로 사용
+  - `get_rotation`: 학습된 rotation 대신 identity quaternion 사용
+  - `get_covariance`: isotropic scaling + identity rotation 기준으로 계산
+  - `densify_and_split`: 새로 생성되는 Gaussian도 동일한 sphere constraint 유지
+  - geometry/appearance optimizer 분리
+  - alternating/joint 모드에서도 `feature_lr`, `opacity_lr`, `scaling_lr`를 각각 유지
+
 ## 검증
 1. 학습 및 렌더 실행 후 `output/{model}/test/ours_{iter}/renders` 폴더 확인
 2. PSNR 계산 스크립트: `tools/` 미리 작성 가능
@@ -168,7 +177,15 @@ python gaussian_initiailization/train.py \
 - `2026-04-03`: alternating optimization 구현 및 시범 적용
 - `2026-04-03`: SAM2 추가 시도 후 롤백 완료
 - `2026-04-03`: README 정리 (CG-WM 추가 안내)
+- `2026-04-06`: scene initialization 실험을 위해 Gaussian의 회전을 고정하고 등방성 스케일을 적용하도록 수정
 
+
+## 주의
+현재 구현은 ContactGaussian-WM의 scene initialization 아이디어를 참고한 실험 버전이며,
+논문의 decoupled optimization 전체를 완전히 재현한 상태는 아닙니다.
+현재 단계에서는 isotropic spherical Gaussian constraint를 우선 반영했습니다.
 ---
 
 추가적으로 구조적 개선(클램프 대신 `sh2rgb * C0 + 0.5`, `loss color regularization`)을 바로 코드에서 적용 가능합니다.
+
+

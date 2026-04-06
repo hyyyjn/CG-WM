@@ -97,10 +97,6 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        self.alternating_optimization = False
-        self.geometry_iters = 100
-        self.appearance_iters = 100
-        self.joint_optimization = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

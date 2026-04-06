@@ -28,10 +28,29 @@ except:
     pass
 
 class GaussianModel:
+    # add function
+    @staticmethod
+    def _expand_isotropic_scaling(scaling):
+        isotropic = scaling.mean(dim=1, keepdim=True)
+        return isotropic.repeat(1, 3)
+
+    # add function
+    @staticmethod
+    def _identity_rotation(num_points, device):
+        rots = torch.zeros((num_points, 4), device=device)
+        rots[:, 0] = 1
+        return rots
+
+    # add function
+    def _get_isotropic_scaling(self):
+        return self._expand_isotropic_scaling(self.scaling_activation(self._scaling))
 
     def setup_functions(self):
+        # edit this
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            isotropic_scaling = self._expand_isotropic_scaling(scaling_modifier * scaling)
+            identity_rotation = self._identity_rotation(isotropic_scaling.shape[0], isotropic_scaling.device)
+            L = build_scaling_rotation(isotropic_scaling, identity_rotation)
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
@@ -57,69 +76,31 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._exposure = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
-        self.geom_optimizer = None
-        self.app_optimizer = None
-        self.exposure_optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.exposure_mapping = {}
-        self.pretrained_exposures = None
         self.setup_functions()
 
     def capture(self):
-        return {
-            "active_sh_degree": self.active_sh_degree,
-            "xyz": self._xyz,
-            "features_dc": self._features_dc,
-            "features_rest": self._features_rest,
-            "scaling": self._scaling,
-            "rotation": self._rotation,
-            "opacity": self._opacity,
-            "exposure": self._exposure,
-            "max_radii2D": self.max_radii2D,
-            "xyz_gradient_accum": self.xyz_gradient_accum,
-            "denom": self.denom,
-            "spatial_lr_scale": self.spatial_lr_scale,
-            "exposure_mapping": self.exposure_mapping,
-            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
-            "geom_optimizer": self.geom_optimizer.state_dict() if self.geom_optimizer is not None else None,
-            "app_optimizer": self.app_optimizer.state_dict() if self.app_optimizer is not None else None,
-            "exposure_optimizer": self.exposure_optimizer.state_dict() if self.exposure_optimizer is not None else None,
-        }
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            self.xyz_gradient_accum,
+            self.denom,
+            self.optimizer.state_dict(),
+            self.spatial_lr_scale,
+        )
     
     def restore(self, model_args, training_args):
-        if isinstance(model_args, dict):
-            self.active_sh_degree = model_args["active_sh_degree"]
-            self._xyz = model_args["xyz"]
-            self._features_dc = model_args["features_dc"]
-            self._features_rest = model_args["features_rest"]
-            self._scaling = model_args["scaling"]
-            self._rotation = model_args["rotation"]
-            self._opacity = model_args["opacity"]
-            self._exposure = model_args.get("exposure", self._exposure)
-            self.max_radii2D = model_args["max_radii2D"]
-            self.xyz_gradient_accum = model_args["xyz_gradient_accum"]
-            self.denom = model_args["denom"]
-            self.spatial_lr_scale = model_args["spatial_lr_scale"]
-            self.exposure_mapping = model_args.get("exposure_mapping", self.exposure_mapping)
-
-            self.training_setup(training_args)
-
-            if model_args.get("optimizer") is not None:
-                self.optimizer.load_state_dict(model_args["optimizer"])
-            if model_args.get("geom_optimizer") is not None:
-                self.geom_optimizer.load_state_dict(model_args["geom_optimizer"])
-            if model_args.get("app_optimizer") is not None:
-                self.app_optimizer.load_state_dict(model_args["app_optimizer"])
-            if model_args.get("exposure_optimizer") is not None:
-                self.exposure_optimizer.load_state_dict(model_args["exposure_optimizer"])
-            return
-
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -137,14 +118,15 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    # edit this
     @property
-    # replicate 3-axis scales
     def get_scaling(self):
-        return self.scaling_activation(self._scaling).repeat(1, 3)
+        return self._get_isotropic_scaling()
     
+    # edit this
     @property
     def get_rotation(self):
-        return self.rotation_activation(self._rotation)
+        return self._identity_rotation(self._rotation.shape[0], self._rotation.device)
     
     @property
     def get_xyz(self):
@@ -178,8 +160,9 @@ class GaussianModel:
         else:
             return self.pretrained_exposures[image_name]
     
+    # edit this
     def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self.get_rotation)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -195,9 +178,8 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        # make initial scale 1 radius and set rotation identity quaternion
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[..., None]
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
@@ -219,40 +201,24 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.feature_lr = training_args.feature_lr
-        self.feature_rest_lr = training_args.feature_lr / 20.0
-        self.opacity_lr = training_args.opacity_lr
-        self.scaling_lr = training_args.scaling_lr
 
-        l_all = [
+        l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            # frozen rotation
-            {'params': [self._rotation], 'lr': 0.0, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        self.geom_optimizer = torch.optim.Adam([
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-        ], eps=1e-15)
-
-        self.app_optimizer = torch.optim.Adam([
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-        ], eps=1e-15)
-
         if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l_all, lr=0.0, eps=1e-15)
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         elif self.optimizer_type == "sparse_adam":
             try:
-                self.optimizer = SparseGaussianAdam(l_all, lr=0.0, eps=1e-15)
+                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
                 # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l_all, lr=0.0, eps=1e-15)
+                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
@@ -272,42 +238,11 @@ class GaussianModel:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 
-        geo_lr = self.xyz_scheduler_args(iteration)
-        for optimizer in (self.optimizer, self.geom_optimizer, self.app_optimizer):
-            if optimizer is None:
-                continue
-            for param_group in optimizer.param_groups:
-                if param_group["name"] == "xyz":
-                    param_group['lr'] = geo_lr
-                elif param_group["name"] == "scaling":
-                    param_group['lr'] = self.scaling_lr
-                elif param_group["name"] == "f_dc":
-                    param_group['lr'] = self.feature_lr
-                elif param_group["name"] == "f_rest":
-                    param_group['lr'] = self.feature_rest_lr
-                elif param_group["name"] == "opacity":
-                    param_group['lr'] = self.opacity_lr
-        return geo_lr
-
-    def _point_optimizers(self):
-        return [optimizer for optimizer in (self.optimizer, self.geom_optimizer, self.app_optimizer) if optimizer is not None]
-
-    def _refresh_split_optimizer_params(self):
-        if self.geom_optimizer is not None:
-            for group in self.geom_optimizer.param_groups:
-                if group["name"] == "xyz":
-                    group["params"] = [self._xyz]
-                elif group["name"] == "scaling":
-                    group["params"] = [self._scaling]
-
-        if self.app_optimizer is not None:
-            for group in self.app_optimizer.param_groups:
-                if group["name"] == "f_dc":
-                    group["params"] = [self._features_dc]
-                elif group["name"] == "f_rest":
-                    group["params"] = [self._features_rest]
-                elif group["name"] == "opacity":
-                    group["params"] = [self._opacity]
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                lr = self.xyz_scheduler_args(iteration)
+                param_group['lr'] = lr
+                return lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -317,8 +252,7 @@ class GaussianModel:
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
-        # keep format 3 axis
-        for i in range(3):
+        for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
@@ -332,8 +266,7 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        # make (N,3)
-        scale = self.get_scaling.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
@@ -348,7 +281,6 @@ class GaussianModel:
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
-        self._refresh_split_optimizer_params()
 
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
@@ -398,58 +330,42 @@ class GaussianModel:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        # load 3 axis-scale -> make 1 radius (using mean) 
-        scales = np.mean(scales, axis=1, keepdims=True)
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-        # make quaternion (1,0,0,0)
-        self._rotation.data.zero_()
-        self._rotation.data[:, 0] = 1
 
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
-        new_param = nn.Parameter(tensor.requires_grad_(True))
-        for optimizer in self._point_optimizers():
-            for group in optimizer.param_groups:
-                if group["name"] != name:
-                    continue
+        for group in self.optimizer.param_groups:
+            if group["name"] == name:
+                stored_state = self.optimizer.state.get(group['params'][0], None)
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                old_param = group["params"][0]
-                stored_state = optimizer.state.get(old_param, None)
-                if stored_state is not None:
-                    stored_state["exp_avg"] = torch.zeros_like(tensor)
-                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-                    del optimizer.state[old_param]
-                    group["params"][0] = new_param
-                    optimizer.state[new_param] = stored_state
-                else:
-                    group["params"][0] = new_param
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = new_param
-        self._refresh_split_optimizer_params()
+                optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
-        for name in ("xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"):
-            old_param = getattr(self, f"_{name}" if name != "f_dc" and name != "f_rest" else {"f_dc": "_features_dc", "f_rest": "_features_rest"}[name])
-            new_param = nn.Parameter(old_param[mask].requires_grad_(True))
-            for optimizer in self._point_optimizers():
-                for group in optimizer.param_groups:
-                    if group["name"] != name:
-                        continue
-                    stored_state = optimizer.state.get(group['params'][0], None)
-                    if stored_state is not None:
-                        stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                        stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
-                        del optimizer.state[group['params'][0]]
-                        group["params"][0] = new_param
-                        optimizer.state[new_param] = stored_state
-                    else:
-                        group["params"][0] = new_param
-            optimizable_tensors[name] = new_param
+        for group in self.optimizer.param_groups:
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
     def prune_points(self, mask):
@@ -463,8 +379,6 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self._refresh_split_optimizer_params()
-
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -473,24 +387,24 @@ class GaussianModel:
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
-        for name, extension_tensor in tensors_dict.items():
-            old_param = getattr(self, f"_{name}" if name != "f_dc" and name != "f_rest" else {"f_dc": "_features_dc", "f_rest": "_features_rest"}[name])
-            new_param = nn.Parameter(torch.cat((old_param, extension_tensor), dim=0).requires_grad_(True))
-            for optimizer in self._point_optimizers():
-                for group in optimizer.param_groups:
-                    if group["name"] != name:
-                        continue
-                    assert len(group["params"]) == 1
-                    stored_state = optimizer.state.get(group['params'][0], None)
-                    if stored_state is not None:
-                        stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                        stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-                        del optimizer.state[group['params'][0]]
-                        group["params"][0] = new_param
-                        optimizer.state[new_param] = stored_state
-                    else:
-                        group["params"][0] = new_param
-            optimizable_tensors[name] = new_param
+        for group in self.optimizer.param_groups:
+            assert len(group["params"]) == 1
+            extension_tensor = tensors_dict[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
@@ -509,13 +423,12 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self._refresh_split_optimizer_params()
-
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    # edit this
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -528,11 +441,10 @@ class GaussianModel:
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        rots = build_rotation(self.get_rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        # replicate raqius to actual scale
-        new_scaling = self.scaling_inverse_activation(self.scaling_activation(self._scaling[selected_pts_mask]).repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_rotation = self._identity_rotation(selected_pts_mask.sum() * N, self._rotation.device)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
