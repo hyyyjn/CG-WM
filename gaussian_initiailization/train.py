@@ -68,6 +68,10 @@ except:
 GEOMETRY_SCALE_REG_WEIGHT = 1e-4
 APPEARANCE_OPACITY_REG_WEIGHT = 1e-4
 
+def append_jsonl(path, payload):
+    with open(path, "a") as f:
+        f.write(json.dumps(payload) + "\n")
+
 def zero_active_optimizers(gaussians, use_decoupled_optimization):
     if use_decoupled_optimization:
         gaussians.geometry_optimizer.zero_grad(set_to_none=True)
@@ -109,20 +113,51 @@ def compute_sam_feature_loss(viewpoint_cam, gaussians, pipe, bg, separate_sh, we
     if weight <= 0 or viewpoint_cam.sam_feature_map is None:
         return None, 0.0
 
-    geometry_feature_render = render(
-        viewpoint_cam,
-        gaussians,
-        pipe,
-        bg,
-        override_color=gaussians.get_geometry_features,
-        use_trained_exp=False,
-        separate_sh=separate_sh,
-        screenspace_points=shared_screenspace_points,
-    )["render"]
-
     target_feature_map = viewpoint_cam.sam_feature_map
     feature_mask = viewpoint_cam.alpha_mask
-    geometry_feature_loss = weight * l1_loss(geometry_feature_render * feature_mask, target_feature_map * feature_mask)
+    geometry_features = gaussians.get_geometry_features
+
+    common_channels = min(int(geometry_features.shape[1]), int(target_feature_map.shape[0]))
+    if common_channels <= 0:
+        return None, 0.0
+
+    total_feature_loss = torch.tensor(0.0, device=geometry_features.device)
+    num_chunks = 0
+    for channel_start in range(0, common_channels, 3):
+        channel_end = min(channel_start + 3, common_channels)
+        gaussian_chunk = geometry_features[:, channel_start:channel_end]
+        target_chunk = target_feature_map[channel_start:channel_end, ...]
+        valid_channels = channel_end - channel_start
+
+        if valid_channels < 3:
+            gaussian_chunk = torch.cat(
+                [gaussian_chunk, gaussian_chunk[:, -1:].repeat(1, 3 - valid_channels)],
+                dim=1,
+            )
+            target_chunk = torch.cat(
+                [target_chunk, target_chunk[-1:, ...].repeat(3 - valid_channels, 1, 1)],
+                dim=0,
+            )
+
+        geometry_feature_render = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            bg,
+            override_color=gaussian_chunk,
+            use_trained_exp=False,
+            separate_sh=separate_sh,
+            screenspace_points=shared_screenspace_points,
+        )["render"][:valid_channels, ...]
+
+        chunk_loss = l1_loss(
+            geometry_feature_render * feature_mask,
+            target_chunk[:valid_channels, ...] * feature_mask,
+        )
+        total_feature_loss = total_feature_loss + chunk_loss
+        num_chunks += 1
+
+    geometry_feature_loss = weight * (total_feature_loss / float(max(num_chunks, 1)))
     return geometry_feature_loss, geometry_feature_loss.item()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args=None):
@@ -132,7 +167,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, full_args if full_args is not None else dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        opt.optimizer_type,
+        geometry_feature_dim=getattr(dataset, "geometry_feature_dim", 3),
+    )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -155,6 +194,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
     ema_geometry_loss_for_log = 0.0
     ema_appearance_loss_for_log = 0.0
+    densification_log_path = os.path.join(dataset.model_path, "densification_stats.jsonl")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -219,6 +259,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         densify_visibility_filter = None
         densify_radii = None
         densify_viewspace_points = None
+        densification_summary = None
 
         if use_decoupled_optimization:
             depth_weight_value = depth_l1_weight(iteration)
@@ -332,7 +373,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, densify_radii)
+                    densification_summary = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, densify_radii)
+                    densification_summary.update({
+                        "iteration": int(iteration),
+                        "sam_feature_weight": float(opt.sam_feature_weight),
+                        "geometry_feature_loss": float(geometry_feature_loss_value),
+                        "geometry_loss": float(geometry_loss_value),
+                        "appearance_loss": float(appearance_loss_value),
+                        "mode": "joint" if opt.joint_optimization else ("alternating" if opt.alternating_optimization else "baseline"),
+                    })
+                    append_jsonl(densification_log_path, densification_summary)
+                    if tb_writer:
+                        tb_writer.add_scalar("densification/visible_points", densification_summary["visible_points"], iteration)
+                        tb_writer.add_scalar("densification/grad_mean", densification_summary["grad_mean"], iteration)
+                        tb_writer.add_scalar("densification/grad_max", densification_summary["grad_max"], iteration)
+                        tb_writer.add_scalar("densification/clone_selected", densification_summary["clone_selected"], iteration)
+                        tb_writer.add_scalar("densification/split_selected", densification_summary["split_selected"], iteration)
+                        tb_writer.add_scalar("densification/pruned", densification_summary["pruned"], iteration)
+                        tb_writer.add_scalar("densification/net_new_points", densification_summary["net_new_points"], iteration)
+                        tb_writer.add_scalar("densification/geometry_feature_loss", densification_summary["geometry_feature_loss"], iteration)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

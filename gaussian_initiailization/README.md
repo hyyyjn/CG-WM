@@ -8,6 +8,7 @@
 - geometry / appearance loss 분리
 - image-wise exposure optimization
 - SAM2 feature supervision 경로
+- richer SAM feature supervision
 
 폴더 이름은 현재 저장소 기준으로 `gaussian_initiailization`입니다.
 
@@ -28,6 +29,8 @@
 - exposure optimizer 분리 및 checkpoint 복구
 - 구 decoupled checkpoint 호환 resume
 - SAM2 feature map `.npy` 로딩 및 geometry step supervision
+- configurable geometry feature dimension (`--geometry_feature_dim`)
+- configurable SAM feature extraction channel count (`--output_channels`)
 - `--disable_viewer` 사용 시 viewer import 실패 fallback
 - Gaussian별 `object_id` 저장 / 복구 / PLY round-trip
 - object-only render (`--object_id`)
@@ -36,6 +39,8 @@
 - physics stage 연결용 intermediate export
 - rigid-friendly body / collision / mass metadata export
 - 외부 instance segmentation 결과 normalize helper
+- densification statistics logging (`densification_stats.jsonl`)
+- variant / densification 비교용 `compare_variants.py`
 
 현재 저장소 기준으로는 이 디렉터리가 "scene initialization + object grouping + rigid-friendly export"까지 담당합니다.
 즉 rigid-body dynamics 자체는 아직 없지만, 그 직전 단계까지는 코드와 입출력 경로가 연결된 상태입니다.
@@ -50,7 +55,7 @@
 - `metrics.py`
   - PSNR / SSIM / LPIPS 평가
 - `extract_sam2_features.py`
-  - SAM2 image encoder feature를 `.npy`로 저장하는 전처리 스크립트
+  - SAM2 image encoder feature를 configurable channel count `.npy`로 저장하는 전처리 스크립트
 - `assign_object_ids.py`
   - 외부 object id 배열을 Gaussian에 붙여 grouped model로 저장
 - `auto_assign_object_ids.py`
@@ -118,8 +123,10 @@
 - geometry loss
   - reconstruction term
   - optional depth loss
-  - scale / opacity regularization
+  - scale regularization
   - optional SAM2 feature loss
+- appearance regularization
+  - opacity regularization
 
 로그에는 아래 항목이 분리되어 기록됩니다.
 
@@ -137,6 +144,8 @@ SAM2 feature supervision은 현재 구현되어 있습니다.
   - `sam_features/test/*.npy`
   - `sam_features/val/*.npy`
 - geometry step에서 Gaussian의 geometry feature를 렌더한 뒤 target feature와 L1로 비교합니다.
+- geometry feature는 현재 multi-chunk supervision을 지원합니다.
+  - 즉 3채널만 쓰는 대신, 더 높은 feature 차원을 3채널 chunk로 나눠 여러 번 render/loss를 계산할 수 있습니다.
 - 현재 구현에서는 geometry RGB render와 geometry feature render가 같은 screen-space gradient를 공유하도록 연결해,
   SAM feature loss가 densification 통계에도 간접적으로 반영되도록 수정했습니다.
 - `--sam_feature_normalization`으로 feature preprocessing을 제어할 수 있습니다.
@@ -304,6 +313,7 @@ conda run -n sam2cpu python -c "import torch, sam2; print(torch.__version__); pr
 conda run -n sam2cpu python gaussian_initiailization/extract_sam2_features.py \
   --source_path /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego \
   --output_dir sam_features_sam2 \
+  --output_channels 9 \
   --splits train test val
 ```
 
@@ -320,6 +330,7 @@ conda run -n gaussian_splatting python gaussian_initiailization/train.py \
   --source_path /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego \
   --sam_features sam_features_sam2 \
   --sam_feature_weight 0.1 \
+  --geometry_feature_dim 9 \
   --model_path gaussian_initiailization/output/lego_sam2_10k \
   --iterations 10000 \
   --resolution 8 \
@@ -367,6 +378,14 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 - `baseline`, `joint`, `alternating` 짧은 CUDA smoke test 성공
 - `lego_sam2_10k` 모델 render 성공
 - test view 200장 저장 확인
+- richer feature supervision smoke test 성공
+  - `geometry_feature_dim=3`, `20 iter` 학습 + render
+  - `geometry_feature_dim=9`, `20 iter` 학습 + render
+  - `geometry_feature_dim=9`, `650 iter` 학습 + densification log + render
+- richer feature supervision 5k 비교 실험 성공
+  - `geometry_feature_dim=3`, `5000 iter` 학습 + render
+  - `geometry_feature_dim=9`, `5000 iter` 학습 + render
+  - 두 실험 모두 train 100장 / test 200장 render 저장 확인
 - 현재 코드가 직접 만든 decoupled checkpoint self-resume 성공
 - 예전 decoupled checkpoint에서 빠져 있던 `f_geo` optimizer group을 이름 기반 fallback으로 복구 가능
 - `--disable_viewer`를 줬을 때 socket permission 문제 없이 학습 시작 가능
@@ -375,6 +394,9 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 
 - 모델 출력: `gaussian_initiailization/output/lego_sam2_10k`
 - render 출력: `gaussian_initiailization/output/lego_sam2_10k/test/ours_10000/renders`
+- 3채널 5k 출력: `gaussian_initiailization/output/test_geo3_5k`
+- 9채널 5k 출력: `gaussian_initiailization/output/test_geo9_5k`
+- variant 비교 smoke JSON: `gaussian_initiailization/output/test_geo_compare_smoke.json`
 
 ## 현재 코드에 있는 주요 옵션
 
@@ -385,6 +407,7 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 - `--images`
 - `--depths`
 - `--sam_features`
+- `--geometry_feature_dim`
 - `--sam_feature_normalization`
 - `--resolution`
 - `--white_background`
@@ -680,6 +703,7 @@ ContactGaussian-WM의 scene initialization 다음 단계까지 맞추려면, 현
 - `sam_features_sam2/`
 - 대용량 checkpoint
 - CUDA extension build 산출물 (`*.so`, `build/`)
+- `densification_stats.jsonl`가 들어 있는 실험 output 폴더 전체
 
 즉 GitHub에는 "코드와 실행 방법"을 올리고, 학습 결과물과 feature cache는 제외하는 구성이 적절합니다.
 

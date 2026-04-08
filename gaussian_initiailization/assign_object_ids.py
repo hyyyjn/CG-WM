@@ -40,7 +40,7 @@ if __name__ == "__main__":
     output_model_path = args.output_model_path if args.output_model_path else args.model_path
     dataset = model.extract(args)
 
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, geometry_feature_dim=getattr(dataset, "geometry_feature_dim", 3))
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
     scene.model_path = output_model_path
     dataset.model_path = output_model_path

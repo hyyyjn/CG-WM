@@ -66,10 +66,11 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", geometry_feature_dim=3):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
+        self.geometry_feature_dim = int(geometry_feature_dim)
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -120,6 +121,8 @@ class GaussianModel:
             self._features_dc = model_args["features_dc"]
             self._features_rest = model_args["features_rest"]
             self._features_geo = model_args.get("features_geo", self._features_geo)
+            if self._features_geo.numel() > 0:
+                self.geometry_feature_dim = int(self._features_geo.shape[1])
             self._object_ids = model_args.get("object_ids", self._object_ids)
             self._scaling = model_args["scaling"]
             self._rotation = model_args["rotation"]
@@ -149,6 +152,7 @@ class GaussianModel:
                 denom,
                 opt_dict,
                 self.spatial_lr_scale) = model_args
+                self.geometry_feature_dim = int(self._features_geo.shape[1])
             else:
                 (self.active_sh_degree,
                 self._xyz,
@@ -163,13 +167,14 @@ class GaussianModel:
                 opt_dict,
                 self.spatial_lr_scale) = model_args
                 self._features_geo = nn.Parameter(torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device).requires_grad_(True))
+                self.geometry_feature_dim = 3
             geometry_opt_dict = None
             appearance_opt_dict = None
             exposure_opt_dict = None
             saved_decoupled = False
 
         if self._features_geo.numel() == 0:
-            self._features_geo = nn.Parameter(torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device).requires_grad_(True))
+            self._features_geo = nn.Parameter(torch.zeros((self._xyz.shape[0], self.geometry_feature_dim), device=self._xyz.device).requires_grad_(True))
         if self._object_ids.numel() == 0:
             self._object_ids = torch.zeros((self._xyz.shape[0],), dtype=torch.int32, device=self._xyz.device)
 
@@ -267,7 +272,7 @@ class GaussianModel:
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_geo = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 3), device="cuda").requires_grad_(True))
+        self._features_geo = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], self.geometry_feature_dim), device="cuda").requires_grad_(True))
         self._object_ids = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.int32, device="cuda")
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
@@ -498,8 +503,9 @@ class GaussianModel:
             features_geo = np.zeros((xyz.shape[0], len(geo_f_names)))
             for idx, attr_name in enumerate(geo_f_names):
                 features_geo[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            self.geometry_feature_dim = int(features_geo.shape[1])
         else:
-            features_geo = np.zeros((xyz.shape[0], 3), dtype=np.float32)
+            features_geo = np.zeros((xyz.shape[0], self.geometry_feature_dim), dtype=np.float32)
 
         if "object_id" in plydata.elements[0].data.dtype.names:
             object_ids = np.asarray(plydata.elements[0]["object_id"]).astype(np.int32)
@@ -639,6 +645,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        num_selected = int(selected_pts_mask.sum().item())
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -658,12 +665,18 @@ class GaussianModel:
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
+        return {
+            "selected": num_selected,
+            "created": int(num_selected * N),
+            "pruned_originals": num_selected,
+        }
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        num_selected = int(selected_pts_mask.sum().item())
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -677,25 +690,51 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_geo, new_object_ids, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        return {
+            "selected": num_selected,
+            "created": num_selected,
+        }
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        point_count_before = int(self.get_xyz.shape[0])
+        valid_grad_mask = (self.denom.squeeze(-1) > 0)
+        visible_points = int(valid_grad_mask.sum().item())
+        grad_values = grads.squeeze(-1) if grads.ndim > 1 else grads
+        grad_mean = float(grad_values[valid_grad_mask].mean().item()) if visible_points > 0 else 0.0
+        grad_max = float(grad_values[valid_grad_mask].max().item()) if visible_points > 0 else 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        clone_stats = self.densify_and_clone(grads, max_grad, extent)
+        split_stats = self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        prune_count = int(prune_mask.sum().item())
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
+        point_count_after = int(self.get_xyz.shape[0])
 
         torch.cuda.empty_cache()
+        return {
+            "points_before": point_count_before,
+            "points_after": point_count_after,
+            "visible_points": visible_points,
+            "grad_mean": grad_mean,
+            "grad_max": grad_max,
+            "clone_selected": int(clone_stats["selected"]),
+            "clone_created": int(clone_stats["created"]),
+            "split_selected": int(split_stats["selected"]),
+            "split_created": int(split_stats["created"]),
+            "split_pruned_originals": int(split_stats["pruned_originals"]),
+            "pruned": prune_count,
+            "net_new_points": int(point_count_after - point_count_before),
+        }
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

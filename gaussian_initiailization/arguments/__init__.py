@@ -52,6 +52,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._depths = ""
         self.sam_features = ""
+        self.geometry_feature_dim = 3
         self.sam_feature_normalization = "none"
         self._resolution = -1
         self._white_background = False

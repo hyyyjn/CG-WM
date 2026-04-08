@@ -463,7 +463,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     dataset = model.extract(args)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, geometry_feature_dim=getattr(dataset, "geometry_feature_dim", 3))
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
 
     views_by_split = []

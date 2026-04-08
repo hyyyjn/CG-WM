@@ -62,12 +62,8 @@ class Camera(nn.Module):
         if sam_feature_map is not None:
             if sam_feature_map.ndim == 2:
                 sam_feature_map = sam_feature_map[..., None]
-            if sam_feature_map.shape[0] in (1, 3) and sam_feature_map.ndim == 3 and sam_feature_map.shape[-1] not in (1, 3):
+            if sam_feature_map.ndim == 3 and sam_feature_map.shape[0] < sam_feature_map.shape[-1]:
                 sam_feature_map = np.transpose(sam_feature_map, (1, 2, 0))
-            if sam_feature_map.shape[-1] > 3:
-                sam_feature_map = sam_feature_map[..., :3]
-            if sam_feature_map.shape[-1] == 1:
-                sam_feature_map = np.repeat(sam_feature_map, 3, axis=-1)
 
             sam_feature_map = cv2.resize(sam_feature_map, resolution, interpolation=cv2.INTER_LINEAR)
             sam_feature_map = sam_feature_map.astype(np.float32, copy=False)

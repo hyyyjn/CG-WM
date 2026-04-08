@@ -18,6 +18,8 @@
 - shared screen-space gradient 연결
 - `sam_feature_normalization` 옵션 추가
 - SAM2 feature extraction 스크립트
+- configurable `--output_channels` 기반 richer SAM feature extraction
+- configurable `--geometry_feature_dim` 기반 richer geometry feature supervision
 - Blender synthetic split-aware SAM feature loading
 - Gaussian별 `object_id` 저장 / 복구 / export
 - manual / automatic object grouping
@@ -27,30 +29,38 @@
 - rigid-friendly physics metadata export
 - 외부 instance segmentation 결과 normalize helper
 - variant 비교용 `compare_variants.py`
+- densification statistics logging (`densification_stats.jsonl`)
+- `compare_variants.py`의 densification summary 비교
+- richer feature supervision smoke / 5k train+render 검증
 
 ## P0. 지금 바로 할 것
 
-### 1. Richer SAM feature supervision
+### 1. Richer SAM feature supervision 고도화
 
-현재 geometry prior의 가장 큰 한계는 feature 표현력이 너무 약하다는 점입니다.
-지금 3채널 proxy supervision은 실험용으로는 괜찮지만, 논문 방향의 강한 geometry cue로는 부족합니다.
+기본 richer feature 경로 자체는 구현됐습니다.
+현재는 `--output_channels`, `--geometry_feature_dim`, multi-chunk supervision까지 붙어 있어서
+3채널 축약 없이 실험은 가능합니다.
+
+이제 남은 건 "더 좋은 richer feature"로 다듬는 단계입니다.
 
 필요 작업:
 
-- 더 높은 차원의 geometry feature 저장 방식 검토
 - 3채널 평균 축약 대신 fixed projection 또는 learned projection 도입
 - SAM2 feature의 multi-scale 활용 검토
-- richer feature supervision과 3채널 proxy supervision 정량 비교
+- 3채널 vs 9채널 이상의 정량 비교 리포트 정리
 
 완료 기준:
 
-- 3채널 축약 없이 richer feature supervision 실험 가능
-- feature 차원에 따른 rendering / grouping 변화 비교표 확보
+- richer feature 차원별 비교표와 추천 설정 확보
 
 ### 2. Feature-aware densification 분석
 
 shared screen-space gradient 연결은 끝났지만,
 실제로 feature loss가 split / clone / prune 판단에 얼마나 영향을 주는지는 아직 잘 안 보입니다.
+
+현재 기본 densification 통계 로그(`densification_stats.jsonl`)와
+`compare_variants.py`의 densification summary 비교는 추가되어 있습니다.
+이제는 그 로그를 더 해석하기 쉽게 만들고, 장기 실험 비교에 연결하는 단계가 남았습니다.
 
 필요 작업:
 
@@ -64,13 +74,15 @@ shared screen-space gradient 연결은 끝났지만,
 
 ### 3. 장기 비교 실험 자동화
 
-1k smoke 비교는 했지만, 5k~10k 장기 학습에서 안정적인 개선인지 아직 확인이 부족합니다.
+1k smoke 비교와 5k 3채널/9채널 train+render 검증은 했지만,
+5k~10k 장기 학습에서 안정적인 개선인지에 대한 정량 비교는 아직 부족합니다.
 
 필요 작업:
 
 - baseline / SAM-init / shared-grad 변형 비교 스크립트 확장
 - train/test PSNR뿐 아니라 SSIM / LPIPS도 함께 수집
 - checkpoint 시점별 성능 추적
+- 3채널 vs 9채널 richer feature의 장기 성능 비교 자동화
 
 완료 기준:
 

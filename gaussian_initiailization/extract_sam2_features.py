@@ -38,6 +38,12 @@ def parse_args():
         help="Which SAM2 feature map to export before reducing channels.",
     )
     parser.add_argument(
+        "--output_channels",
+        default=3,
+        type=int,
+        help="Number of channels to save after reducing the raw SAM2 feature map.",
+    )
+    parser.add_argument(
         "--splits",
         nargs="+",
         default=["train", "test", "val"],
@@ -53,21 +59,22 @@ def collect_images(split_dir: Path):
     )
 
 
-def reduce_to_three_channels(feature_map: torch.Tensor) -> np.ndarray:
+def reduce_feature_channels(feature_map: torch.Tensor, output_channels: int) -> np.ndarray:
     if feature_map.ndim != 3:
         raise ValueError(f"Expected CHW feature map, got shape {tuple(feature_map.shape)}")
+    if output_channels <= 0:
+        raise ValueError(f"output_channels must be positive, got {output_channels}")
 
     channels = feature_map.shape[0]
-    if channels == 1:
-        reduced = feature_map.repeat(3, 1, 1)
-    elif channels == 2:
-        reduced = torch.cat([feature_map, feature_map[:1]], dim=0)
-    elif channels == 3:
+    if channels == output_channels:
         reduced = feature_map
+    elif channels < output_channels:
+        repeats = int(np.ceil(output_channels / float(channels)))
+        reduced = feature_map.repeat(repeats, 1, 1)[:output_channels]
     else:
-        chunk_size = int(np.ceil(channels / 3.0))
+        chunk_size = int(np.ceil(channels / float(output_channels)))
         chunks = []
-        for chunk_idx in range(3):
+        for chunk_idx in range(output_channels):
             start = chunk_idx * chunk_size
             end = min(start + chunk_size, channels)
             if start >= channels:
@@ -119,7 +126,7 @@ def main():
             image = np.array(Image.open(image_path).convert("RGB"))
             predictor.set_image(image)
             feature_map = select_feature_map(predictor, args.feature_source)
-            reduced = reduce_to_three_channels(feature_map)
+            reduced = reduce_feature_channels(feature_map, args.output_channels)
             np.save(split_output_dir / f"{image_path.stem}.npy", reduced)
             total_saved += 1
 

@@ -86,6 +86,43 @@ def load_results_json(model_dir):
     results_path = model_dir / "results.json"
     if not results_path.exists():
         return None
+
+
+def load_densification_stats(model_dir):
+    stats_path = model_dir / "densification_stats.jsonl"
+    if not stats_path.exists():
+        return None
+
+    rows = []
+    for line in stats_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+
+    if not rows:
+        return None
+
+    last = rows[-1]
+    return {
+        "num_events": len(rows),
+        "last_iteration": last.get("iteration"),
+        "last_visible_points": last.get("visible_points"),
+        "last_grad_mean": last.get("grad_mean"),
+        "last_grad_max": last.get("grad_max"),
+        "last_clone_selected": last.get("clone_selected"),
+        "last_split_selected": last.get("split_selected"),
+        "last_pruned": last.get("pruned"),
+        "last_net_new_points": last.get("net_new_points"),
+        "last_geometry_feature_loss": last.get("geometry_feature_loss"),
+        "mean_clone_selected": float(np.mean([row.get("clone_selected", 0) for row in rows])),
+        "mean_split_selected": float(np.mean([row.get("split_selected", 0) for row in rows])),
+        "mean_pruned": float(np.mean([row.get("pruned", 0) for row in rows])),
+        "mean_net_new_points": float(np.mean([row.get("net_new_points", 0) for row in rows])),
+    }
     try:
         return json.loads(results_path.read_text())
     except Exception:
@@ -118,6 +155,7 @@ def summarize_model(model_path):
     test_summary = summarize_split(model_dir, "test")
     train_summary = summarize_split(model_dir, "train")
     results_json = load_results_json(model_dir)
+    densification_stats = load_densification_stats(model_dir)
 
     summary = {
         "model_path": str(model_dir),
@@ -130,6 +168,7 @@ def summarize_model(model_path):
         "test": test_summary,
         "train": train_summary,
         "results_json": results_json,
+        "densification": densification_stats,
     }
     return summary
 
@@ -143,6 +182,17 @@ def print_summary_table(summaries):
         "mode",
         "test_psnr",
         "train_psnr",
+        "densify_it",
+        "events",
+        "clone",
+        "split",
+        "pruned",
+        "net_new",
+        "avg_clone",
+        "avg_split",
+        "avg_pruned",
+        "avg_net",
+        "feat_loss",
     ]
     rows = []
     for item in summaries:
@@ -156,6 +206,17 @@ def print_summary_table(summaries):
                 mode,
                 "-" if item["test"] is None else f'{item["test"]["psnr_mean"]:.4f}',
                 "-" if item["train"] is None else f'{item["train"]["psnr_mean"]:.4f}',
+                "-" if item["densification"] is None or item["densification"]["last_iteration"] is None else str(item["densification"]["last_iteration"]),
+                "-" if item["densification"] is None else str(item["densification"]["num_events"]),
+                "-" if item["densification"] is None else str(item["densification"]["last_clone_selected"]),
+                "-" if item["densification"] is None else str(item["densification"]["last_split_selected"]),
+                "-" if item["densification"] is None else str(item["densification"]["last_pruned"]),
+                "-" if item["densification"] is None else str(item["densification"]["last_net_new_points"]),
+                "-" if item["densification"] is None else f'{item["densification"]["mean_clone_selected"]:.1f}',
+                "-" if item["densification"] is None else f'{item["densification"]["mean_split_selected"]:.1f}',
+                "-" if item["densification"] is None else f'{item["densification"]["mean_pruned"]:.1f}',
+                "-" if item["densification"] is None else f'{item["densification"]["mean_net_new_points"]:.1f}',
+                "-" if item["densification"] is None or item["densification"]["last_geometry_feature_loss"] is None else f'{item["densification"]["last_geometry_feature_loss"]:.4f}',
             ]
         )
 
