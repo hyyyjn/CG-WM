@@ -1,0 +1,17 @@
+.codex/
+.cuda-11.8/
+
+__pycache__/
+*.pyc
+*.pyo
+
+gaussian_initiailization/output/
+gaussian_initiailization/sam_features_sam2/
+
+gaussian_initiailization/submodules/simple-knn/build/
+gaussian_initiailization/submodules/simple-knn/**/*.so
+gaussian_initiailization/submodules/diff-gaussian-rasterization/**/*.so
+gaussian_initiailization/submodules/fused-ssim/**/*.so
+
+gaussian_initiailization/**/__pycache__/
+gaussian_initiailization/lpipsPyTorch/**/__pycache__/

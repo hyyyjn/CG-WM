@@ -13,7 +13,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -22,6 +22,30 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+class _DisabledNetworkGUI:
+    def __init__(self):
+        self.conn = None
+
+    def init(self, *args, **kwargs):
+        self.conn = None
+
+    def try_connect(self):
+        self.conn = None
+
+    def receive(self):
+        return None, None, None, None, None, None
+
+    def send(self, *args, **kwargs):
+        return None
+
+NETWORK_GUI_IMPORT_ERROR = None
+try:
+    import gaussian_renderer.network_gui as network_gui
+except Exception as e:
+    network_gui = _DisabledNetworkGUI()
+    NETWORK_GUI_IMPORT_ERROR = e
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -39,6 +63,66 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+GEOMETRY_SCALE_REG_WEIGHT = 1e-4
+GEOMETRY_OPACITY_REG_WEIGHT = 1e-4
+
+def zero_active_optimizers(gaussians, use_decoupled_optimization):
+    if use_decoupled_optimization:
+        gaussians.geometry_optimizer.zero_grad(set_to_none=True)
+        gaussians.appearance_optimizer.zero_grad(set_to_none=True)
+        gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+    else:
+        gaussians.optimizer.zero_grad(set_to_none=True)
+        gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+
+def compute_losses(render_pkg, viewpoint_cam, opt, depth_l1_weight_value):
+    image = render_pkg["render"]
+    if viewpoint_cam.alpha_mask is not None:
+        alpha_mask = viewpoint_cam.alpha_mask.cuda()
+        image = image * alpha_mask
+
+    gt_image = viewpoint_cam.original_image.cuda()
+    ll1 = l1_loss(image, gt_image)
+    if FUSED_SSIM_AVAILABLE:
+        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+    else:
+        ssim_value = ssim(image, gt_image)
+
+    appearance_loss = (1.0 - opt.lambda_dssim) * ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+    depth_loss_value = 0.0
+    depth_loss_tensor = None
+    if depth_l1_weight_value > 0 and viewpoint_cam.depth_reliable:
+        invDepth = render_pkg["depth"]
+        mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+        depth_mask = viewpoint_cam.depth_mask.cuda()
+
+        depth_loss_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+        depth_loss_tensor = depth_l1_weight_value * depth_loss_pure
+        depth_loss_value = depth_loss_tensor.item()
+
+    return image, ll1, appearance_loss, depth_loss_tensor, depth_loss_value
+
+def compute_sam_feature_loss(viewpoint_cam, gaussians, pipe, bg, separate_sh, weight, shared_screenspace_points=None):
+    if weight <= 0 or viewpoint_cam.sam_feature_map is None:
+        return None, 0.0
+
+    geometry_feature_render = render(
+        viewpoint_cam,
+        gaussians,
+        pipe,
+        bg,
+        override_color=gaussians.get_geometry_features,
+        use_trained_exp=False,
+        separate_sh=separate_sh,
+        screenspace_points=shared_screenspace_points,
+    )["render"]
+
+    target_feature_map = viewpoint_cam.sam_feature_map
+    feature_mask = viewpoint_cam.alpha_mask
+    geometry_feature_loss = weight * l1_loss(geometry_feature_render * feature_mask, target_feature_map * feature_mask)
+    return geometry_feature_loss, geometry_feature_loss.item()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -62,11 +146,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    use_decoupled_optimization = opt.alternating_optimization or opt.joint_optimization
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_geometry_loss_for_log = 0.0
+    ema_appearance_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -90,6 +177,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
+        if opt.alternating_optimization:
+            cycle_length = opt.geometry_iters + opt.appearance_iters
+            phase_position = (iteration - 1) % cycle_length
+            optimize_geometry = phase_position < opt.geometry_iters
+            optimize_appearance = not optimize_geometry
+        elif opt.joint_optimization:
+            optimize_geometry = True
+            optimize_appearance = True
+        else:
+            optimize_geometry = True
+            optimize_appearance = True
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -107,39 +206,90 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+        zero_active_optimizers(gaussians, use_decoupled_optimization)
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        Ll1 = torch.tensor(0.0, device="cuda")
+        loss = torch.tensor(0.0, device="cuda")
+        Ll1depth = 0.0
+        geometry_loss_value = 0.0
+        appearance_loss_value = 0.0
+        geometry_feature_loss_value = 0.0
+        densify_render_pkg = None
+        densify_visibility_filter = None
+        densify_radii = None
+        densify_viewspace_points = None
 
-        if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+        if use_decoupled_optimization:
+            depth_weight_value = depth_l1_weight(iteration)
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            if optimize_geometry:
+                gaussians.set_parameter_requires_grad(True, False, False)
+                geometry_render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+                geometry_image, geometry_l1, geometry_appearance_loss, geometry_depth_loss_tensor, geometry_depth_loss_value = compute_losses(
+                    geometry_render_pkg, viewpoint_cam, opt, depth_weight_value
+                )
+                geometry_feature_loss_tensor, geometry_feature_loss_value = compute_sam_feature_loss(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    bg,
+                    SPARSE_ADAM_AVAILABLE,
+                    opt.sam_feature_weight,
+                    shared_screenspace_points=geometry_render_pkg["viewspace_points"],
+                )
+                geometry_reg = GEOMETRY_SCALE_REG_WEIGHT * gaussians.get_scaling.mean() + GEOMETRY_OPACITY_REG_WEIGHT * gaussians.get_opacity.mean()
+                geometry_loss = geometry_appearance_loss + geometry_reg
+                if geometry_depth_loss_tensor is not None:
+                    geometry_loss = geometry_loss + geometry_depth_loss_tensor
+                if geometry_feature_loss_tensor is not None:
+                    geometry_loss = geometry_loss + geometry_feature_loss_tensor
+                geometry_loss.backward()
+
+                densify_render_pkg = geometry_render_pkg
+                densify_visibility_filter = geometry_render_pkg["visibility_filter"]
+                densify_radii = geometry_render_pkg["radii"]
+                densify_viewspace_points = geometry_render_pkg["viewspace_points"]
+                geometry_loss_value = geometry_loss.item()
+                Ll1depth = geometry_depth_loss_value
+                Ll1 = geometry_l1.detach()
+
+            if optimize_appearance:
+                gaussians.set_parameter_requires_grad(False, True, True)
+                appearance_render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+                _, appearance_l1, appearance_loss_tensor, _, _ = compute_losses(
+                    appearance_render_pkg, viewpoint_cam, opt, 0.0
+                )
+                appearance_loss_tensor.backward()
+
+                if densify_render_pkg is None:
+                    densify_render_pkg = appearance_render_pkg
+                    densify_visibility_filter = appearance_render_pkg["visibility_filter"]
+                    densify_radii = appearance_render_pkg["radii"]
+                    densify_viewspace_points = appearance_render_pkg["viewspace_points"]
+                    Ll1 = appearance_l1.detach()
+                appearance_loss_value = appearance_loss_tensor.item()
+
+            gaussians.set_parameter_requires_grad(True, True, True)
+            combined_loss_value = geometry_loss_value + appearance_loss_value
+            loss = torch.tensor(combined_loss_value, device="cuda")
         else:
-            ssim_value = ssim(image, gt_image)
+            gaussians.set_parameter_requires_grad(True, True, True)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            image, Ll1, appearance_loss_tensor, depth_loss_tensor, depth_loss_value = compute_losses(
+                render_pkg, viewpoint_cam, opt, depth_l1_weight(iteration)
+            )
+            loss = appearance_loss_tensor
+            if depth_loss_tensor is not None:
+                loss = loss + depth_loss_tensor
+            loss.backward()
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
-
-        loss.backward()
+            densify_render_pkg = render_pkg
+            densify_visibility_filter = render_pkg["visibility_filter"]
+            densify_radii = render_pkg["radii"]
+            densify_viewspace_points = render_pkg["viewspace_points"]
+            Ll1depth = depth_loss_value
+            geometry_loss_value = loss.item()
+            appearance_loss_value = appearance_loss_tensor.item()
 
         iter_end.record()
 
@@ -147,42 +297,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_geometry_loss_for_log = 0.4 * geometry_loss_value + 0.6 * ema_geometry_loss_for_log
+            ema_appearance_loss_for_log = 0.4 * appearance_loss_value + 0.6 * ema_appearance_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Geom": f"{ema_geometry_loss_for_log:.{7}f}",
+                    "App": f"{ema_appearance_loss_for_log:.{7}f}",
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            if tb_writer and use_decoupled_optimization:
+                tb_writer.add_scalar('train_loss_patches/geometry_loss', geometry_loss_value, iteration)
+                tb_writer.add_scalar('train_loss_patches/appearance_loss', appearance_loss_value, iteration)
+                tb_writer.add_scalar('train_loss_patches/geometry_feature_loss', geometry_feature_loss_value, iteration)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            should_update_geometry_stats = (not use_decoupled_optimization) or optimize_geometry
+            if iteration < opt.densify_until_iter and should_update_geometry_stats:
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.max_radii2D[densify_visibility_filter] = torch.max(gaussians.max_radii2D[densify_visibility_filter], densify_radii[densify_visibility_filter])
+                gaussians.add_densification_stats(densify_viewspace_points, densify_visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, densify_radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                visible = densify_radii > 0
+                if use_decoupled_optimization:
+                    if optimize_geometry:
+                        if use_sparse_adam:
+                            gaussians.geometry_optimizer.step(visible, densify_radii.shape[0])
+                        else:
+                            gaussians.geometry_optimizer.step()
+                    if optimize_appearance:
+                        if use_sparse_adam:
+                            gaussians.appearance_optimizer.step(visible, densify_radii.shape[0])
+                        else:
+                            gaussians.appearance_optimizer.step()
+                        gaussians.exposure_optimizer.step()
+                    gaussians.geometry_optimizer.zero_grad(set_to_none = True)
+                    gaussians.appearance_optimizer.zero_grad(set_to_none = True)
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 else:
-                    gaussians.optimizer.step()
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                    if use_sparse_adam:
+                        gaussians.optimizer.step(visible, radii.shape[0])
+                    else:
+                        gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -268,6 +445,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
+    if args.alternating_optimization and args.joint_optimization:
+        raise ValueError("Choose either --alternating_optimization or --joint_optimization, not both.")
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
@@ -276,7 +455,9 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    if not args.disable_viewer:
+    if not args.disable_viewer and NETWORK_GUI_IMPORT_ERROR is not None:
+        print(f"Viewer disabled because network GUI could not be initialized: {NETWORK_GUI_IMPORT_ERROR}")
+    elif not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
