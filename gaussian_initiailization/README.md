@@ -134,6 +134,14 @@ SAM2 feature supervision은 현재 구현되어 있습니다.
 - geometry step에서 Gaussian의 geometry feature를 렌더한 뒤 target feature와 L1로 비교합니다.
 - 현재 구현에서는 geometry RGB render와 geometry feature render가 같은 screen-space gradient를 공유하도록 연결해,
   SAM feature loss가 densification 통계에도 간접적으로 반영되도록 수정했습니다.
+- `--sam_feature_normalization`으로 feature preprocessing을 제어할 수 있습니다.
+  - `none`
+    - 기본값
+    - per-view min-max normalization 없이 원본 feature scale을 유지
+  - `per_view_minmax`
+    - 예전 동작 재현용
+  - `clip_0_1`
+    - feature 값을 0~1 범위로만 제한
 
 현재 loader는 예전 flat 경로도 fallback으로 지원합니다.
 
@@ -358,6 +366,7 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 - `--images`
 - `--depths`
 - `--sam_features`
+- `--sam_feature_normalization`
 - `--resolution`
 - `--white_background`
 - `--eval`
@@ -602,3 +611,21 @@ ContactGaussian-WM의 scene initialization 다음 단계까지 맞추려면, 현
 즉 GitHub에는 "코드와 실행 방법"을 올리고, 학습 결과물과 feature cache는 제외하는 구성이 적절합니다.
 
 현재 저장소에서는 실험 결과를 로컬에서 보존할 수 있도록 `output/`은 Git 추적 대상에서 제외하는 것을 권장합니다.
+
+업로드 전 작업 트리 정리 예시:
+
+```bash
+find gaussian_initiailization -type d -name __pycache__ -prune -exec rm -rf {} +
+find gaussian_initiailization -type d -path '*/build/*' -prune -exec rm -rf {} +
+find gaussian_initiailization -type f \( -name '*.pyc' -o -name '*.so' \) -delete
+git status --short
+```
+
+이미 한 번 Git이 추적한 캐시 / 빌드 파일이 있다면 index에서도 빼는 것이 좋습니다.
+
+```bash
+git rm -r --cached gaussian_initiailization/**/__pycache__
+git rm -r --cached gaussian_initiailization/submodules/simple-knn/build
+git rm -r --cached gaussian_initiailization/submodules/diff-gaussian-rasterization/build
+git rm -r --cached gaussian_initiailization/submodules/fused-ssim/build
+```

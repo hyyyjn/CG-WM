@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -65,7 +66,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 GEOMETRY_SCALE_REG_WEIGHT = 1e-4
-GEOMETRY_OPACITY_REG_WEIGHT = 1e-4
+APPEARANCE_OPACITY_REG_WEIGHT = 1e-4
 
 def zero_active_optimizers(gaussians, use_decoupled_optimization):
     if use_decoupled_optimization:
@@ -124,13 +125,13 @@ def compute_sam_feature_loss(viewpoint_cam, gaussians, pipe, bg, separate_sh, we
     geometry_feature_loss = weight * l1_loss(geometry_feature_render * feature_mask, target_feature_map * feature_mask)
     return geometry_feature_loss, geometry_feature_loss.item()
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, full_args if full_args is not None else dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -237,7 +238,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opt.sam_feature_weight,
                     shared_screenspace_points=geometry_render_pkg["viewspace_points"],
                 )
-                geometry_reg = GEOMETRY_SCALE_REG_WEIGHT * gaussians.get_scaling.mean() + GEOMETRY_OPACITY_REG_WEIGHT * gaussians.get_opacity.mean()
+                geometry_reg = GEOMETRY_SCALE_REG_WEIGHT * gaussians.get_scaling.mean()
                 geometry_loss = geometry_appearance_loss + geometry_reg
                 if geometry_depth_loss_tensor is not None:
                     geometry_loss = geometry_loss + geometry_depth_loss_tensor
@@ -259,6 +260,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _, appearance_l1, appearance_loss_tensor, _, _ = compute_losses(
                     appearance_render_pkg, viewpoint_cam, opt, 0.0
                 )
+                appearance_loss_tensor = appearance_loss_tensor + APPEARANCE_OPACITY_REG_WEIGHT * gaussians.get_opacity.mean()
                 appearance_loss_tensor.backward()
 
                 if densify_render_pkg is None:
@@ -366,24 +368,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
-    if not args.model_path:
+def prepare_output_and_logger(output_args, snapshot_args):    
+    if not output_args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        output_args.model_path = os.path.join("./output/", unique_str[0:10])
         
     # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+    print("Output folder: {}".format(output_args.model_path))
+    os.makedirs(output_args.model_path, exist_ok = True)
+    with open(os.path.join(output_args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(output_args))))
+    with open(os.path.join(output_args.model_path, "training_args.json"), "w") as training_args_f:
+        json.dump(vars(snapshot_args), training_args_f, indent=2)
 
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(output_args.model_path)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
@@ -460,7 +464,7 @@ if __name__ == "__main__":
     elif not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, full_args=args)
 
     # All done
     print("\nTraining complete.")

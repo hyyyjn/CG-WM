@@ -20,7 +20,8 @@ class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap, sam_feature_map,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, is_test_view = False,
+                 sam_feature_normalization="none"
                  ):
         super(Camera, self).__init__()
 
@@ -69,12 +70,23 @@ class Camera(nn.Module):
                 sam_feature_map = np.repeat(sam_feature_map, 3, axis=-1)
 
             sam_feature_map = cv2.resize(sam_feature_map, resolution, interpolation=cv2.INTER_LINEAR)
-            feat_min = float(sam_feature_map.min())
-            feat_max = float(sam_feature_map.max())
-            if feat_max > feat_min:
-                sam_feature_map = (sam_feature_map - feat_min) / (feat_max - feat_min)
-            else:
-                sam_feature_map = np.zeros_like(sam_feature_map, dtype=np.float32)
+            sam_feature_map = sam_feature_map.astype(np.float32, copy=False)
+
+            if sam_feature_normalization == "per_view_minmax":
+                feat_min = float(sam_feature_map.min())
+                feat_max = float(sam_feature_map.max())
+                if feat_max > feat_min:
+                    sam_feature_map = (sam_feature_map - feat_min) / (feat_max - feat_min)
+                else:
+                    sam_feature_map = np.zeros_like(sam_feature_map, dtype=np.float32)
+            elif sam_feature_normalization == "clip_0_1":
+                sam_feature_map = np.clip(sam_feature_map, 0.0, 1.0)
+            elif sam_feature_normalization != "none":
+                raise ValueError(
+                    f"Unsupported sam_feature_normalization='{sam_feature_normalization}'. "
+                    "Expected one of: none, per_view_minmax, clip_0_1."
+                )
+
             self.sam_feature_map = torch.from_numpy(np.transpose(sam_feature_map, (2, 0, 1))).float().to(self.data_device)
 
         self.invdepthmap = None

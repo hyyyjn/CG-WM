@@ -4,9 +4,11 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 gaussian_initiailization/output/
 gaussian_initiailization/sam_features_sam2/
+gaussian_initiailization/**/build/
 
 gaussian_initiailization/submodules/simple-knn/build/
 gaussian_initiailization/submodules/simple-knn/**/*.so
