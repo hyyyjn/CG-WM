@@ -17,7 +17,40 @@ def infer_source_track_id(object_id, background_id):
     return int(object_id)
 
 
-def build_object_export(gaussians, object_id, background_id):
+def compute_rigid_metadata(center, bbox_min, bbox_max, radius, density, friction, restitution, dynamic):
+    extents = bbox_max - bbox_min
+    half_extents = extents * 0.5
+    sphere_radius = max(float(radius), 1e-6)
+    approx_volume = (4.0 / 3.0) * np.pi * (sphere_radius ** 3)
+    mass = float(max(density * approx_volume, 1e-8)) if dynamic else 0.0
+    inertia_scalar = 0.4 * mass * (sphere_radius ** 2) if dynamic else 0.0
+    return {
+        "body_frame": {
+            "translation": center.tolist(),
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+        "collision_proxy": {
+            "type": "sphere_and_aabb",
+            "sphere_center": center.tolist(),
+            "sphere_radius": float(sphere_radius),
+            "aabb_min": bbox_min.tolist(),
+            "aabb_max": bbox_max.tolist(),
+            "half_extents": half_extents.tolist(),
+        },
+        "physics": {
+            "dynamic": bool(dynamic),
+            "mass": float(mass),
+            "density": float(density),
+            "friction": float(friction),
+            "restitution": float(restitution),
+            "inertia_diag": [float(inertia_scalar), float(inertia_scalar), float(inertia_scalar)],
+            "initial_linear_velocity": [0.0, 0.0, 0.0],
+            "initial_angular_velocity": [0.0, 0.0, 0.0],
+        },
+    }
+
+
+def build_object_export(gaussians, object_id, background_id, density, friction, restitution):
     mask = gaussians.get_object_ids == object_id
     xyz = gaussians.get_xyz[mask].detach().cpu().numpy()
     scaling = gaussians.get_scaling[mask].detach().cpu().numpy()
@@ -31,6 +64,19 @@ def build_object_export(gaussians, object_id, background_id):
     distances = np.linalg.norm(xyz - center[None, :], axis=1)
     gaussian_radius = np.max(np.linalg.norm(scaling, axis=1))
     radius = float(distances.max() + gaussian_radius)
+    bbox_min = xyz.min(axis=0)
+    bbox_max = xyz.max(axis=0)
+    dynamic = int(object_id) != int(background_id)
+    rigid_metadata = compute_rigid_metadata(
+        center=center,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+        radius=radius,
+        density=density,
+        friction=friction,
+        restitution=restitution,
+        dynamic=dynamic,
+    )
 
     return {
         "object_id": int(object_id),
@@ -38,10 +84,11 @@ def build_object_export(gaussians, object_id, background_id):
         "num_gaussians": int(xyz.shape[0]),
         "center": center.tolist(),
         "radius": radius,
-        "bbox_min": xyz.min(axis=0).tolist(),
-        "bbox_max": xyz.max(axis=0).tolist(),
+        "bbox_min": bbox_min.tolist(),
+        "bbox_max": bbox_max.tolist(),
         "mean_scale": scaling.mean(axis=0).tolist(),
         "mean_opacity": float(opacity.mean()),
+        **rigid_metadata,
     }, {
         "xyz": xyz,
         "scaling": scaling,
@@ -64,6 +111,9 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--output_dir", default="", type=str)
     parser.add_argument("--background_id", default=0, type=int)
+    parser.add_argument("--density", default=1000.0, type=float)
+    parser.add_argument("--friction", default=0.5, type=float)
+    parser.add_argument("--restitution", default=0.1, type=float)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -81,7 +131,14 @@ if __name__ == "__main__":
     npz_payload = {}
 
     for object_id in unique_object_ids.tolist():
-        summary, arrays = build_object_export(gaussians, object_id, args.background_id)
+        summary, arrays = build_object_export(
+            gaussians,
+            object_id,
+            args.background_id,
+            density=args.density,
+            friction=args.friction,
+            restitution=args.restitution,
+        )
         summary["is_background"] = int(object_id) == args.background_id
         object_summaries.append(summary)
         prefix = f"object_{int(object_id)}"
@@ -94,6 +151,11 @@ if __name__ == "__main__":
         "num_gaussians": int(gaussians.get_xyz.shape[0]),
         "num_objects": int(len(object_summaries)),
         "background_id": int(args.background_id),
+        "default_physics": {
+            "density": float(args.density),
+            "friction": float(args.friction),
+            "restitution": float(args.restitution),
+        },
         "objects": object_summaries,
     }
 

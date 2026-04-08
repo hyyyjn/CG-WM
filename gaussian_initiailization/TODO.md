@@ -21,7 +21,10 @@
 - Blender synthetic split-aware SAM feature loading
 - Gaussian별 `object_id` 저장 / 복구 / export
 - manual / automatic object grouping
+- automatic foreground object mask extraction
+- object-only render
 - physics stage intermediate export
+- rigid-friendly physics metadata export
 - 외부 instance segmentation 결과 normalize helper
 - variant 비교용 `compare_variants.py`
 
@@ -148,12 +151,11 @@ isotropic spherical Gaussian 제약은 구현되어 있지만,
 
 ### 8. Object-level 시각화와 디버깅
 
-현재 가장 부족한 부분은 "scene 전체"가 아니라 "object만 떼어서 확인하는 능력"입니다.
+기본 object-only render는 구현됐지만, grouped 결과를 더 잘 디버깅할 수 있는 도구가 여전히 부족합니다.
 
 필요 작업:
 
 - foreground / background 분리 render
-- object-only render 모드 추가
 - object id별 색칠 render
 - object별 Gaussian subset 시각화
 
@@ -163,13 +165,14 @@ isotropic spherical Gaussian 제약은 구현되어 있지만,
 
 ### 9. Physics export 확장
 
-scene initialization 결과를 이후 rigid-body / physics 단계로 연결하는 포맷은 생겼지만,
-collision-friendly metadata는 더 보강할 수 있습니다.
+scene initialization 결과를 이후 rigid-body / physics 단계로 연결하는 포맷은 생겼고,
+기본 body frame / sphere+AABB proxy / default mass metadata도 들어갑니다.
+이제는 그 metadata를 더 물리적으로 유용하게 다듬는 쪽이 남았습니다.
 
 필요 작업:
 
-- collision proxy 또는 bounding primitive 생성
-- body frame 정의
+- 더 나은 collision primitive 구성
+- inertia / center of mass 추정 고도화
 - object별 안정성 점검 통계 추가
 
 완료 기준:

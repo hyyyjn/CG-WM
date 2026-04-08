@@ -27,15 +27,32 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh, object_id=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    if object_id is not None:
+        render_path = os.path.join(model_path, f"{name}_object_{object_id}", "ours_{}".format(iteration), "renders")
+        gts_path = os.path.join(model_path, f"{name}_object_{object_id}", "ours_{}".format(iteration), "gt")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
+    gaussian_mask = None
+    if object_id is not None:
+        gaussian_mask = gaussians.get_object_ids == int(object_id)
+        if not torch.any(gaussian_mask):
+            raise ValueError(f"Object id {object_id} was not found in the loaded Gaussian model.")
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+        rendering = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            use_trained_exp=train_test_exp,
+            separate_sh=separate_sh,
+            gaussian_mask=gaussian_mask,
+        )["render"]
         gt = view.original_image[0:3, :, :]
 
         if args.train_test_exp:
@@ -45,7 +62,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, object_id=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -54,10 +71,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh, object_id=object_id)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh, object_id=object_id)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -67,11 +84,14 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--object_id", default=None, type=int)
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
+    if not hasattr(args, "object_id"):
+        args.object_id = None
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, object_id=args.object_id)

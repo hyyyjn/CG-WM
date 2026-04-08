@@ -25,6 +25,7 @@ def render(
     override_color=None,
     use_trained_exp=False,
     screenspace_points=None,
+    gaussian_mask=None,
 ):
     """
     Render the scene. 
@@ -33,8 +34,14 @@ def render(
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    xyz = pc.get_xyz if gaussian_mask is None else pc.get_xyz[gaussian_mask]
+    opacity = pc.get_opacity if gaussian_mask is None else pc.get_opacity[gaussian_mask]
+    features = pc.get_features if gaussian_mask is None else pc.get_features[gaussian_mask]
+    features_dc = pc.get_features_dc if gaussian_mask is None else pc.get_features_dc[gaussian_mask]
+    features_rest = pc.get_features_rest if gaussian_mask is None else pc.get_features_rest[gaussian_mask]
+
     if screenspace_points is None:
-        screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+        screenspace_points = torch.zeros_like(xyz, dtype=xyz.dtype, requires_grad=True, device="cuda") + 0
         try:
             screenspace_points.retain_grad()
         except:
@@ -67,9 +74,8 @@ def render(
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -78,10 +84,10 @@ def render(
     cov3D_precomp = None
 
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = pc.get_covariance(scaling_modifier) if gaussian_mask is None else pc.get_covariance(scaling_modifier)[gaussian_mask]
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        scales = pc.get_scaling if gaussian_mask is None else pc.get_scaling[gaussian_mask]
+        rotations = pc.get_rotation if gaussian_mask is None else pc.get_rotation[gaussian_mask]
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -89,16 +95,16 @@ def render(
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            shs_view = features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (xyz - viewpoint_camera.camera_center.repeat(features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             if separate_sh:
-                dc, shs = pc.get_features_dc, pc.get_features_rest
+                dc, shs = features_dc, features_rest
             else:
-                shs = pc.get_features
+                shs = features
     else:
         colors_precomp = override_color
 
