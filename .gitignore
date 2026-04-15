@@ -1,5 +1,6 @@
 .codex/
 .cuda-11.8/
+external/
 
 __pycache__/
 *.pyc

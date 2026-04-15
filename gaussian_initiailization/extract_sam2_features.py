@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +12,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Extract SAM2 feature maps for NeRF synthetic images.")
-    parser.add_argument("--source_path", required=True, type=str, help="Dataset root containing train/test/val image folders.")
+    parser = argparse.ArgumentParser(description="Extract SAM2 feature maps for SG-GS Stage 1 images.")
+    parser.add_argument("--source_path", required=True, type=str, help="Dataset root containing images or transforms files.")
     parser.add_argument(
         "--output_dir",
         default="sam_features_sam2",
@@ -49,14 +50,58 @@ def parse_args():
         default=["train", "test", "val"],
         help="Dataset splits to process.",
     )
+    parser.add_argument(
+        "--images_root",
+        default="images",
+        type=str,
+        help="Preferred image root for split-aware datasets, e.g. source_path/images/train.",
+    )
     return parser.parse_args()
 
 
-def collect_images(split_dir: Path):
+def collect_images_from_dir(split_dir: Path):
     return sorted(
         path for path in split_dir.glob("*.png")
         if path.is_file() and "_depth_" not in path.name
     )
+
+
+def resolve_transform_image_path(source_path: Path, file_path: str) -> Path:
+    raw = Path(file_path)
+    candidate = raw if raw.is_absolute() else source_path / raw
+    if candidate.suffix:
+        return candidate
+    for suffix in (".png", ".jpg", ".jpeg"):
+        with_suffix = candidate.with_suffix(suffix)
+        if with_suffix.exists():
+            return with_suffix
+    return candidate.with_suffix(".png")
+
+
+def collect_images(source_path: Path, split: str, images_root: str):
+    # edit this: prefer the Stage 1 layout, then keep legacy NeRF synthetic fallbacks.
+    split_dirs = [
+        source_path / images_root / split,
+        source_path / split,
+    ]
+    for split_dir in split_dirs:
+        if split_dir.exists():
+            image_paths = collect_images_from_dir(split_dir)
+            if image_paths:
+                return image_paths
+
+    transforms_path = source_path / f"transforms_{split}.json"
+    if transforms_path.exists():
+        with open(transforms_path, "r") as f:
+            frames = json.load(f).get("frames", [])
+        image_paths = []
+        for frame in frames:
+            image_path = resolve_transform_image_path(source_path, frame["file_path"])
+            if image_path.exists() and "_depth_" not in image_path.name:
+                image_paths.append(image_path)
+        return sorted(image_paths)
+
+    return []
 
 
 def reduce_feature_channels(feature_map: torch.Tensor, output_channels: int) -> np.ndarray:
@@ -113,12 +158,11 @@ def main():
 
     total_saved = 0
     for split in args.splits:
-        split_dir = source_path / split
-        if not split_dir.exists():
-            print(f"Skipping missing split directory: {split_dir}")
+        image_paths = collect_images(source_path, split, args.images_root)
+        if not image_paths:
+            print(f"Skipping split with no images: {split}")
             continue
 
-        image_paths = collect_images(split_dir)
         split_output_dir = output_root / split
         split_output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -178,6 +178,7 @@ python gaussian_initiailization/train.py \
 - `2026-04-03`: SAM2 추가 시도 후 롤백 완료
 - `2026-04-03`: README 정리 (CG-WM 추가 안내)
 - `2026-04-06`: scene initialization 실험을 위해 Gaussian의 회전을 고정하고 등방성 스케일을 적용하도록 수정
+- `2026-04-15`: SG-GS Stage 1 strict mode, SAM2 feature 필수 경로, mesh dataset generator, SIBR용 PLY 변환, 10k bunny color 실험 및 상세 문서(`gaussian_initiailization/EXPLAIN2.md`) 추가
 
 
 ## 주의
@@ -187,5 +188,4 @@ python gaussian_initiailization/train.py \
 ---
 
 추가적으로 구조적 개선(클램프 대신 `sh2rgb * C0 + 0.5`, `loss color regularization`)을 바로 코드에서 적용 가능합니다.
-
 
