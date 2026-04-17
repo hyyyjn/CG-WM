@@ -15,8 +15,47 @@ from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
 import os
+from pathlib import Path
 
 WARNED = False
+
+def load_object_mask_prior(masks_dir, cam_info):
+    if masks_dir == "":
+        return None
+
+    masks_root = Path(masks_dir)
+    if not masks_root.is_absolute():
+        source_root = Path(cam_info.image_path).resolve().parents[1]
+        masks_root = source_root / masks_root
+
+    image_stem = Path(cam_info.image_name).stem
+    split_name = "test" if getattr(cam_info, "is_test", False) else "train"
+    candidates = [
+        masks_root / split_name / f"{cam_info.image_name}.npy",
+        masks_root / split_name / f"{image_stem}.npy",
+        masks_root / split_name / f"{cam_info.image_name}.png",
+        masks_root / split_name / f"{image_stem}.png",
+        masks_root / f"{cam_info.image_name}.npy",
+        masks_root / f"{image_stem}.npy",
+        masks_root / f"{cam_info.image_name}.png",
+        masks_root / f"{image_stem}.png",
+    ]
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if candidate.suffix == ".npy":
+            mask = np.load(candidate)
+        else:
+            mask = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                continue
+        mask = np.asarray(mask)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        return (mask > 0).astype(np.float32)
+
+    return None
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     sam_feature_normalization = getattr(args, "sam_feature_normalization", "none")
@@ -50,6 +89,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         except Exception as e:
             print(f"Error: Unable to load SAM feature map '{cam_info.sam_feature_path}': {e}")
             raise
+    object_mask_map = load_object_mask_prior(getattr(args, "masks_dir", ""), cam_info)
         
     orig_w, orig_h = image.size
     if args.resolution in [1, 2, 4, 8]:
@@ -74,7 +114,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap, sam_feature_map=sam_feature_map,
+                  image=image, invdepthmap=invdepthmap, sam_feature_map=sam_feature_map, object_mask_map=object_mask_map,
                   image_name=cam_info.image_name, uid=id, data_device=data_device,
                   train_test_exp=train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   sam_feature_normalization=sam_feature_normalization)

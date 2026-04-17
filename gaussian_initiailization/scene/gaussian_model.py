@@ -75,6 +75,7 @@ class GaussianModel:
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
         self._features_geo = torch.empty(0)
+        self._foreground_logit = torch.empty(0)
         self._object_ids = torch.empty(0, dtype=torch.int32)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -98,6 +99,7 @@ class GaussianModel:
             "features_dc": self._features_dc,
             "features_rest": self._features_rest,
             "features_geo": self._features_geo,
+            "foreground_logit": self._foreground_logit,
             "object_ids": self._object_ids,
             "scaling": self._scaling,
             "rotation": self._rotation,
@@ -121,6 +123,7 @@ class GaussianModel:
             self._features_dc = model_args["features_dc"]
             self._features_rest = model_args["features_rest"]
             self._features_geo = model_args.get("features_geo", self._features_geo)
+            self._foreground_logit = model_args.get("foreground_logit", self._foreground_logit)
             if self._features_geo.numel() > 0:
                 self.geometry_feature_dim = int(self._features_geo.shape[1])
             self._object_ids = model_args.get("object_ids", self._object_ids)
@@ -138,7 +141,23 @@ class GaussianModel:
             self.spatial_lr_scale = model_args["spatial_lr_scale"]
             saved_decoupled = model_args.get("use_decoupled_optimization", False)
         else:
-            if len(model_args) == 13:
+            if len(model_args) == 14:
+                (self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._features_geo,
+                self._foreground_logit,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+                self.geometry_feature_dim = int(self._features_geo.shape[1])
+            elif len(model_args) == 13:
                 (self.active_sh_degree,
                 self._xyz,
                 self._features_dc,
@@ -152,6 +171,7 @@ class GaussianModel:
                 denom,
                 opt_dict,
                 self.spatial_lr_scale) = model_args
+                self._foreground_logit = nn.Parameter(torch.zeros((self._xyz.shape[0], 1), device=self._xyz.device).requires_grad_(True))
                 self.geometry_feature_dim = int(self._features_geo.shape[1])
             else:
                 (self.active_sh_degree,
@@ -167,6 +187,7 @@ class GaussianModel:
                 opt_dict,
                 self.spatial_lr_scale) = model_args
                 self._features_geo = nn.Parameter(torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device).requires_grad_(True))
+                self._foreground_logit = nn.Parameter(torch.zeros((self._xyz.shape[0], 1), device=self._xyz.device).requires_grad_(True))
                 self.geometry_feature_dim = 3
             geometry_opt_dict = None
             appearance_opt_dict = None
@@ -175,6 +196,8 @@ class GaussianModel:
 
         if self._features_geo.numel() == 0:
             self._features_geo = nn.Parameter(torch.zeros((self._xyz.shape[0], self.geometry_feature_dim), device=self._xyz.device).requires_grad_(True))
+        if self._foreground_logit.numel() == 0:
+            self._foreground_logit = nn.Parameter(torch.zeros((self._xyz.shape[0], 1), device=self._xyz.device).requires_grad_(True))
         if self._object_ids.numel() == 0:
             self._object_ids = torch.zeros((self._xyz.shape[0],), dtype=torch.int32, device=self._xyz.device)
 
@@ -227,6 +250,10 @@ class GaussianModel:
         return torch.sigmoid(self._features_geo)
 
     @property
+    def get_foreground_scores(self):
+        return torch.sigmoid(self._foreground_logit)
+
+    @property
     def get_object_ids(self):
         return self._object_ids
     
@@ -273,6 +300,7 @@ class GaussianModel:
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_geo = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], self.geometry_feature_dim), device="cuda").requires_grad_(True))
+        self._foreground_logit = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
         self._object_ids = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.int32, device="cuda")
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
@@ -294,6 +322,7 @@ class GaussianModel:
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._features_geo], 'lr': training_args.feature_lr, "name": "f_geo"},
+            {'params': [self._foreground_logit], 'lr': training_args.feature_lr, "name": "f_fg"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
@@ -314,7 +343,7 @@ class GaussianModel:
         self.appearance_optimizer = None
 
         if self.use_decoupled_optimization:
-            geometry_groups = [group for group in l if group["name"] in {"xyz", "scaling", "rotation", "f_geo"}]
+            geometry_groups = [group for group in l if group["name"] in {"xyz", "scaling", "rotation", "f_geo", "f_fg"}]
             appearance_groups = [group for group in l if group["name"] in {"f_dc", "f_rest", "opacity"}]
             self.geometry_optimizer = build_optimizer(geometry_groups)
             self.appearance_optimizer = build_optimizer(appearance_groups)
@@ -404,7 +433,7 @@ class GaussianModel:
             }
 
     def geometry_parameters(self):
-        return [self._xyz, self._scaling, self._rotation, self._features_geo]
+        return [self._xyz, self._scaling, self._rotation, self._features_geo, self._foreground_logit]
 
     def appearance_parameters(self):
         return [self._features_dc, self._features_rest, self._opacity]
@@ -429,6 +458,7 @@ class GaussianModel:
             l.append('f_rest_{}'.format(i))
         for i in range(self._features_geo.shape[1]):
             l.append('f_geo_{}'.format(i))
+        l.append('foreground_logit')
         l.append('object_id')
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
@@ -445,6 +475,7 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_geo = self._features_geo.detach().cpu().numpy()
+        foreground_logit = self._foreground_logit.detach().cpu().numpy()
         object_ids = self._object_ids.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -455,7 +486,7 @@ class GaussianModel:
             dtype_full.append((attribute, 'i4' if attribute == 'object_id' else 'f4'))
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, f_geo, object_ids[:, None], opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, f_geo, foreground_logit, object_ids[:, None], opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -507,6 +538,11 @@ class GaussianModel:
         else:
             features_geo = np.zeros((xyz.shape[0], self.geometry_feature_dim), dtype=np.float32)
 
+        if "foreground_logit" in plydata.elements[0].data.dtype.names:
+            foreground_logit = np.asarray(plydata.elements[0]["foreground_logit"])[..., np.newaxis]
+        else:
+            foreground_logit = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+
         if "object_id" in plydata.elements[0].data.dtype.names:
             object_ids = np.asarray(plydata.elements[0]["object_id"]).astype(np.int32)
         else:
@@ -528,6 +564,7 @@ class GaussianModel:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_geo = nn.Parameter(torch.tensor(features_geo, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._foreground_logit = nn.Parameter(torch.tensor(foreground_logit, dtype=torch.float, device="cuda").requires_grad_(True))
         self._object_ids = torch.tensor(object_ids, dtype=torch.int32, device="cuda")
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -578,6 +615,7 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._features_geo = optimizable_tensors["f_geo"]
+        self._foreground_logit = optimizable_tensors["f_fg"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -612,11 +650,12 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_features_geo, new_object_ids, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_features_geo, new_foreground_logit, new_object_ids, new_opacities, new_scaling, new_rotation, new_tmp_radii):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "f_geo": new_features_geo,
+        "f_fg": new_foreground_logit,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
@@ -626,6 +665,7 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._features_geo = optimizable_tensors["f_geo"]
+        self._foreground_logit = optimizable_tensors["f_fg"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -657,11 +697,12 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_features_geo = self._features_geo[selected_pts_mask].repeat(N,1)
+        new_foreground_logit = self._foreground_logit[selected_pts_mask].repeat(N,1)
         new_object_ids = self._object_ids[selected_pts_mask].repeat(N)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_geo, new_object_ids, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_geo, new_foreground_logit, new_object_ids, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -682,6 +723,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_features_geo = self._features_geo[selected_pts_mask]
+        new_foreground_logit = self._foreground_logit[selected_pts_mask]
         new_object_ids = self._object_ids[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
@@ -689,7 +731,7 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_geo, new_object_ids, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_geo, new_foreground_logit, new_object_ids, new_opacities, new_scaling, new_rotation, new_tmp_radii)
         return {
             "selected": num_selected,
             "created": num_selected,

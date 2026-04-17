@@ -441,7 +441,6 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Automatically assign Gaussian object ids from 2D instance masks.")
     model = ModelParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--masks_dir", required=True, type=str)
     parser.add_argument("--output_model_path", default="", type=str)
     parser.add_argument("--save_iteration", default=-1, type=int)
     parser.add_argument("--background_id", default=0, type=int)
@@ -459,6 +458,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+
+    if not args.masks_dir:
+        raise ValueError("--masks_dir is required.")
 
     safe_state(args.quiet)
 

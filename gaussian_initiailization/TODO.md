@@ -1,236 +1,203 @@
 # Gaussian Initialization TODO
 
-이 문서는 현재 `gaussian_initiailization` 코드 기준으로, ContactGaussian-WM scene initialization 재현에서
-이미 된 것과 아직 부족한 것을 우선순위 중심으로 정리한 메모입니다.
+이 문서는 현재 `gaussian_initiailization` 코드 기준으로,
+ContactGaussian-WM scene initialization 재현에서 이미 된 것과 아직 남은 것을 우선순위 중심으로 정리한 메모입니다.
 
-## 이미 완료된 항목
+## 현재 기준으로 이미 완료된 항목
 
 - isotropic spherical Gaussian 제약
 - 기본 3DGS 학습 / 저장 / render
-- exposure optimization
 - geometry / appearance decoupled optimization
 - alternating / joint optimization 옵션
 - geometry / appearance loss 분리
-- decoupled optimizer state checkpoint 저장 / 복구
-- old decoupled checkpoint 호환 resume
+- exposure optimization 및 checkpoint 복구
+- old checkpoint 호환 resume
 - `--disable_viewer` fallback
 - SAM2 feature supervision 경로
-- shared screen-space gradient 연결
-- `sam_feature_normalization` 옵션 추가
-- SAM2 feature extraction 스크립트
-- configurable `--output_channels` 기반 richer SAM feature extraction
-- configurable `--geometry_feature_dim` 기반 richer geometry feature supervision
-- Blender synthetic split-aware SAM feature loading
+- richer `--geometry_feature_dim` supervision
+- split-aware SAM feature loading
+- visual hull seed initialization
+- masked COLMAP 재추정 경로
 - Gaussian별 `object_id` 저장 / 복구 / export
 - manual / automatic object grouping
-- automatic foreground object mask extraction
-- object-only render
 - physics stage intermediate export
-- rigid-friendly physics metadata export
-- 외부 instance segmentation 결과 normalize helper
-- variant 비교용 `compare_variants.py`
-- densification statistics logging (`densification_stats.jsonl`)
-- `compare_variants.py`의 densification summary 비교
-- richer feature supervision smoke / 5k train+render 검증
+- densification statistics logging
+- object mask prior loading
+- object mask BCE + L1 geometry supervision
+- per-Gaussian learned foreground score
+- foreground score PLY save/load 및 checkpoint round-trip
+- foreground-aware debug render
+- `--foreground_threshold` 기반 tighter render
+- `lego_objaware_mask_10k` 10k train + render 검증
 
-## P0. 지금 바로 할 것
+## P0. 지금 바로 이어갈 것
 
-### 1. Richer SAM feature supervision 고도화
+### 1. Foreground 억제와 경계 정리
 
-기본 richer feature 경로 자체는 구현됐습니다.
-현재는 `--output_channels`, `--geometry_feature_dim`, multi-chunk supervision까지 붙어 있어서
-3채널 축약 없이 실험은 가능합니다.
-
-이제 남은 건 "더 좋은 richer feature"로 다듬는 단계입니다.
-
-필요 작업:
-
-- 3채널 평균 축약 대신 fixed projection 또는 learned projection 도입
-- SAM2 feature의 multi-scale 활용 검토
-- 3채널 vs 9채널 이상의 정량 비교 리포트 정리
-
-완료 기준:
-
-- richer feature 차원별 비교표와 추천 설정 확보
-
-### 2. Feature-aware densification 분석
-
-shared screen-space gradient 연결은 끝났지만,
-실제로 feature loss가 split / clone / prune 판단에 얼마나 영향을 주는지는 아직 잘 안 보입니다.
-
-현재 기본 densification 통계 로그(`densification_stats.jsonl`)와
-`compare_variants.py`의 densification summary 비교는 추가되어 있습니다.
-이제는 그 로그를 더 해석하기 쉽게 만들고, 장기 실험 비교에 연결하는 단계가 남았습니다.
+object mask prior와 foreground score는 꽤 잘 맞기 시작했지만,
+RGB render에서는 여전히 경계 주변 halo나 잔여 Gaussian이 보일 수 있습니다.
 
 필요 작업:
 
-- densification 직전 gradient 통계를 branch별로 기록
-- feature supervision 유무에 따른 split / prune 개수 비교
-- 어떤 iteration에서 geometry prior가 성장 규칙을 바꾸는지 로그화
+- foreground threshold를 render 전용이 아니라 학습 regularization에도 연결
+- 낮은 foreground score를 가진 Gaussian의 opacity 억제
+- boundary 근처에서 foreground score를 더 날카롭게 만드는 regularization
+- foreground/background-aware pruning 규칙 추가
 
 완료 기준:
 
-- feature-aware densification이 실제로 작동하는지 실험 로그로 확인 가능
+- object-only render에서 halo가 크게 줄고, threshold를 과하게 올리지 않아도 object가 깔끔하게 보임
 
-### 3. 장기 비교 실험 자동화
+### 2. Post-hoc grouping 의존 줄이기
 
-1k smoke 비교와 5k 3채널/9채널 train+render 검증은 했지만,
-5k~10k 장기 학습에서 안정적인 개선인지에 대한 정량 비교는 아직 부족합니다.
+현재는 논문에 더 가까운 object-aware initialization이 어느 정도 들어갔지만,
+여전히 multi-object 실험이나 physics export에서는 `auto_assign_object_ids.py`에 기대는 부분이 남아 있습니다.
 
 필요 작업:
 
-- baseline / SAM-init / shared-grad 변형 비교 스크립트 확장
-- train/test PSNR뿐 아니라 SSIM / LPIPS도 함께 수집
-- checkpoint 시점별 성능 추적
-- 3채널 vs 9채널 richer feature의 장기 성능 비교 자동화
+- foreground score만으로 foreground/background 분리 export 가능하게 만들기
+- `object_id` 없는 상태에서도 object-aware render / metric 계산 가능하게 만들기
+- grouping을 핵심 경로가 아니라 fallback 경로로 문서와 코드에서 더 분명히 분리
 
 완료 기준:
 
-- 장기 학습 비교 결과를 한 번에 재현할 수 있는 실험 루프 확보
+- 단일 object foreground 분리는 grouping 없이 확인 가능
+- grouping은 multi-object physics export가 필요할 때만 선택적으로 사용
 
-## P1. 다음 단계
+### 3. Object-aware 평가 지표 추가
 
-### 4. Initial Gaussian 품질 개선
-
-현재 초기 Gaussian은 3DGS 기본 초기화에 isotropic constraint를 얹은 형태에 가깝습니다.
-ContactGaussian-WM 관점에서는 object-aware / geometry-aware 초기화 prior가 더 필요합니다.
+지금은 `foreground_scores`, `object_mask_prior`, RGB render를 눈으로 비교하기는 쉽지만,
+분리 품질을 정량적으로 재는 루프는 아직 약합니다.
 
 필요 작업:
 
-- object-aware initial Gaussian seeding 가능성 검토
-- foreground / background prior를 초기화 단계에서 반영하는 방법 정리
-- scale / opacity / geometry feature 초기값 민감도 실험
-- 초기 Gaussian 분포가 이후 grouping 품질에 미치는 영향 분석
+- mask IoU
+- precision / recall on foreground occupancy
+- foreground score histogram
+- threshold sweep 결과 저장
+- render 품질과 separation 품질을 함께 요약하는 비교 스크립트
 
 완료 기준:
 
-- 기본 3DGS 초기화와 개선된 initialization을 정량 비교 가능
+- 한 실험 폴더에서 reconstruction 품질과 separation 품질을 같이 읽을 수 있음
 
-### 5. Geometry supervision 강화
+## P1. 논문 정렬을 위해 다음에 할 것
 
-지금은 geometry supervision이 SAM2 feature와 optional depth 위주입니다.
-더 직접적인 geometry target이 추가되면 initialization 품질을 더 끌어올릴 수 있습니다.
+### 4. Initial Gaussian을 더 object-aware하게 만들기
 
-후보:
-
-- silhouette / alpha mask loss
-- monocular depth prior 강화
-- normal prior
-- segmentation boundary consistency
+지금은 학습 도중 object-aware signal이 들어가지만,
+초기 seed 자체는 아직 visual hull / PCD 중심입니다.
 
 필요 작업:
 
-- `masks/`, `normals/`, `depths/` 같은 추가 입력 경로 정의
-- 카메라 객체에 geometry target 확장
-- geometry step에서 supervision 항목별 가중치 옵션 추가
+- foreground seed와 background seed를 다르게 주는 초기화 실험
+- mask/visual hull를 scale, opacity 초기값에 더 직접 반영
+- 초기 foreground logit priors 도입 검토
 
 완료 기준:
 
-- geometry step에서 mask / depth / normal supervision을 선택적으로 조합 가능
+- object-aware supervision이 초기 몇 백 iteration부터 더 안정적으로 작동
 
-### 6. SG-GS 효과 검증
+### 5. SAM2 supervision을 object separation 쪽으로 강화
 
-isotropic spherical Gaussian 제약은 구현되어 있지만,
-"실제로 더 좋은 scene initialization을 만드는가"는 아직 충분히 닫히지 않았습니다.
+현재 SAM2는 geometry feature supervision으로는 잘 연결돼 있지만,
+object consistency까지 직접적으로 밀어주는 loss는 아직 약합니다.
 
 필요 작업:
 
-- anisotropic baseline 대비 SG-GS 초기화 성능 비교
-- densification 이후 spherical constraint 유지가 품질에 미치는 영향 분석
-- 7k / 10k checkpoint 등 iteration별 품질 변화 추적
-- shared screen-space gradient 연결 전후 비교 실험
+- cross-view object consistency loss 검토
+- foreground/background feature contrastive loss 검토
+- SAM2 feature와 mask prior를 함께 쓰는 hybrid geometry loss 설계
 
 완료 기준:
 
-- SG-GS 유무에 따른 정량 비교표 확보
+- SAM2가 단순 feature prior를 넘어서 object separation quality에도 직접 기여
 
-### 7. Decoupled optimization 효과 검증
+### 6. Richer feature supervision 장기 비교
 
-구조와 loss 책임은 이전보다 정리됐지만,
-실제로 언제 도움이 되는지에 대한 정량 실험이 더 필요합니다.
+3채널 대비 9채널 이상 supervision 경로는 구현됐지만,
+장기 학습에서 얼마나 안정적으로 좋은지는 더 비교가 필요합니다.
 
 필요 작업:
 
-- alternating / joint / baseline 모드 비교 실험 자동화
-- decoupled optimization의 장단점 정리
-- geometry / appearance branch별 gradient / loss 통계 기록
+- 3채널 / 9채널 / 더 높은 채널 수 비교
+- `sam_feature_weight` sweep
+- 장기 학습에서 densification 차이 분석
 
 완료 기준:
 
-- decoupled optimization이 유리한 설정과 불리한 설정을 정리한 비교 결과 확보
+- 추천 feature 차원과 weight를 표로 정리 가능
+
+### 7. SG-GS / decoupled optimization 효과 검증
+
+구현은 되어 있지만, 어떤 설정에서 실제로 제일 유리한지 정량 비교는 더 필요합니다.
+
+필요 작업:
+
+- spherical vs baseline 비교
+- alternating vs joint vs baseline 비교
+- geometry / appearance branch별 loss와 gradient 통계 정리
+
+완료 기준:
+
+- 기본 설정 추천값을 문서로 고정할 수 있음
 
 ## P2. Object / Physics 연결 고도화
 
-### 8. Object-level 시각화와 디버깅
+### 8. Multi-object separation을 학습 안쪽으로 더 끌어오기
 
-기본 object-only render는 구현됐지만, grouped 결과를 더 잘 디버깅할 수 있는 도구가 여전히 부족합니다.
+지금 foreground score는 우선 foreground/background 분리 쪽에 가깝습니다.
+여러 object instance를 학습 내부에서 직접 나누는 단계는 아직 멀었습니다.
 
 필요 작업:
 
-- foreground / background 분리 render
-- object id별 색칠 render
-- object별 Gaussian subset 시각화
+- multi-instance mask prior 설계
+- Gaussian별 soft object embedding 또는 label distribution 검토
+- 이후 rigid grouping과 자연스럽게 이어지는 representation 정의
 
 완료 기준:
 
-- object 단위로 grouped 결과를 바로 확인 가능
+- 여러 object가 있는 장면에서 post-hoc grouping 없이도 instance-aware 구조가 드러남
 
 ### 9. Physics export 확장
 
-scene initialization 결과를 이후 rigid-body / physics 단계로 연결하는 포맷은 생겼고,
-기본 body frame / sphere+AABB proxy / default mass metadata도 들어갑니다.
-이제는 그 metadata를 더 물리적으로 유용하게 다듬는 쪽이 남았습니다.
+scene initialization 결과를 이후 rigid-body / physics 단계로 연결하는 포맷은 이미 있지만,
+메타데이터 품질은 더 좋아질 수 있습니다.
 
 필요 작업:
 
-- 더 나은 collision primitive 구성
+- collision primitive 개선
 - inertia / center of mass 추정 고도화
 - object별 안정성 점검 통계 추가
 
 완료 기준:
 
-- physics stage에서 바로 쓸 수 있는 object metadata 확보
+- physics stage에서 바로 쓰기 쉬운 object metadata 확보
 
 ## P3. 평가 / 재현성 / 문서화
 
-### 10. 평가 지표 확장
-
-현재는 렌더 품질 중심으로 보기 쉽고, geometry quality를 체계적으로 재는 도구는 부족합니다.
+### 10. 실험 자동화와 metrics 정리
 
 필요 작업:
 
-- mask IoU
-- depth error
-- object separation quality
-- Gaussian scale / opacity distribution 분석
-- geometry feature consistency 분석
+- train + render + metrics + debug summary를 한 번에 도는 helper 정리
+- threshold별 render 자동 생성
+- 주요 실험 설정별 결과 표 자동 저장
 
 완료 기준:
 
-- rendering metric 외에 geometry initialization metric을 같이 기록
+- 다른 사람이 문서만 보고 같은 비교 실험을 재현 가능
 
-### 11. Resume / training ergonomics 보강
+### 11. README / EXPLAIN / TODO 동기화 유지
 
-기본 checkpoint 복구는 되지만, 실험 편의성은 더 좋아질 수 있습니다.
+최근처럼 구현이 빠르게 바뀌면 문서가 쉽게 뒤처집니다.
 
 필요 작업:
 
-- mode mismatch 경고 메시지 개선
-- config snapshot 정리
-- feature extraction부터 training까지의 end-to-end helper script 추가
+- 새 옵션 추가 시 README와 EXPLAIN 동시 반영
+- 완료된 TODO를 바로 이동
+- 대표 실험 결과 경로를 최신 상태로 유지
 
 완료 기준:
 
-- 다른 사람이 같은 절차를 문서만 보고 재현 가능
-
-### 12. 저장소 정리 규칙 유지
-
-필요 작업:
-
-- README와 `.gitignore`를 계속 동기화
-- output / cache / checkpoint 관리 규칙 문서화
-- 실제 실험 예시 명령 축적
-
-완료 기준:
-
-- GitHub에는 코드와 문서만, 산출물은 로컬 보존이라는 원칙이 유지됨
+- 문서가 실제 코드 상태를 계속 따라감

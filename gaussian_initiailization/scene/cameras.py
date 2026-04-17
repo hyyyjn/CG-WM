@@ -17,7 +17,7 @@ from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
-    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap, sam_feature_map,
+    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap, sam_feature_map, object_mask_map,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False,
@@ -58,6 +58,8 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
         self.sam_feature_map = None
+        self.object_mask = None
+        self.has_object_mask_prior = False
 
         if sam_feature_map is not None:
             if sam_feature_map.ndim == 2:
@@ -84,6 +86,21 @@ class Camera(nn.Module):
                 )
 
             self.sam_feature_map = torch.from_numpy(np.transpose(sam_feature_map, (2, 0, 1))).float().to(self.data_device)
+
+        if object_mask_map is not None:
+            if object_mask_map.ndim == 3:
+                object_mask_map = object_mask_map[..., 0]
+            object_mask_map = cv2.resize(
+                object_mask_map.astype(np.float32, copy=False),
+                resolution,
+                interpolation=cv2.INTER_NEAREST,
+            )
+            object_mask_map = np.clip(object_mask_map, 0.0, 1.0)
+            self.object_mask = torch.from_numpy(object_mask_map[None]).float().to(self.data_device)
+            self.has_object_mask_prior = True
+        elif resized_image_rgb.shape[0] == 4:
+            self.object_mask = self.alpha_mask.clone()
+            self.has_object_mask_prior = True
 
         self.invdepthmap = None
         self.depth_reliable = False

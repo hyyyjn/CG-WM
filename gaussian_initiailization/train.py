@@ -12,6 +12,7 @@
 import os
 import json
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
@@ -162,6 +163,35 @@ def compute_sam_feature_loss(viewpoint_cam, gaussians, pipe, bg, separate_sh, we
     geometry_feature_loss = weight * (total_feature_loss / float(max(num_chunks, 1)))
     return geometry_feature_loss, geometry_feature_loss.item()
 
+def compute_object_mask_loss(viewpoint_cam, gaussians, pipe, separate_sh, weight, bce_weight=1.0, shared_screenspace_points=None):
+    if weight <= 0 or not getattr(viewpoint_cam, "has_object_mask_prior", False):
+        return None, 0.0
+
+    target_mask = viewpoint_cam.object_mask
+    if target_mask is None:
+        return None, 0.0
+
+    foreground_scores = gaussians.get_foreground_scores
+    occupancy_color = foreground_scores.repeat(1, 3)
+    occupancy_render = render(
+        viewpoint_cam,
+        gaussians,
+        pipe,
+        torch.zeros((3), dtype=torch.float32, device="cuda"),
+        override_color=occupancy_color,
+        use_trained_exp=False,
+        separate_sh=separate_sh,
+        screenspace_points=shared_screenspace_points,
+    )["render"][:1, ...]
+
+    occupancy_render = occupancy_render.clamp(1e-6, 1.0 - 1e-6)
+    target_mask = target_mask.clamp(0.0, 1.0)
+
+    bce_term = F.binary_cross_entropy(occupancy_render, target_mask)
+    l1_term = l1_loss(occupancy_render, target_mask)
+    object_mask_loss = weight * (bce_weight * bce_term + l1_term)
+    return object_mask_loss, object_mask_loss.item()
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -211,6 +241,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
     ema_geometry_loss_for_log = 0.0
     ema_appearance_loss_for_log = 0.0
+    ema_object_mask_loss_for_log = 0.0
     densification_log_path = os.path.join(dataset.model_path, "densification_stats.jsonl")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -272,6 +303,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         geometry_loss_value = 0.0
         appearance_loss_value = 0.0
         geometry_feature_loss_value = 0.0
+        object_mask_loss_value = 0.0
         densify_render_pkg = None
         densify_visibility_filter = None
         densify_radii = None
@@ -301,6 +333,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opt.sam_feature_weight,
                     shared_screenspace_points=geometry_render_pkg["viewspace_points"],
                 )
+                object_mask_loss_tensor, object_mask_loss_value = compute_object_mask_loss(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    SPARSE_ADAM_AVAILABLE,
+                    opt.object_mask_weight,
+                    bce_weight=opt.object_mask_bce_weight,
+                    shared_screenspace_points=geometry_render_pkg["viewspace_points"],
+                )
                 geometry_reg = GEOMETRY_SCALE_REG_WEIGHT * gaussians.get_scaling.mean()
                 # edit this: keep RGB geometry pressure optional so SG-GS can be feature-driven.
                 geometry_loss = geometry_reg + opt.geometry_rgb_weight * geometry_appearance_loss
@@ -310,6 +351,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     geometry_loss = geometry_loss + geometry_feature_loss_tensor
                 elif opt.require_sam_features:
                     raise RuntimeError("SAM feature loss was not computed even though SAM features are required.")
+                if object_mask_loss_tensor is not None:
+                    geometry_loss = geometry_loss + object_mask_loss_tensor
                 geometry_loss.backward()
 
                 densify_render_pkg = geometry_render_pkg
@@ -367,12 +410,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
             ema_geometry_loss_for_log = 0.4 * geometry_loss_value + 0.6 * ema_geometry_loss_for_log
             ema_appearance_loss_for_log = 0.4 * appearance_loss_value + 0.6 * ema_appearance_loss_for_log
+            ema_object_mask_loss_for_log = 0.4 * object_mask_loss_value + 0.6 * ema_object_mask_loss_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}",
                     "Geom": f"{ema_geometry_loss_for_log:.{7}f}",
                     "App": f"{ema_appearance_loss_for_log:.{7}f}",
+                    "Obj": f"{ema_object_mask_loss_for_log:.{7}f}",
                     "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"
                 })
                 progress_bar.update(10)
@@ -385,6 +430,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/geometry_loss', geometry_loss_value, iteration)
                 tb_writer.add_scalar('train_loss_patches/appearance_loss', appearance_loss_value, iteration)
                 tb_writer.add_scalar('train_loss_patches/geometry_feature_loss', geometry_feature_loss_value, iteration)
+                tb_writer.add_scalar('train_loss_patches/object_mask_loss', object_mask_loss_value, iteration)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -403,6 +449,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         "iteration": int(iteration),
                         "sam_feature_weight": float(opt.sam_feature_weight),
                         "geometry_feature_loss": float(geometry_feature_loss_value),
+                        "object_mask_loss": float(object_mask_loss_value),
                         "geometry_loss": float(geometry_loss_value),
                         "appearance_loss": float(appearance_loss_value),
                         "mode": "joint" if opt.joint_optimization else ("alternating" if opt.alternating_optimization else "baseline"),

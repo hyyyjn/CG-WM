@@ -9,7 +9,12 @@ __pycache__/
 
 gaussian_initiailization/output/
 gaussian_initiailization/sam_features_sam2/
+gaussian_initiailization/**/masked_colmap/
+gaussian_initiailization/**/visual_hull/
+gaussian_initiailization/**/physics_export/
 gaussian_initiailization/**/build/
+gaussian_initiailization/**/*.log
+gaussian_initiailization/**/*.jsonl
 
 gaussian_initiailization/submodules/simple-knn/build/
 gaussian_initiailization/submodules/simple-knn/**/*.so

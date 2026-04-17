@@ -112,6 +112,8 @@ class OptimizationParams(ParamGroup):
         self.sg_gs_stage1 = False
         self.geometry_rgb_weight = 1.0
         self.require_sam_features = False
+        self.object_mask_weight = 0.0
+        self.object_mask_bce_weight = 1.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
