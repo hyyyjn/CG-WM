@@ -46,6 +46,33 @@ class SceneInfo(NamedTuple):
     ply_path: str
     is_nerf_synthetic: bool
 
+
+def resolve_initial_ply_path(scene_path, scene_info_ply_path, init_mode="default", init_ply_path=""):
+    mode = (init_mode or "default").strip().lower()
+    explicit_path = (init_ply_path or "").strip()
+    if explicit_path:
+        candidate = explicit_path if os.path.isabs(explicit_path) else os.path.join(scene_path, explicit_path)
+        if os.path.exists(candidate):
+            return candidate
+        raise FileNotFoundError(f"Requested init_ply_path does not exist: {candidate}")
+
+    if mode in {"default", "colmap_sparse"}:
+        return scene_info_ply_path
+    if mode == "visual_hull":
+        candidate = os.path.join(scene_path, "visual_hull", "visual_hull.ply")
+        if os.path.exists(candidate):
+            return candidate
+        raise FileNotFoundError(
+            f"init_mode='visual_hull' requested, but no visual hull seed was found at {candidate}. "
+            "Run build_visual_hull.py first or pass --init_ply_path."
+        )
+    if mode == "random":
+        return scene_info_ply_path
+
+    raise ValueError(
+        f"Unsupported init_mode='{init_mode}'. Expected one of: default, colmap_sparse, visual_hull, random."
+    )
+
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)

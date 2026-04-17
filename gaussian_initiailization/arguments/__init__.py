@@ -51,9 +51,12 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self.masks_dir = ""
         self.sam_features = ""
         self.geometry_feature_dim = 3
         self.sam_feature_normalization = "none"
+        self.init_mode = "default"
+        self.init_ply_path = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False

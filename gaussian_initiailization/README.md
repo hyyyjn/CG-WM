@@ -64,6 +64,12 @@
   - 이미지에서 foreground object mask를 자동 추출
 - `prepare_instance_masks.py`
   - 외부 segmentation 결과를 `auto_assign_object_ids.py` 입력 형식으로 normalize
+- `estimate_masked_colmap.py`
+  - foreground mask를 반영한 입력 이미지로 COLMAP pose를 다시 추정
+- `build_visual_hull.py`
+  - multi-view mask와 camera로 visual hull seed point cloud를 생성
+- `run_scene_initialization_pipeline.py`
+  - mask 추출, masked COLMAP, visual hull, SAM2, train 단계를 순차 실행
 - `export_physics_scene.py`
   - grouped Gaussian scene을 physics stage용 JSON / NPZ와 rigid metadata로 export
 - `arguments/`
@@ -74,6 +80,83 @@
   - CUDA rasterizer 호출
 
 ## 핵심 구현 포인트
+
+### 0. Visual Hull Seed Initialization
+
+초기 Gaussian seed를 외부 PLY로 주입할 수 있습니다.
+
+- `build_visual_hull.py`가 `images + masks + cameras`에서 `visual_hull/visual_hull.ply`를 생성합니다.
+- 학습 시 `--init_mode visual_hull`를 주면 이 seed를 우선 사용합니다.
+- 다른 PLY를 직접 쓰고 싶으면 `--init_ply_path`를 줄 수 있습니다.
+
+예시:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/build_visual_hull.py \
+  --source_path /path/to/scene \
+  --masks_dir /path/to/masks \
+  --grid_resolution 128
+```
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/train.py \
+  --source_path /path/to/scene \
+  --model_path gaussian_initiailization/output/scene_vh \
+  --init_mode visual_hull \
+  --eval \
+  --disable_viewer
+```
+
+### 0.1 Mask-Aware COLMAP Pose Estimation
+
+foreground mask를 이용해 background를 제거한 이미지로 COLMAP pose를 다시 추정할 수 있습니다.
+
+- 입력 이미지는 `masked_colmap/input` 아래에 생성됩니다.
+- COLMAP 결과는 최종적으로 `source_path/sparse/0`에 반영됩니다.
+- 기존 `source_path/sparse`가 있으면 덮어쓰게 되므로 필요하면 미리 백업하세요.
+
+예시:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/estimate_masked_colmap.py \
+  --source_path /path/to/scene \
+  --masks_dir /path/to/masks \
+  --background_mode white \
+  --mask_dilate 5 \
+  --overwrite
+```
+
+### 0.2 End-to-End Orchestration
+
+한 번에 전체 초기화 파이프라인을 돌리고 싶으면 orchestration 스크립트를 사용할 수 있습니다.
+
+기본 흐름:
+
+- mask 추출
+- masked COLMAP
+- visual hull seed 생성
+- SAM2 feature 추출
+- visual hull seed로 SG-GS 학습
+
+예시:
+
+```bash
+python gaussian_initiailization/run_scene_initialization_pipeline.py \
+  --source_path /path/to/scene \
+  --model_path gaussian_initiailization/output/scene_pipeline \
+  --iterations 10000 \
+  --sam_feature_weight 0.1 \
+  --geometry_feature_dim 9 \
+  --alternating_optimization
+```
+
+이미 준비된 단계를 건너뛰고 싶으면:
+
+- `--skip_mask_extraction`
+- `--skip_masked_colmap`
+- `--skip_visual_hull`
+- `--skip_sam2`
+- `--skip_train`
 
 ### 1. Isotropic Gaussian
 
