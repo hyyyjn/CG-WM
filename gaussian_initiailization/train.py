@@ -115,6 +115,8 @@ def compute_sam_feature_loss(viewpoint_cam, gaussians, pipe, bg, separate_sh, we
 
     target_feature_map = viewpoint_cam.sam_feature_map
     feature_mask = viewpoint_cam.alpha_mask
+    if feature_mask is None:
+        feature_mask = torch.ones_like(target_feature_map[:1, ...])
     geometry_features = gaussians.get_geometry_features
 
     common_channels = min(int(geometry_features.shape[1]), int(target_feature_map.shape[0]))
@@ -164,6 +166,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+    # edit this: SG-GS Stage 1 should use decoupled optimization and SAM2 geometry features.
+    if opt.sg_gs_stage1:
+        opt.alternating_optimization = True
+        opt.joint_optimization = False
+        opt.require_sam_features = True
+        opt.geometry_rgb_weight = 0.0
+        if full_args is not None:
+            full_args.alternating_optimization = True
+            full_args.joint_optimization = False
+            full_args.require_sam_features = True
+            full_args.geometry_rgb_weight = 0.0
+        if opt.sam_feature_weight <= 0:
+            raise ValueError("--sg_gs_stage1 requires --sam_feature_weight > 0.")
+    if opt.require_sam_features and dataset.sam_features == "":
+        raise ValueError("--require_sam_features requires --sam_features to point at extracted SAM2 feature maps.")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, full_args if full_args is not None else dataset)
@@ -270,6 +287,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 geometry_image, geometry_l1, geometry_appearance_loss, geometry_depth_loss_tensor, geometry_depth_loss_value = compute_losses(
                     geometry_render_pkg, viewpoint_cam, opt, depth_weight_value
                 )
+                if opt.require_sam_features and viewpoint_cam.sam_feature_map is None:
+                    raise FileNotFoundError(
+                        f"SAM feature map is required but missing for view '{viewpoint_cam.image_name}'. "
+                        "Run extract_sam2_features.py and pass --sam_features."
+                    )
                 geometry_feature_loss_tensor, geometry_feature_loss_value = compute_sam_feature_loss(
                     viewpoint_cam,
                     gaussians,
@@ -280,11 +302,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     shared_screenspace_points=geometry_render_pkg["viewspace_points"],
                 )
                 geometry_reg = GEOMETRY_SCALE_REG_WEIGHT * gaussians.get_scaling.mean()
-                geometry_loss = geometry_appearance_loss + geometry_reg
+                # edit this: keep RGB geometry pressure optional so SG-GS can be feature-driven.
+                geometry_loss = geometry_reg + opt.geometry_rgb_weight * geometry_appearance_loss
                 if geometry_depth_loss_tensor is not None:
                     geometry_loss = geometry_loss + geometry_depth_loss_tensor
                 if geometry_feature_loss_tensor is not None:
                     geometry_loss = geometry_loss + geometry_feature_loss_tensor
+                elif opt.require_sam_features:
+                    raise RuntimeError("SAM feature loss was not computed even though SAM features are required.")
                 geometry_loss.backward()
 
                 densify_render_pkg = geometry_render_pkg
@@ -418,7 +443,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                     if use_sparse_adam:
-                        gaussians.optimizer.step(visible, radii.shape[0])
+                        # edit this: use the active render radii tensor in the non-decoupled path.
+                        gaussians.optimizer.step(visible, densify_radii.shape[0])
                     else:
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)

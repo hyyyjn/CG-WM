@@ -108,6 +108,10 @@ class OptimizationParams(ParamGroup):
         self.geometry_iters = 100
         self.appearance_iters = 100
         self.sam_feature_weight = 0.0
+        # edit this: SG-GS Stage 1 mode keeps geometry supervision feature-driven by default.
+        self.sg_gs_stage1 = False
+        self.geometry_rgb_weight = 1.0
+        self.require_sam_features = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
