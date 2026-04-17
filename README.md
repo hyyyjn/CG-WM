@@ -1,7 +1,10 @@
+한양대학교 졸프
+
 # CG-WM
 
 ContactGaussian-WM의 `scene initialization`을 중심으로 실험 중인 저장소입니다.
 현재 구현의 무게중심은 `gaussian_initiailization/` 아래에 있습니다.
+
 
 ## 현재 범위
 
@@ -75,7 +78,7 @@ conda run -n gaussian_splatting python gaussian_initiailization/train.py \
 
 ```bash
 conda run -n gaussian_splatting python gaussian_initiailization/render.py \
-  --source_path /path/to/scene \
+  --source_path /path/to/scene \SIBR_viewers
   --model_path gaussian_initiailization/output/scene_objaware \
   --iteration 10000 \
   --skip_train \
