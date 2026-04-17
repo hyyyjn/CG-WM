@@ -82,7 +82,7 @@
 - decoupled optimization이 실제로 구현되는 곳
 - geometry / appearance loss 분리가 적용되는 곳
 - SAM feature loss가 geometry step과 densification에 연결되는 곳
-- `densification_stats.jsonl`가 생성되는 곳
+- `densification_stat.jsonl`가 생성되는 곳
 
 ## 2. [scene/gaussian_model.py](/home/cgr-ugrad-2026/work/CG-WM/gaussian_initiailization/scene/gaussian_model.py)
 
