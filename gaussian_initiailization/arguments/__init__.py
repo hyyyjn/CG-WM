@@ -111,6 +111,8 @@ class OptimizationParams(ParamGroup):
         # edit this: SG-GS Stage 1 mode keeps geometry supervision feature-driven by default.
         self.sg_gs_stage1 = False
         self.geometry_rgb_weight = 1.0
+        self.stage1_densify_ratio = 0.6
+        self.stage1_appearance_refine = True
         self.require_sam_features = False
         self.object_mask_weight = 0.0
         self.object_mask_bce_weight = 1.0

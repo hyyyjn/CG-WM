@@ -202,11 +202,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         opt.joint_optimization = False
         opt.require_sam_features = True
         opt.geometry_rgb_weight = 0.0
+        strict_densify_until = max(int(opt.densify_from_iter) + 1, int(opt.iterations * opt.stage1_densify_ratio))
+        opt.densify_until_iter = min(int(opt.densify_until_iter), strict_densify_until)
         if full_args is not None:
             full_args.alternating_optimization = True
             full_args.joint_optimization = False
             full_args.require_sam_features = True
             full_args.geometry_rgb_weight = 0.0
+            full_args.densify_until_iter = opt.densify_until_iter
         if opt.sam_feature_weight <= 0:
             raise ValueError("--sg_gs_stage1 requires --sam_feature_weight > 0.")
     if opt.require_sam_features and dataset.sam_features == "":
@@ -276,6 +279,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             optimize_appearance = True
         else:
             optimize_geometry = True
+            optimize_appearance = True
+
+        # edit this: once Stage 1 densification stops, use the remaining iterations
+        # to sharpen appearance instead of continuing geometry updates that often
+        # preserve large blurry splats.
+        if opt.sg_gs_stage1 and opt.stage1_appearance_refine and iteration > opt.densify_until_iter:
+            optimize_geometry = False
             optimize_appearance = True
 
         # Every 1000 its we increase the levels of SH up to a maximum degree

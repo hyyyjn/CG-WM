@@ -1,5 +1,22 @@
 # Gaussian Initialization in CG-WM
 
+## Recent Update Summary
+
+Recent work in this directory focused on connecting a cleaner Stage 1 cube
+asset path to a reusable Stage 2 MuJoCo dataset path.
+
+In short:
+
+- Stage 1 asset generation was cleaned up so cube views, masks, and face
+  orientation cues are easier to trust and inspect.
+- Stage 1 training was adjusted to reduce late-stage blur by stopping
+  densification earlier and leaving room for appearance refinement.
+- Stage 2 now includes a dynamic cube rollout path with MuJoCo, segmentation-
+  based masks, GIF export, and looping preview support.
+
+For the detailed notes, execution commands, and output structure, see
+`EXPLAIN_DATASET.md`.
+
 이 디렉터리는 CG-WM의 scene initialization 실험 코드를 담고 있습니다.
 기반은 Inria의 3D Gaussian Splatting이며, 현재 코드는 ContactGaussian-WM 방향의 초기화 실험을 위해 아래 기능들이 추가된 상태입니다.
 
