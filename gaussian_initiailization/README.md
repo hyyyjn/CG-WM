@@ -165,6 +165,68 @@ python gaussian_initiailization/run_scene_initialization_pipeline.py \
 - `--skip_sam2`
 - `--skip_train`
 
+### 0.3 MuJoCo Synthetic Dataset Quickstart
+
+간단한 box / sphere / cylinder 장면을 MuJoCo로 렌더해서
+현재 scene initialization 코드가 바로 읽을 수 있는 synthetic 데이터셋을 만들 수 있습니다.
+
+생성 스크립트 출력 형식:
+
+- `images/train/*.png`
+- `images/test/*.png`
+- `masks/train/*.png`
+- `masks/test/*.png`
+- `transforms_train.json`
+- `transforms_test.json`
+
+예시:
+
+```bash
+MUJOCO_GL=egl conda run -n mujoco python gaussian_initiailization/generate_mujoco_synthetic_dataset.py \
+  --output_root gaussian_initiailization/output/mujoco_data \
+  --scene_name box_demo \
+  --object_type box \
+  --train_views 24 \
+  --test_views 8
+```
+
+headless 환경에서 `egl`이 안 되면 `MUJOCO_GL=osmesa`도 시도해볼 수 있습니다.
+
+그 다음 visual hull 기반 초기화 테스트:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/build_visual_hull.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_demo \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_demo/masks \
+  --grid_resolution 96
+```
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/train.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_demo \
+  --model_path gaussian_initiailization/output/mujoco_box_demo_init \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_demo/masks \
+  --init_mode visual_hull \
+  --iterations 3000 \
+  --object_mask_weight 0.1 \
+  --eval \
+  --disable_viewer
+```
+
+synthetic 데이터셋에는 COLMAP이 없으므로 `run_scene_initialization_pipeline.py`를 그대로 쓸 때는
+최소한 아래 옵션으로 COLMAP 관련 단계를 건너뛰는 편이 안전합니다.
+
+```bash
+python gaussian_initiailization/run_scene_initialization_pipeline.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_demo \
+  --model_path gaussian_initiailization/output/mujoco_box_demo_pipeline \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_demo/masks \
+  --skip_mask_extraction \
+  --skip_masked_colmap \
+  --skip_sam2 \
+  --iterations 3000
+```
+
 ### 1. Isotropic Gaussian
 
 `scene/gaussian_model.py`에서 anisotropic Gaussian을 그대로 쓰지 않습니다.
@@ -410,6 +472,32 @@ conda run -n sam2cpu python -c "import torch, sam2; print(torch.__version__); pr
 
 ## 실제 실행 절차
 
+### 0. 현재 기준 object-aware 흐름 요약
+
+지금 `main` 브랜치 기준으로 가장 대표적인 흐름은 아래입니다.
+
+1. foreground mask 준비
+   - 이미 있으면 `--masks_dir`로 사용
+   - 없으면 `extract_object_masks.py`로 생성
+2. SAM2 feature 준비
+   - `extract_sam2_features.py`로 `sam_features_sam2/` 생성
+3. object-aware Stage 1 학습
+   - `--sg_gs_stage1`
+   - `--sam_feature_weight`
+   - `--object_mask_weight`
+   - `--masks_dir`
+4. debug render 확인
+   - `renders`
+   - `foreground_scores`
+   - `foreground_overlay`
+   - `object_mask_prior`
+5. 필요하면 `--foreground_threshold`로 tighter render 생성
+
+현재 구현에서 object-aware 성분은 `mask prior -> object mask loss -> foreground score -> thresholded render`
+경로를 통해 가장 직접적으로 반영됩니다.
+
+즉 지금 단계에서는 `mask 품질`의 영향이 꽤 큰 편입니다.
+
 ### 1. SAM2 feature 추출
 
 먼저 SAM2 feature map을 만듭니다.
@@ -466,6 +554,27 @@ conda run -n gaussian_splatting python gaussian_initiailization/train.py \
   --sg_gs_stage1
 ```
 
+현재 `lego` 기준으로 실제 검증에 쓴 최신 명령은 아래입니다.
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/train.py \
+  --source_path /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego \
+  --model_path gaussian_initiailization/output/main_objaware_lego_10k \
+  --iterations 10000 \
+  --resolution 8 \
+  --sam_features sam_features_sam2 \
+  --sam_feature_weight 0.1 \
+  --geometry_feature_dim 9 \
+  --masks_dir /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego/auto_masks \
+  --object_mask_weight 0.1 \
+  --eval \
+  --disable_viewer \
+  --quiet \
+  --sg_gs_stage1 \
+  --test_iterations -1 \
+  --save_iterations 10000
+```
+
 ### 3. 렌더
 
 ```bash
@@ -511,6 +620,31 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 
 이 경우 출력은 `test_fgthr_0p5/ours_<iter>/...` 아래에 저장됩니다.
 
+현재 코드에서는 `cfg_args` 병합 과정 때문에 `foreground_threshold`를 명시하지 않으면
+일부 환경에서 기본값이 빠지는 경우가 있습니다.
+그래서 전체 Gaussian을 포함한 기본 object-aware render도 아래처럼 `0.0`을 명시하는 것을 권장합니다.
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/render.py \
+  --source_path /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego \
+  --model_path gaussian_initiailization/output/main_objaware_lego_10k \
+  --iteration 10000 \
+  --skip_train \
+  --resolution 8 \
+  --eval \
+  --quiet \
+  --geometry_feature_dim 9 \
+  --masks_dir /home/cgr-ugrad-2026/Downloads/nerf_synthetic/lego/auto_masks \
+  --foreground_threshold 0.0
+```
+
+즉 현재 권장 비교는 아래 두 결과입니다.
+
+- `test_fgthr_0p0`
+  - object-aware 학습 결과 전체
+- `test_fgthr_0p5`
+  - foreground score가 낮은 Gaussian을 제거한 tighter render
+
 ## 최근 검증 결과
 
 실제로 아래가 확인되었습니다.
@@ -534,6 +668,9 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 - `lego_objaware_mask_10k` 10,000 iteration object-aware 학습 성공
 - `foreground_scores`, `object_mask_prior`, `foreground_overlay` debug render 저장 확인
 - `--foreground_threshold 0.5` 기반 thresholded render 생성 확인
+- `main_objaware_lego_10k` 10,000 iteration object-aware 학습 성공
+- `main_objaware_lego_10k/test_fgthr_0p0` 전체 object-aware render 확인
+- `main_objaware_lego_10k/test_fgthr_0p5` tighter render 확인
 
 예시 결과:
 
@@ -545,6 +682,9 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 - object-aware 10k 모델: `gaussian_initiailization/output/lego_objaware_mask_10k`
 - object-aware render: `gaussian_initiailization/output/lego_objaware_mask_10k/test/ours_10000`
 - thresholded render: `gaussian_initiailization/output/lego_objaware_mask_10k/test_fgthr_0p5/ours_10000`
+- 최신 main 기준 object-aware 10k 모델: `gaussian_initiailization/output/main_objaware_lego_10k`
+- 최신 main 기준 전체 render: `gaussian_initiailization/output/main_objaware_lego_10k/test_fgthr_0p0/ours_10000`
+- 최신 main 기준 thresholded render: `gaussian_initiailization/output/main_objaware_lego_10k/test_fgthr_0p5/ours_10000`
 
 ## 현재 코드에 있는 주요 옵션
 
@@ -810,10 +950,11 @@ conda run -n gaussian_splatting python gaussian_initiailization/prepare_instance
 
 - geometry supervision은 현재 SAM2 feature, optional depth, optional object mask까지 연결된 1차 구현입니다.
 - SAM2 feature는 더 이상 3채널 고정은 아니지만, 아직 object consistency 자체를 직접 강하게 밀어주는 단계는 아닙니다.
+- 현재 object-aware 분리는 `foreground/background-aware separation`에 더 가깝고, multi-instance separation은 아직 약합니다.
+- 따라서 현재 object-aware 품질은 `mask prior` 품질에 크게 영향을 받습니다.
 - automatic grouping은 2D mask 품질에 크게 의존합니다.
 - 현재 physics export는 intermediate representation이며, differentiable rigid-body solver와 직접 결합되지는 않습니다.
 - object-only rendering, foreground score render, object mask prior render, overlay debug render는 구현되어 있습니다.
-- foreground/background 분리는 아직 foreground score 중심이며, multi-instance separation은 아직 약합니다.
 - halo를 줄이기 위한 `--foreground_threshold`는 들어갔지만, 학습 내부 pruning/regularization은 더 보강할 여지가 있습니다.
 
 ## 논문 정렬을 위한 다음 구현

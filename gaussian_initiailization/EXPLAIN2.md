@@ -12,9 +12,100 @@
 - 결과 파일이 어디에 어떤 구조로 저장되는지
 - SIBR viewer에서 왜 검정 화면이 나왔고 어떻게 해결했는지
 
+## 0. 현재 기준 흐름
+
+이 문서는 원래 `stage1 bunny synthetic` 실험 메모로 시작했지만,
+현재 기준으로는 아래 흐름까지 포함해서 읽는 것이 맞습니다.
+
+### 0.1 지금 메인 브랜치에서 실제로 쓰는 루프
+
+현재 object-aware scene initialization의 대표 흐름은 아래입니다.
+
+1. foreground mask 준비
+   - 이미 있으면 `--masks_dir`로 사용
+   - 없으면 `extract_object_masks.py`
+2. 필요하면 masked COLMAP 재추정
+   - `estimate_masked_colmap.py`
+3. 필요하면 visual hull seed 생성
+   - `build_visual_hull.py`
+4. SAM2 feature 추출
+   - `extract_sam2_features.py`
+5. object-aware Stage 1 학습
+   - `train.py`
+   - `--sg_gs_stage1`
+   - `--sam_feature_weight`
+   - `--object_mask_weight`
+   - `--masks_dir`
+6. debug render 확인
+   - `render.py`
+   - `renders`
+   - `foreground_scores`
+   - `foreground_overlay`
+   - `object_mask_prior`
+7. 필요하면 `--foreground_threshold`로 tighter render 생성
+
+즉 지금 구현의 중심은 더 이상 `post-hoc grouping` 하나가 아니라,
+학습 안에 들어간 `object mask prior + foreground score` 경로입니다.
+
+### 0.2 현재 object-aware 학습이 실제로 어떻게 동작하는가
+
+현재 학습에서 object-aware 성분은 대략 아래 경로로 연결됩니다.
+
+```text
+mask prior
+  -> Camera.object_mask
+  -> compute_object_mask_loss
+  -> Gaussian foreground_logit
+  -> foreground score render
+  -> foreground_threshold render
+```
+
+여기서 중요한 점은 두 가지입니다.
+
+- 지금 구현은 `instance-level object decomposition`보다는 `foreground/background-aware separation`에 더 가깝습니다.
+- 따라서 현재 단계에서는 `mask 품질`이 결과에 꽤 큰 영향을 줍니다.
+
+### 0.3 현재 대표 실험
+
+현재 메인 브랜치 기준 대표 실험은 `lego` object-aware 10k 학습입니다.
+
+모델 경로:
+
+```text
+gaussian_initiailization/output/main_objaware_lego_10k
+```
+
+대표 출력:
+
+```text
+point_cloud/iteration_10000/point_cloud.ply
+test_fgthr_0p0/ours_10000/renders
+test_fgthr_0p0/ours_10000/foreground_scores
+test_fgthr_0p0/ours_10000/foreground_overlay
+test_fgthr_0p0/ours_10000/object_mask_prior
+test_fgthr_0p5/ours_10000/renders
+```
+
+이때 보통은 아래 둘을 같이 봅니다.
+
+- `test_fgthr_0p0`
+  - 학습된 전체 object-aware 결과
+- `test_fgthr_0p5`
+  - foreground score가 낮은 Gaussian을 잘라낸 tighter 결과
+
+### 0.4 현재 흐름에서 바로 보이는 한계
+
+- foreground/background separation은 가능하지만, multi-instance separation은 아직 약함
+- object-aware 결과는 mask 품질에 크게 영향받음
+- halo를 줄이기 위해 render 시 threshold를 쓰는 경우가 많음
+- 논문식 rigid-body dynamics stage는 아직 없음
+
+아래 섹션들은 이 현재 흐름의 배경이 된 `stage1 strict`, synthetic bunny, viewer 대응 작업을 기록한 히스토리 메모로 읽으면 됩니다.
+
 ## 1. 현재 목표
 
 현재 목표는 논문 전체 pipeline을 전부 구현하는 것이 아니라, 먼저 Stage 1을 안정적으로 구현하는 것입니다.
+현재는 이 Stage 1 위에 object-aware separation 실험까지 일부 얹힌 상태입니다.
 
 지금 구현/테스트한 범위는 다음과 같습니다.
 
@@ -77,7 +168,7 @@ SAM2는 Visual Hull 자체를 만드는 도구로 구현한 것이 아닙니다.
 
 - Visual Hull: real-world object의 초기 3D point cloud 생성용
 - SAM2 feature: Stage 1 geometry feature supervision용
-- SAM2 mask: Visual Hull을 만들 때 object mask 후보로 쓸 수는 있지만, 현재 구현은 SAM2 mask로 Visual Hull을 만드는 단계까지 가지 않았음
+- SAM2 mask: Visual Hull을 만들 때 object mask 후보로 쓸 수는 있지만, 현재 구현에서 object-aware 분리는 주로 `mask prior + object mask loss` 경로를 통해 반영됨
 
 ## 3. Stage 1 strict 모드
 
