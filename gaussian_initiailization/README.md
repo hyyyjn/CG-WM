@@ -69,6 +69,243 @@ For the detailed notes, execution commands, and output structure, see
 즉 rigid-body dynamics 자체는 아직 없지만, 그 직전 단계까지는 코드와 입출력 경로가 연결된 상태입니다.
 최근 구현의 중심은 `grouping`보다는 `train.py` 내부의 object-aware supervision과 `gaussian_model.py`의 foreground score입니다.
 
+## Branch / Origin 비교
+
+현재 이 코드 설명은 `data_optimization` 브랜치를 기준으로 합니다.
+
+```text
+current branch: data_optimization
+tracking branch: origin/data_optimization
+module path: gaussian_initiailization
+```
+
+현재 로컬 `data_optimization` 브랜치는 `origin/data_optimization`과 커밋 기준으로는 같습니다.
+다만 이 README에 추가한 문서 변경처럼, 커밋되지 않은 로컬 변경이 있을 수 있습니다.
+
+`origin/main`과 비교하면 `data_optimization`에는 Stage 1 blur / asset / training 개선과
+Stage 2 MuJoCo dataset scaffold가 추가되어 있습니다.
+
+주요 차이는 아래와 같습니다.
+
+- `EXPLAIN_DATASET.md` 추가
+- Stage 1 학습 옵션 추가
+  - `--sg_gs_stage1`
+  - `--stage1_densify_ratio`
+  - `--stage1_appearance_refine`
+  - `--geometry_rgb_weight`
+  - `--require_sam_features`
+- `train.py`의 Stage 1 strict mode 정리
+  - SAM feature 필수화
+  - densification 조기 종료
+  - 후반 appearance refine
+  - geometry RGB pressure 제어
+- `render.py`의 `foreground_threshold` config fallback 추가
+- `render_object_views_blender.py`의 Stage 1 asset 생성 개선
+  - cube face palette
+  - mask fallback
+  - camera / framing 옵션 정리
+- Stage 2 / MuJoCo tool 추가
+  - `tools/create_contactwm_stage2_layout.py`
+  - `tools/generate_mujoco_fall_dataset.py`
+  - `tools/preview_mujoco_fall.py`
+  - `tools/export_episode_gif.py`
+- 테스트용 mesh 추가
+  - `tools/test_cube.obj`
+  - `tools/test_sphere.obj`
+
+반대로 `origin/main`에는 `data_optimization`에 아직 merge되지 않은 최신 변경도 있습니다.
+확인 시점 기준으로는 `origin/main`의 `latest update` 커밋에 아래 계열의 변경이 포함되어 있었습니다.
+
+- `EXPLAIN2.md` 업데이트
+- `README.md` 업데이트
+- `generate_mujoco_synthetic_dataset.py` 추가
+
+따라서 현재 실험 결과를 해석할 때는,
+`origin/main` 전체가 아니라 `data_optimization` 브랜치의 scene initialization / MuJoCo dataset 코드 기준으로 보는 것이 맞습니다.
+
+## Scene Initialization 흐름
+
+현재 scene initialization은 MuJoCo / synthetic multi-view object data를 받아,
+mask와 camera pose를 이용해 object 중심 spherical Gaussian representation을 학습하고,
+foreground / object-only 렌더링이 가능한 Gaussian PLY를 출력하는 과정입니다.
+
+전체 흐름은 아래와 같습니다.
+
+```text
+MuJoCo / synthetic RGB, mask, camera
+-> points3d 또는 visual hull seed
+-> spherical Gaussian 초기화
+-> geometry / appearance decoupled optimization
+-> foreground_logit / object_id 포함 PLY 저장
+-> render.py로 전체 / object-only 렌더
+-> metrics.py로 평가
+```
+
+### 1. 입력 데이터
+
+입력 데이터는 보통 아래 구조를 가집니다.
+
+```text
+output/mujoco_data/<scene_name>/
+  images/
+    train/
+    test/
+  masks/
+    train/
+    test/
+  transforms_train.json
+  transforms_test.json
+  points3d.ply
+  visual_hull/
+    visual_hull.ply
+```
+
+- `images/*`: MuJoCo 또는 synthetic renderer가 만든 multi-view RGB입니다.
+- `masks/*`: foreground object mask입니다.
+- `transforms_*.json`: Blender-style camera pose와 intrinsics입니다.
+- `points3d.ply`: 기본 초기 point cloud입니다.
+- `visual_hull/visual_hull.ply`: mask와 camera에서 만든 object-centric seed입니다.
+
+즉 Stage 1은 MuJoCo object를 직접 시뮬레이션하는 단계가 아니라,
+MuJoCo로 생성된 관측을 받아 object의 Gaussian representation을 초기화하는 단계입니다.
+
+### 2. 초기 Gaussian seed 선택
+
+학습 시작점은 `--init_mode`로 정합니다.
+
+- `--init_mode default`
+  - dataset의 `points3d.ply`를 사용합니다.
+  - point 수가 많으면 학습은 무거워지지만, noisy / non-object seed가 많을 수 있습니다.
+- `--init_mode visual_hull`
+  - `visual_hull/visual_hull.ply` 또는 `--init_ply_path`를 사용합니다.
+  - mask가 좋으면 object-centric seed가 되지만, grid 설정에 따라 point 수가 너무 작을 수 있습니다.
+
+최근 확인한 MuJoCo box 데이터에서는 `points3d.ply`가 100000 points,
+기존 `visual_hull.ply`가 120 points였습니다. 이 차이 때문에 같은 10000 iteration이어도
+실제 학습 시간과 품질이 크게 달라질 수 있습니다.
+
+### 3. Spherical Gaussian 초기화
+
+`scene/gaussian_model.py`는 기존 anisotropic 3DGS를 그대로 쓰지 않고,
+scene initialization 단계에서 spherical Gaussian처럼 동작하도록 제한합니다.
+
+- `get_scaling`: 내부 3축 scale의 평균을 사용합니다.
+- `get_rotation`: identity quaternion을 반환합니다.
+
+따라서 PLY에는 `scale_*`, `rot_*` 필드가 남아 있어도,
+렌더링과 학습에서 읽히는 표현은 회전 없는 isotropic Gaussian에 가깝습니다.
+
+### 4. Geometry / Appearance Decoupled Optimization
+
+`train.py`는 geometry와 appearance를 분리해서 최적화할 수 있습니다.
+
+예시:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/train.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
+  --model_path gaussian_initiailization/output/mujoco_box_res2_alt_10k \
+  --images images \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
+  --resolution 2 \
+  --iterations 10000 \
+  --eval \
+  --disable_viewer \
+  --alternating_optimization \
+  --geometry_iters 1 \
+  --appearance_iters 1 \
+  --object_mask_weight 0.1
+```
+
+`--alternating_optimization --geometry_iters 1 --appearance_iters 1`을 사용하면
+geometry step과 appearance step을 번갈아 수행합니다.
+
+- geometry 쪽:
+  - `xyz`
+  - `scaling`
+  - `rotation`
+  - `features_geo`
+  - `foreground_logit`
+- appearance 쪽:
+  - SH color features
+  - opacity
+  - exposure
+
+### 5. Object / Foreground Supervision
+
+`--masks_dir`와 `--object_mask_weight`를 주면 foreground mask prior가 학습에 들어갑니다.
+
+학습 중에는 Gaussian별 foreground score를 렌더링한 뒤 target mask와 비교합니다.
+이 score는 최종 PLY의 `foreground_logit`으로 저장됩니다.
+
+최종 PLY에는 아래와 같은 object-aware field가 포함됩니다.
+
+```text
+features_geo
+foreground_logit
+object_id
+opacity
+scale_*
+rot_*
+```
+
+따라서 학습 결과는 전체 scene 렌더뿐 아니라 foreground threshold 기반 object-only 렌더에도 사용할 수 있습니다.
+
+### 6. Render / Object-Only Render / Metrics
+
+학습 후 전체 Gaussian render를 생성합니다.
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/render.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
+  --model_path gaussian_initiailization/output/mujoco_box_res2_alt_10k \
+  --images images \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
+  --iteration 10000 \
+  --quiet
+```
+
+foreground score 기준 object-only render는 아래처럼 생성합니다.
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/render.py \
+  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
+  --model_path gaussian_initiailization/output/mujoco_box_res2_alt_10k \
+  --images images \
+  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
+  --iteration 10000 \
+  --foreground_threshold 0.5 \
+  --quiet
+```
+
+출력은 보통 아래에 저장됩니다.
+
+```text
+model_path/
+  test/ours_10000/
+    renders/
+    gt/
+    foreground_scores/
+    foreground_overlay/
+    object_mask_prior/
+  test_fgthr_0p5/ours_10000/
+    renders/
+    gt/
+    foreground_scores/
+    foreground_overlay/
+    object_mask_prior/
+```
+
+metric은 `metrics.py`로 계산합니다.
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/metrics.py \
+  --model_paths gaussian_initiailization/output/mujoco_box_res2_alt_10k
+```
+
+여기서 비교되는 것은 MuJoCo / synthetic renderer가 만든 GT image와,
+학습된 Gaussian representation을 같은 camera pose에서 다시 렌더링한 image입니다.
+
 ## 코드 구조
 
 - `train.py`
