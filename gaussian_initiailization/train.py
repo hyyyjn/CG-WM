@@ -202,11 +202,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         opt.joint_optimization = False
         opt.require_sam_features = True
         opt.geometry_rgb_weight = 0.0
+        strict_densify_until = max(int(opt.densify_from_iter) + 1, int(opt.iterations * opt.stage1_densify_ratio))
+        opt.densify_until_iter = min(int(opt.densify_until_iter), strict_densify_until)
         if full_args is not None:
             full_args.alternating_optimization = True
             full_args.joint_optimization = False
             full_args.require_sam_features = True
             full_args.geometry_rgb_weight = 0.0
+            full_args.densify_until_iter = opt.densify_until_iter
         if opt.sam_feature_weight <= 0:
             raise ValueError("--sg_gs_stage1 requires --sam_feature_weight > 0.")
     if opt.require_sam_features and dataset.sam_features == "":
@@ -243,6 +246,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_appearance_loss_for_log = 0.0
     ema_object_mask_loss_for_log = 0.0
     densification_log_path = os.path.join(dataset.model_path, "densification_stats.jsonl")
+    last_densification_iter = int(opt.densify_from_iter)
+    last_opacity_reset_iter = 0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -276,6 +281,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             optimize_appearance = True
         else:
             optimize_geometry = True
+            optimize_appearance = True
+
+        # edit this: once Stage 1 densification stops, use the remaining iterations
+        # to sharpen appearance instead of continuing geometry updates that often
+        # preserve large blurry splats.
+        if opt.sg_gs_stage1 and opt.stage1_appearance_refine and iteration > opt.densify_until_iter:
+            optimize_geometry = False
             optimize_appearance = True
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -442,11 +454,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[densify_visibility_filter] = torch.max(gaussians.max_radii2D[densify_visibility_filter], densify_radii[densify_visibility_filter])
                 gaussians.add_densification_stats(densify_viewspace_points, densify_visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                densification_due = (
+                    iteration > opt.densify_from_iter
+                    and (iteration - last_densification_iter) >= opt.densification_interval
+                )
+                if densification_due:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     densification_summary = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, densify_radii)
                     densification_summary.update({
                         "iteration": int(iteration),
+                        "iteration_since_last_densification": int(iteration - last_densification_iter),
                         "sam_feature_weight": float(opt.sam_feature_weight),
                         "geometry_feature_loss": float(geometry_feature_loss_value),
                         "object_mask_loss": float(object_mask_loss_value),
@@ -464,9 +481,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar("densification/pruned", densification_summary["pruned"], iteration)
                         tb_writer.add_scalar("densification/net_new_points", densification_summary["net_new_points"], iteration)
                         tb_writer.add_scalar("densification/geometry_feature_loss", densification_summary["geometry_feature_loss"], iteration)
+                    last_densification_iter = int(iteration)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                opacity_reset_due = (
+                    (iteration - last_opacity_reset_iter) >= opt.opacity_reset_interval
+                    or (dataset.white_background and iteration >= opt.densify_from_iter and last_opacity_reset_iter < opt.densify_from_iter)
+                )
+                if opacity_reset_due:
                     gaussians.reset_opacity()
+                    last_opacity_reset_iter = int(iteration)
 
             # Optimizer step
             if iteration < opt.iterations:

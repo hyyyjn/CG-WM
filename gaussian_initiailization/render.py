@@ -166,6 +166,9 @@ if __name__ == "__main__":
     args = get_combined_args(parser)
     if not hasattr(args, "object_id"):
         args.object_id = None
+    # edit this: older cfg_args may not include foreground_threshold yet.
+    if not hasattr(args, "foreground_threshold"):
+        args.foreground_threshold = None
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

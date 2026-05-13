@@ -22,6 +22,13 @@ def parse_args():
     )
     parser.add_argument("--mesh_path", required=True, type=str)
     parser.add_argument("--output_path", required=True, type=str)
+    parser.add_argument("--object_name", default="", type=str)
+    parser.add_argument(
+        "--physics_shape",
+        default="box",
+        choices=("box", "sphere"),
+        help="Physics proxy shape to record for downstream MuJoCo dataset generation.",
+    )
     parser.add_argument("--num_views", default=72, type=int)
     parser.add_argument("--test_hold", default=8, type=int, help="Every Nth view is assigned to test.")
     parser.add_argument("--resolution", default=512, type=int)
@@ -31,12 +38,15 @@ def parse_args():
     parser.add_argument("--elevation_max", default=60.0, type=float)
     parser.add_argument("--point_count", default=100000, type=int)
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--density", default=1000.0, type=float)
+    parser.add_argument("--friction", default=0.5, type=float)
+    parser.add_argument("--restitution", default=0.1, type=float)
     parser.add_argument("--white_background", action="store_true")
     parser.add_argument(
         "--material_mode",
         default="gray",
-        choices=("gray", "position_bands"),
-        help="Use gray for geometry checks or position_bands for appearance/color checks.",
+        choices=("gray", "position_bands", "face_palette"),
+        help="Use gray for geometry checks, position_bands for generic color checks, or face_palette for box-like objects.",
     )
     return parser.parse_args(argv)
 
@@ -98,7 +108,13 @@ def normalize_objects(mesh_objects):
         obj.scale = obj.scale * scale
         bpy.context.view_layer.update()
 
-    return 1.0
+    return {
+        "bbox_min": [float(bbox_min.x), float(bbox_min.y), float(bbox_min.z)],
+        "bbox_max": [float(bbox_max.x), float(bbox_max.y), float(bbox_max.z)],
+        "center": [float(center.x), float(center.y), float(center.z)],
+        "scale": float(scale),
+        "target_extent": 2.0,
+    }
 
 
 def make_material(name, color):
@@ -132,6 +148,23 @@ def band_color(point):
     return colors[band_index(point)]
 
 
+def face_palette_colors():
+    return (
+        (230 / 255.0, 77 / 255.0, 61 / 255.0, 1.0),
+        (73 / 255.0, 188 / 255.0, 103 / 255.0, 1.0),
+        (62 / 255.0, 126 / 255.0, 236 / 255.0, 1.0),
+        (243 / 255.0, 197 / 255.0, 67 / 255.0, 1.0),
+        (161 / 255.0, 94 / 255.0, 255 / 255.0, 1.0),
+        (48 / 255.0, 198 / 255.0, 210 / 255.0, 1.0),
+    )
+
+
+def dominant_axis_index(world_normal):
+    axis = max(range(3), key=lambda idx: abs(world_normal[idx]))
+    sign = 0 if world_normal[axis] >= 0 else 1
+    return axis * 2 + sign
+
+
 def setup_materials(mesh_objects, material_mode):
     # edit this: position_bands makes appearance/color optimization visible in
     # synthetic Stage 1 tests; gray remains the default geometry-only check.
@@ -142,19 +175,31 @@ def setup_materials(mesh_objects, material_mode):
             obj.data.materials.append(material)
         return
 
+    if material_mode == "position_bands":
+        material_colors = [
+            (224 / 255.0, 58 / 255.0, 50 / 255.0, 1.0),
+            (64 / 255.0, 184 / 255.0, 92 / 255.0, 1.0),
+            (54 / 255.0, 118 / 255.0, 230 / 255.0, 1.0),
+            (242 / 255.0, 190 / 255.0, 64 / 255.0, 1.0),
+        ]
+    else:
+        material_colors = list(face_palette_colors())
+
     materials = [
-        make_material("stage1_red_band", (224 / 255.0, 58 / 255.0, 50 / 255.0, 1.0)),
-        make_material("stage1_green_band", (64 / 255.0, 184 / 255.0, 92 / 255.0, 1.0)),
-        make_material("stage1_blue_band", (54 / 255.0, 118 / 255.0, 230 / 255.0, 1.0)),
-        make_material("stage1_yellow_band", (242 / 255.0, 190 / 255.0, 64 / 255.0, 1.0)),
+        make_material(f"stage1_material_{idx}", color)
+        for idx, color in enumerate(material_colors)
     ]
     for obj in mesh_objects:
         obj.data.materials.clear()
         for material in materials:
             obj.data.materials.append(material)
         for polygon in obj.data.polygons:
-            world_center = obj.matrix_world @ polygon.center
-            polygon.material_index = band_index(world_center)
+            if material_mode == "position_bands":
+                world_center = obj.matrix_world @ polygon.center
+                polygon.material_index = band_index(world_center)
+            else:
+                world_normal = (obj.matrix_world.to_3x3() @ polygon.normal).normalized()
+                polygon.material_index = dominant_axis_index(world_normal)
 
 
 def setup_scene(resolution, white_background, lens):
@@ -224,9 +269,18 @@ def render_view(scene, camera, image_path, mask_path):
     pixels = list(rendered.pixels)
     mask = bpy.data.images.new(f"mask_{image_path.stem}", width=width, height=height, alpha=False)
     mask_pixels = [0.0] * (width * height * 4)
+    background_is_white = bool(scene.world.color[0] > 0.9 and scene.world.color[1] > 0.9 and scene.world.color[2] > 0.9)
     for idx in range(width * height):
+        red = pixels[idx * 4 + 0]
+        green = pixels[idx * 4 + 1]
+        blue = pixels[idx * 4 + 2]
         alpha = pixels[idx * 4 + 3]
-        value = 1.0 if alpha > 0.01 else 0.0
+        if alpha > 0.01 and alpha < 0.99:
+            value = 1.0
+        elif background_is_white:
+            value = 0.0 if (red > 0.97 and green > 0.97 and blue > 0.97) else 1.0
+        else:
+            value = 1.0 if (red > 0.03 or green > 0.03 or blue > 0.03) else 0.0
         mask_pixels[idx * 4 + 0] = value
         mask_pixels[idx * 4 + 1] = value
         mask_pixels[idx * 4 + 2] = value
@@ -309,6 +363,17 @@ def write_points_ply(path, points, material_mode):
         for point in points:
             if material_mode == "position_bands":
                 red, green, blue = band_color(point)
+            elif material_mode == "face_palette":
+                palette = (
+                    (230, 77, 61),
+                    (73, 188, 103),
+                    (62, 126, 236),
+                    (243, 197, 67),
+                    (161, 94, 255),
+                    (48, 198, 210),
+                )
+                axis = dominant_axis_index(point.normalized() if point.length > 1e-8 else mathutils.Vector((0.0, 0.0, 1.0)))
+                red, green, blue = palette[axis]
             else:
                 red, green, blue = (184, 184, 184)
             f.write(f"{point.x:.8f} {point.y:.8f} {point.z:.8f} 0 0 0 {red} {green} {blue}\n")
@@ -324,6 +389,7 @@ def main():
     args = parse_args()
     mesh_path = Path(args.mesh_path).expanduser().resolve()
     output_path = Path(args.output_path).expanduser().resolve()
+    object_name = args.object_name.strip() if args.object_name.strip() else mesh_path.stem
     if not mesh_path.exists():
         raise FileNotFoundError(mesh_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -331,7 +397,7 @@ def main():
 
     reset_scene()
     mesh_objects = import_mesh(mesh_path)
-    normalize_objects(mesh_objects)
+    normalization = normalize_objects(mesh_objects)
     setup_materials(mesh_objects, args.material_mode)
     camera = setup_scene(args.resolution, args.white_background, args.lens)
 
@@ -370,6 +436,8 @@ def main():
     write_points_ply(output_path / "points3d.ply", points, args.material_mode)
 
     summary = {
+        "object_name": str(object_name),
+        "physics_shape": str(args.physics_shape),
         "mesh_path": str(mesh_path),
         "output_path": str(output_path),
         "num_views": int(args.num_views),
@@ -378,9 +446,29 @@ def main():
         "resolution": int(args.resolution),
         "point_count": int(args.point_count),
         "material_mode": str(args.material_mode),
+        "normalization": normalization,
+        "physics_prior": {
+            "density": float(args.density),
+            "friction": float(args.friction),
+            "restitution": float(args.restitution),
+        },
     }
     with open(output_path / "stage1_dataset_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    object_asset = {
+        "object_name": str(object_name),
+        "physics_shape": str(args.physics_shape),
+        "mesh_path": str(mesh_path),
+        "stage1_dataset_path": str(output_path),
+        "stage1_points_ply": str(output_path / "points3d.ply"),
+        "stage1_summary_path": str(output_path / "stage1_dataset_summary.json"),
+        "normalization": normalization,
+        "physics_prior": summary["physics_prior"],
+        "material_mode": str(args.material_mode),
+    }
+    with open(output_path / "object_asset.json", "w", encoding="utf-8") as f:
+        json.dump(object_asset, f, indent=2)
     print(json.dumps(summary, indent=2))
 
 
