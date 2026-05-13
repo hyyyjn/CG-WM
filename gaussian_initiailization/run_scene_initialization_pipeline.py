@@ -9,41 +9,67 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run the ContactGaussian-WM-style scene initialization pipeline end-to-end."
     )
-    parser.add_argument("--source_path", required=True, type=str)
-    parser.add_argument("--model_path", required=True, type=str)
-    parser.add_argument("--masks_dir", default="", type=str)
-    parser.add_argument("--images", default="images", type=str)
-    parser.add_argument("--sam_features", default="sam_features_sam2", type=str)
-    parser.add_argument("--visual_hull_ply", default="", type=str)
-    parser.add_argument("--gaussian_env", default="gaussian_splatting", type=str)
-    parser.add_argument("--sam2_env", default="sam2cpu", type=str)
-    parser.add_argument("--sam_checkpoint", default="", type=str)
-    parser.add_argument("--sam_config", default="configs/sam2.1/sam2.1_hiera_t.yaml", type=str)
-    parser.add_argument("--sam_output_channels", default=9, type=int)
-    parser.add_argument("--sam_feature_source", default="high_res0", type=str)
-    parser.add_argument("--grid_resolution", default=128, type=int)
-    parser.add_argument("--vh_max_points", default=200000, type=int)
-    parser.add_argument("--iterations", default=10000, type=int)
-    parser.add_argument("--resolution", default=8, type=int)
-    parser.add_argument("--sam_feature_weight", default=0.1, type=float)
-    parser.add_argument("--geometry_feature_dim", default=9, type=int)
-    parser.add_argument("--skip_mask_extraction", action="store_true")
-    parser.add_argument("--skip_masked_colmap", action="store_true")
-    parser.add_argument("--skip_visual_hull", action="store_true")
-    parser.add_argument("--skip_sam2", action="store_true")
-    parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--mask_method", default="auto", choices=["auto", "alpha", "bg_subtract"])
-    parser.add_argument("--mask_background_mode", default="white", choices=["white", "black", "keep"])
-    parser.add_argument("--mask_dilate", default=5, type=int)
-    parser.add_argument("--no_gpu_colmap", action="store_true")
-    parser.add_argument("--joint_optimization", action="store_true")
-    parser.add_argument("--alternating_optimization", action="store_true")
-    parser.add_argument("--geometry_iters", default=1, type=int)
-    parser.add_argument("--appearance_iters", default=1, type=int)
-    parser.add_argument("--disable_viewer", action="store_true", default=True)
-    parser.add_argument("--eval", action="store_true", default=True)
-    parser.add_argument("--quiet", action="store_true", default=True)
-    parser.add_argument("--dry_run", action="store_true")
+
+    required = parser.add_argument_group("required paths")
+    required.add_argument("--source_path", required=True, type=str)
+    required.add_argument("--model_path", required=True, type=str)
+
+    data = parser.add_argument_group("data inputs")
+    data.add_argument("--images", default="images", type=str)
+    data.add_argument("--masks_dir", default="", type=str)
+    data.add_argument("--sam_features", default="sam_features_sam2", type=str)
+    data.add_argument("--visual_hull_ply", default="", type=str)
+
+    stage1 = parser.add_argument_group("stage 1 training preset")
+    stage1.add_argument(
+        "--stage1_preset",
+        default="contactwm",
+        choices=["contactwm", "baseline", "custom"],
+    )
+    stage1.add_argument(
+        "--init_mode",
+        default="visual_hull",
+        choices=["default", "colmap_sparse", "visual_hull", "random"],
+    )
+    stage1.add_argument("--iterations", default=10000, type=int)
+    stage1.add_argument("--resolution", default=8, type=int)
+    stage1.add_argument("--geometry_feature_dim", default=9, type=int)
+    stage1.add_argument("--sam_feature_weight", default=0.1, type=float)
+    stage1.add_argument("--object_mask_weight", default=0.1, type=float)
+    stage1.add_argument("--object_mask_bce_weight", default=1.0, type=float)
+
+    custom_opt = parser.add_argument_group("custom optimization overrides")
+    custom_opt.add_argument("--joint_optimization", action="store_true")
+    custom_opt.add_argument("--alternating_optimization", action="store_true")
+    custom_opt.add_argument("--geometry_iters", default=1, type=int)
+    custom_opt.add_argument("--appearance_iters", default=1, type=int)
+
+    preprocessing = parser.add_argument_group("preprocessing")
+    preprocessing.add_argument("--grid_resolution", default=128, type=int)
+    preprocessing.add_argument("--vh_max_points", default=200000, type=int)
+    preprocessing.add_argument("--mask_method", default="auto", choices=["auto", "alpha", "bg_subtract"])
+    preprocessing.add_argument("--mask_background_mode", default="white", choices=["white", "black", "keep"])
+    preprocessing.add_argument("--mask_dilate", default=5, type=int)
+    preprocessing.add_argument("--sam_checkpoint", default="", type=str)
+    preprocessing.add_argument("--sam_config", default="configs/sam2.1/sam2.1_hiera_t.yaml", type=str)
+    preprocessing.add_argument("--sam_output_channels", default=9, type=int)
+    preprocessing.add_argument("--sam_feature_source", default="high_res0", type=str)
+
+    pipeline = parser.add_argument_group("pipeline controls")
+    pipeline.add_argument("--skip_mask_extraction", action="store_true")
+    pipeline.add_argument("--skip_masked_colmap", action="store_true")
+    pipeline.add_argument("--skip_visual_hull", action="store_true")
+    pipeline.add_argument("--skip_sam2", action="store_true")
+    pipeline.add_argument("--skip_train", action="store_true")
+    pipeline.add_argument("--no_gpu_colmap", action="store_true")
+    pipeline.add_argument("--no_eval", action="store_true")
+    pipeline.add_argument("--enable_viewer", action="store_true")
+    pipeline.add_argument("--verbose", action="store_true")
+    pipeline.add_argument("--dry_run", action="store_true")
+
+    envs = parser.add_argument_group("conda environments")
+    envs.add_argument("--gaussian_env", default="gaussian_splatting", type=str)
+    envs.add_argument("--sam2_env", default="sam2cpu", type=str)
     return parser.parse_args()
 
 
@@ -131,7 +157,7 @@ def stage_sam2(args):
     run_command(command, dry_run=args.dry_run)
 
 
-def stage_train(args, visual_hull_ply: Path):
+def stage_train(args, masks_dir: Path, visual_hull_ply: Path):
     command = conda_python(args.gaussian_env) + [
         repo_script("train.py"),
         "--source_path", str(Path(args.source_path).expanduser().resolve()),
@@ -141,15 +167,35 @@ def stage_train(args, visual_hull_ply: Path):
         "--sam_features", args.sam_features,
         "--sam_feature_weight", str(args.sam_feature_weight),
         "--geometry_feature_dim", str(args.geometry_feature_dim),
-        "--init_mode", "visual_hull",
-        "--init_ply_path", str(visual_hull_ply),
+        "--init_mode", args.init_mode,
     ]
 
-    if args.eval:
+    if args.init_mode == "visual_hull":
+        command.extend(["--init_ply_path", str(visual_hull_ply)])
+    if args.stage1_preset == "contactwm":
+        command.extend(
+            [
+                "--stage1_preset", "contactwm",
+                "--masks_dir", str(masks_dir),
+                "--object_mask_weight", str(args.object_mask_weight),
+                "--object_mask_bce_weight", str(args.object_mask_bce_weight),
+            ]
+        )
+    elif args.stage1_preset == "custom":
+        if args.object_mask_weight > 0:
+            command.extend(
+                [
+                    "--masks_dir", str(masks_dir),
+                    "--object_mask_weight", str(args.object_mask_weight),
+                    "--object_mask_bce_weight", str(args.object_mask_bce_weight),
+                ]
+            )
+
+    if not args.no_eval:
         command.append("--eval")
-    if args.disable_viewer:
+    if not args.enable_viewer:
         command.append("--disable_viewer")
-    if args.quiet:
+    if not args.verbose:
         command.append("--quiet")
     if args.joint_optimization:
         command.append("--joint_optimization")
@@ -170,6 +216,11 @@ def main():
 
     if args.joint_optimization and args.alternating_optimization:
         raise ValueError("Choose either --joint_optimization or --alternating_optimization, not both.")
+    if args.stage1_preset == "contactwm" and args.joint_optimization:
+        raise ValueError(
+            "--stage1_preset contactwm uses alternating SG-GS optimization; "
+            "do not combine it with --joint_optimization."
+        )
 
     masks_dir = ensure_masks_dir(args)
     visual_hull_ply = ensure_visual_hull_path(args)
@@ -180,6 +231,7 @@ def main():
     print(f"[INFO] masks_dir: {masks_dir}")
     print(f"[INFO] visual_hull_ply: {visual_hull_ply}")
     print(f"[INFO] sam_features: {args.sam_features}")
+    print(f"[INFO] stage1_preset: {args.stage1_preset}")
 
     if not args.skip_mask_extraction and not args.masks_dir:
         stage_extract_masks(args, masks_dir)
@@ -194,7 +246,7 @@ def main():
         stage_sam2(args)
 
     if not args.skip_train:
-        stage_train(args, visual_hull_ply)
+        stage_train(args, masks_dir, visual_hull_ply)
 
     print("[DONE] Scene initialization pipeline finished.")
 

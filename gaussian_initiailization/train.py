@@ -523,6 +523,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+
+def apply_stage1_preset(args):
+    preset = getattr(args, "stage1_preset", "none")
+    if preset in ("", "none"):
+        return
+    if preset != "contactwm":
+        raise ValueError(f"Unsupported --stage1_preset '{preset}'. Expected one of: none, contactwm.")
+    if args.joint_optimization:
+        raise ValueError(
+            "--stage1_preset contactwm uses alternating SG-GS optimization; "
+            "do not combine it with --joint_optimization."
+        )
+
+    args.sg_gs_stage1 = True
+    args.alternating_optimization = True
+    args.require_sam_features = True
+    args.geometry_rgb_weight = 0.0
+    if args.geometry_iters == 100:
+        args.geometry_iters = 1
+    if args.appearance_iters == 100:
+        args.appearance_iters = 1
+    if args.sam_feature_weight <= 0:
+        args.sam_feature_weight = 0.1
+
+
 def prepare_output_and_logger(output_args, snapshot_args):    
     if not output_args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -601,9 +626,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
+    parser.add_argument("--stage1_preset", default="none", choices=["none", "contactwm"])
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
+    apply_stage1_preset(args)
     if args.alternating_optimization and args.joint_optimization:
         raise ValueError("Choose either --alternating_optimization or --joint_optimization, not both.")
     args.save_iterations.append(args.iterations)

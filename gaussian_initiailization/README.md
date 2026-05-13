@@ -197,7 +197,20 @@ scene initialization 단계에서 spherical Gaussian처럼 동작하도록 제�
 
 ### 4. Geometry / Appearance Decoupled Optimization
 
-`train.py`는 geometry와 appearance를 분리해서 최적화할 수 있습니다.
+Stage 1의 권장 실행은 `--stage1_preset contactwm`입니다.
+이 preset은 ContactGaussian-WM Stage 1에 필요한 SG-GS / decoupled optimization 조합을 한 번에 켭니다.
+
+`--stage1_preset contactwm`이 내부적으로 적용하는 설정은 아래와 같습니다.
+
+- `--sg_gs_stage1`
+- `--alternating_optimization`
+- `--require_sam_features`
+- `--geometry_rgb_weight 0.0`
+- 기본 `--geometry_iters 1 --appearance_iters 1`
+- `--sam_feature_weight`가 0이면 `0.1`로 보정
+
+즉 geometry는 RGB photometric loss에 직접 끌려가기보다 SAM2 feature supervision 중심으로 학습되고,
+appearance는 color / opacity 쪽을 별도 step에서 맞춥니다.
 
 예시:
 
@@ -211,14 +224,16 @@ conda run -n gaussian_splatting python gaussian_initiailization/train.py \
   --iterations 10000 \
   --eval \
   --disable_viewer \
-  --alternating_optimization \
-  --geometry_iters 1 \
-  --appearance_iters 1 \
+  --stage1_preset contactwm \
+  --sam_features sam_features_sam2 \
+  --sam_feature_weight 0.1 \
+  --geometry_feature_dim 9 \
   --object_mask_weight 0.1
 ```
 
-`--alternating_optimization --geometry_iters 1 --appearance_iters 1`을 사용하면
-geometry step과 appearance step을 번갈아 수행합니다.
+세부 실험에서는 `--alternating_optimization`, `--joint_optimization`,
+`--geometry_iters`, `--appearance_iters`, `--geometry_rgb_weight`를 직접 조정할 수 있습니다.
+다만 Stage 1 기본값으로는 `--stage1_preset contactwm`을 쓰는 편이 실행 실수를 줄입니다.
 
 - geometry 쪽:
   - `xyz`
@@ -391,13 +406,16 @@ conda run -n gaussian_splatting python gaussian_initiailization/estimate_masked_
 
 한 번에 전체 초기화 파이프라인을 돌리고 싶으면 orchestration 스크립트를 사용할 수 있습니다.
 
+기본 preset은 `--stage1_preset contactwm`입니다.
+따라서 별도 optimization option을 주지 않아도 Stage 1은 SG-GS + decoupled optimization으로 실행됩니다.
+
 기본 흐름:
 
 - mask 추출
 - masked COLMAP
 - visual hull seed 생성
 - SAM2 feature 추출
-- visual hull seed로 SG-GS 학습
+- visual hull seed로 ContactGaussian-WM-style SG-GS 학습
 
 예시:
 
@@ -405,11 +423,30 @@ conda run -n gaussian_splatting python gaussian_initiailization/estimate_masked_
 python gaussian_initiailization/run_scene_initialization_pipeline.py \
   --source_path /path/to/scene \
   --model_path gaussian_initiailization/output/scene_pipeline \
-  --iterations 10000 \
-  --sam_feature_weight 0.1 \
-  --geometry_feature_dim 9 \
-  --alternating_optimization
+  --iterations 10000
 ```
+
+이 command는 학습 단계에서 아래 설정을 자동으로 전달합니다.
+
+```text
+--stage1_preset contactwm
+--init_mode visual_hull
+--sam_features sam_features_sam2
+--sam_feature_weight 0.1
+--geometry_feature_dim 9
+--masks_dir <source_path>/auto_masks 또는 사용자가 준 masks_dir
+--object_mask_weight 0.1
+--eval
+--disable_viewer
+--quiet
+```
+
+다른 방식으로 비교하고 싶으면 `--stage1_preset`을 바꿀 수 있습니다.
+
+- `--stage1_preset contactwm`: 기본값. SG-GS + SAM feature-driven decoupled optimization.
+- `--stage1_preset baseline`: 원본 3DGS에 가까운 RGB/depth 학습 경로.
+- `--stage1_preset custom`: 사용자가 `--alternating_optimization`, `--joint_optimization`,
+  `--object_mask_weight` 등을 직접 조합.
 
 이미 준비된 단계를 건너뛰고 싶으면:
 
@@ -942,6 +979,18 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 
 ## 현재 코드에 있는 주요 옵션
 
+### Stage 1 preset
+
+- `--stage1_preset contactwm`
+  - 권장 기본값입니다.
+  - SG-GS, SAM feature supervision, geometry / appearance decoupled optimization을 한 번에 켭니다.
+- `--stage1_preset baseline`
+  - `run_scene_initialization_pipeline.py`에서만 쓰는 preset입니다.
+  - 학습 command에 Stage 1 preset을 전달하지 않아 원본 3DGS에 가까운 비교 run을 만들 때 사용합니다.
+- `--stage1_preset custom`
+  - `run_scene_initialization_pipeline.py`에서만 쓰는 preset입니다.
+  - 아래 decoupled / mask / feature 옵션을 직접 조합할 때 사용합니다.
+
 ### 데이터 / 입출력
 
 - `--source_path`
@@ -961,10 +1010,15 @@ conda run -n gaussian_splatting python gaussian_initiailization/render.py \
 
 ### decoupled optimization
 
+- `--sg_gs_stage1`
 - `--alternating_optimization`
 - `--joint_optimization`
 - `--geometry_iters`
 - `--appearance_iters`
+- `--geometry_rgb_weight`
+- `--stage1_densify_ratio`
+- `--stage1_appearance_refine`
+- `--require_sam_features`
 
 ### geometry supervision
 
