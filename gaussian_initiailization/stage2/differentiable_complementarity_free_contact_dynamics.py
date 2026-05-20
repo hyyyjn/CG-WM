@@ -7,6 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from .differentiable_collision_detection import (
+    CollisionEngineConfig,
+    DifferentiableCollisionEngine,
+    GaussianCollisionBody,
+    BodyPairContacts,
     PlaneCollider,
     detect_gaussian_union_contacts,
     detect_plane_contacts,
@@ -25,6 +29,24 @@ class RigidState:
         return {
             "position": self.position.detach().cpu().tolist(),
             "linear_velocity": self.linear_velocity.detach().cpu().tolist(),
+        }
+
+
+@dataclass(frozen=True)
+class RigidBodyState:
+    """Rigid body state with translation and quaternion orientation."""
+
+    position: torch.Tensor
+    quaternion_wxyz: torch.Tensor
+    linear_velocity: torch.Tensor
+    angular_velocity: torch.Tensor
+
+    def to_serializable(self) -> Dict[str, List[float]]:
+        return {
+            "position": self.position.detach().cpu().tolist(),
+            "quaternion_wxyz": self.quaternion_wxyz.detach().cpu().tolist(),
+            "linear_velocity": self.linear_velocity.detach().cpu().tolist(),
+            "angular_velocity": self.angular_velocity.detach().cpu().tolist(),
         }
 
 
@@ -210,6 +232,29 @@ class ImpedanceContactDynamicsConfig:
     query_radius_floor: float = 0.0
 
 
+@dataclass(frozen=True)
+class PairwiseImpedanceDynamicsConfig:
+    """Multi-contact impedance dynamics config for a pair of Gaussian bodies."""
+
+    dt: float = 1.0 / 60.0
+    mass_a: float = 1.0
+    mass_b: float = 1.0
+    inertia_diag_a: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    inertia_diag_b: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
+    dynamic_a: bool = True
+    dynamic_b: bool = True
+    contact_softness: float = 1e-3
+    smooth_min_temperature: float = 1e-2
+    inside_penalty: float = 0.02
+    inside_sharpness: float = 50.0
+    num_contact_patches: int = 4
+    broad_phase_margin: float = 0.02
+    patch_selection: str = "spatial"
+    linear_damping: float = 0.0
+    angular_damping: float = 0.0
+
+
 class GaussianUnionFloorContactDynamics:
     """Contact dynamics using floor queries against spherical Gaussian collision geometry."""
 
@@ -279,6 +324,175 @@ def _smooth_min(values: torch.Tensor, temperature: float) -> torch.Tensor:
     if temperature <= 0.0:
         raise ValueError("temperature must be positive.")
     return -temperature * torch.logsumexp(-values / temperature, dim=-1)
+
+
+def _normalize_quaternion(quaternion_wxyz: torch.Tensor) -> torch.Tensor:
+    return quaternion_wxyz / torch.clamp(torch.linalg.norm(quaternion_wxyz, dim=-1, keepdim=True), min=1e-12)
+
+
+def _quat_mul_wxyz(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = lhs.unbind(dim=-1)
+    w2, x2, y2, z2 = rhs.unbind(dim=-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ),
+        dim=-1,
+    )
+
+
+def _integrate_quaternion_wxyz(quaternion_wxyz: torch.Tensor, angular_velocity: torch.Tensor, dt: float) -> torch.Tensor:
+    zeros = torch.zeros_like(angular_velocity[..., :1])
+    omega_quat = torch.cat((zeros, angular_velocity), dim=-1)
+    q_dot = 0.5 * _quat_mul_wxyz(omega_quat, quaternion_wxyz)
+    return _normalize_quaternion(quaternion_wxyz + float(dt) * q_dot)
+
+
+def _cross(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    return torch.cross(lhs, rhs, dim=-1)
+
+
+def _safe_inverse_vec(values: torch.Tensor) -> torch.Tensor:
+    return 1.0 / torch.clamp(values, min=1e-12)
+
+
+class PairwiseGaussianBodyImpedanceDynamics:
+    """Multi-contact impedance dynamics for two Gaussian collision bodies.
+
+    This class consumes the `BodyPairContacts.patch_*` output from
+    `DifferentiableCollisionEngine`. Each patch contributes a frictionless
+    normal force to both linear and angular velocity. It is intended as the
+    first rigid-body dynamics bridge for object-object contact; existing
+    floor-only smoke tests keep using the older classes below.
+    """
+
+    def __init__(
+        self,
+        body_a: GaussianCollisionBody,
+        body_b: GaussianCollisionBody,
+        *,
+        stiffness: torch.Tensor,
+        damping: torch.Tensor,
+        config: Optional[PairwiseImpedanceDynamicsConfig] = None,
+    ):
+        self.body_a = body_a
+        self.body_b = body_b
+        self.stiffness = stiffness
+        self.damping = damping
+        self.config = config or PairwiseImpedanceDynamicsConfig()
+        self.collision_engine = DifferentiableCollisionEngine(
+            CollisionEngineConfig(
+                softness=self.config.contact_softness,
+                smooth_min_temperature=self.config.smooth_min_temperature,
+                inside_penalty=self.config.inside_penalty,
+                inside_sharpness=self.config.inside_sharpness,
+                num_contact_patches=self.config.num_contact_patches,
+                broad_phase_margin=self.config.broad_phase_margin,
+                patch_selection=self.config.patch_selection,
+            )
+        )
+
+    def _predict_free(self, state: RigidBodyState, *, mass: float, dynamic: bool) -> RigidBodyState:
+        cfg = self.config
+        if cfg.dt <= 0.0:
+            raise ValueError("dt must be positive.")
+        if mass <= 0.0 and dynamic:
+            raise ValueError("dynamic bodies require positive mass.")
+
+        gravity = _as_vec3(cfg.gravity, dtype=state.position.dtype, device=state.position.device)
+        if dynamic:
+            linear_velocity = state.linear_velocity + cfg.dt * gravity
+            linear_velocity = linear_velocity * max(0.0, 1.0 - float(cfg.linear_damping) * cfg.dt)
+            angular_velocity = state.angular_velocity * max(0.0, 1.0 - float(cfg.angular_damping) * cfg.dt)
+            position = state.position + cfg.dt * linear_velocity
+            quaternion = _integrate_quaternion_wxyz(state.quaternion_wxyz, angular_velocity, cfg.dt)
+        else:
+            linear_velocity = torch.zeros_like(state.linear_velocity)
+            angular_velocity = torch.zeros_like(state.angular_velocity)
+            position = state.position
+            quaternion = _normalize_quaternion(state.quaternion_wxyz)
+        return RigidBodyState(position, quaternion, linear_velocity, angular_velocity)
+
+    def _apply_patch_forces(
+        self,
+        state_a: RigidBodyState,
+        state_b: RigidBodyState,
+        contacts: BodyPairContacts,
+    ) -> tuple[RigidBodyState, RigidBodyState, Dict[str, torch.Tensor]]:
+        cfg = self.config
+        dtype = state_a.position.dtype
+        device = state_a.position.device
+
+        normals = contacts.patch_normals.to(dtype=dtype, device=device)
+        points = contacts.patch_points.to(dtype=dtype, device=device)
+        weights = contacts.patch_weights.to(dtype=dtype, device=device)
+        phi = contacts.patch_signed_distances.to(dtype=dtype, device=device)
+
+        r_a = points - state_a.position.unsqueeze(-2)
+        r_b = points - state_b.position.unsqueeze(-2)
+        velocity_a_at_patch = state_a.linear_velocity.unsqueeze(-2) + _cross(state_a.angular_velocity.unsqueeze(-2), r_a)
+        velocity_b_at_patch = state_b.linear_velocity.unsqueeze(-2) + _cross(state_b.angular_velocity.unsqueeze(-2), r_b)
+        relative_velocity = velocity_a_at_patch - velocity_b_at_patch
+        normal_velocity = torch.sum(relative_velocity * normals, dim=-1)
+
+        K = F.softplus(self.stiffness).to(dtype=dtype, device=device)
+        D = F.softplus(self.damping).to(dtype=dtype, device=device)
+        lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
+        lambdas = weights * lambda_raw
+        forces = lambdas.unsqueeze(-1) * normals
+        total_force = torch.sum(forces, dim=-2)
+        torque_a = torch.sum(_cross(r_a, forces), dim=-2)
+        torque_b = torch.sum(_cross(r_b, -forces), dim=-2)
+
+        inv_mass_a = 0.0 if not cfg.dynamic_a else 1.0 / float(cfg.mass_a)
+        inv_mass_b = 0.0 if not cfg.dynamic_b else 1.0 / float(cfg.mass_b)
+        inertia_a = _as_vec3(cfg.inertia_diag_a, dtype=dtype, device=device)
+        inertia_b = _as_vec3(cfg.inertia_diag_b, dtype=dtype, device=device)
+        inv_inertia_a = torch.zeros_like(inertia_a) if not cfg.dynamic_a else _safe_inverse_vec(inertia_a)
+        inv_inertia_b = torch.zeros_like(inertia_b) if not cfg.dynamic_b else _safe_inverse_vec(inertia_b)
+
+        velocity_a = state_a.linear_velocity + cfg.dt * inv_mass_a * total_force
+        velocity_b = state_b.linear_velocity - cfg.dt * inv_mass_b * total_force
+        angular_a = state_a.angular_velocity + cfg.dt * inv_inertia_a * torque_a
+        angular_b = state_b.angular_velocity + cfg.dt * inv_inertia_b * torque_b
+
+        position_a = state_a.position + cfg.dt * (velocity_a - state_a.linear_velocity)
+        position_b = state_b.position + cfg.dt * (velocity_b - state_b.linear_velocity)
+        quaternion_a = _integrate_quaternion_wxyz(state_a.quaternion_wxyz, angular_a, cfg.dt)
+        quaternion_b = _integrate_quaternion_wxyz(state_b.quaternion_wxyz, angular_b, cfg.dt)
+
+        next_a = RigidBodyState(position_a, quaternion_a, velocity_a, angular_a)
+        next_b = RigidBodyState(position_b, quaternion_b, velocity_b, angular_b)
+        diagnostics = {
+            "contacts": contacts,
+            "lambda": lambdas,
+            "lambda_raw": lambda_raw,
+            "normal_velocity": normal_velocity,
+            "patch_weights": weights,
+            "patch_penetrations": contacts.patch_penetrations,
+            "patch_signed_distances": phi,
+            "total_force_on_a": total_force,
+            "torque_on_a": torque_a,
+            "torque_on_b": torque_b,
+            "broad_phase_overlaps": contacts.broad_phase_overlaps,
+        }
+        return next_a, next_b, diagnostics
+
+    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, Dict[str, torch.Tensor]]:
+        predicted_a = self._predict_free(state_a, mass=self.config.mass_a, dynamic=self.config.dynamic_a)
+        predicted_b = self._predict_free(state_b, mass=self.config.mass_b, dynamic=self.config.dynamic_b)
+        contacts = self.collision_engine.body_pair_contacts(
+            self.body_a,
+            predicted_a.position,
+            self.body_b,
+            predicted_b.position,
+            quaternion_a_wxyz=predicted_a.quaternion_wxyz,
+            quaternion_b_wxyz=predicted_b.quaternion_wxyz,
+        )
+        return self._apply_patch_forces(predicted_a, predicted_b, contacts)
 
 
 class ImpedanceFloorContactDynamics:

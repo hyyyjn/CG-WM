@@ -13,6 +13,19 @@ import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
+class CollisionEngineConfig:
+    """Numerical knobs shared by the differentiable collision routines."""
+
+    softness: float = 1e-3
+    smooth_min_temperature: float = 2e-2
+    inside_penalty: float = 0.02
+    inside_sharpness: float = 50.0
+    num_contact_patches: int = 1
+    broad_phase_margin: float = 0.0
+    patch_selection: str = "spatial"
+
+
+@dataclass(frozen=True)
 class PlaneCollider:
     """A differentiable infinite plane collider.
 
@@ -72,6 +85,26 @@ class FloorQuerySphereContacts:
 
 
 @dataclass(frozen=True)
+class GaussianUnionSDF:
+    """Dense SDF evaluation of query points against spherical Gaussian geometry.
+
+    The query points are assumed to already be in world space. This class is
+    independent of floors, planes, or any particular query-point generator.
+    """
+
+    query_points: torch.Tensor
+    primitive_signed_distances: torch.Tensor
+    primitive_weights: torch.Tensor
+    phi_soft: torch.Tensor
+    signed_distances: torch.Tensor
+    surface_normals: torch.Tensor
+
+    @property
+    def min_signed_distance(self) -> torch.Tensor:
+        return torch.min(self.signed_distances)
+
+
+@dataclass(frozen=True)
 class GaussianUnionContacts:
     """Result of evaluating query points against a union of spherical Gaussians.
 
@@ -82,17 +115,25 @@ class GaussianUnionContacts:
     `surface_normals` is the analytic ∇ϕ_soft(p) / ‖∇ϕ_soft‖ per query point
     (a softmax-weighted blend of per-primitive outward directions). The
     `collider_normal` field is the contact-weight-aggregated single normal used
-    by downstream rigid-body dynamics, oriented to match the environment's
-    plane normal (paper III-D-1).
+    by downstream rigid-body dynamics. The name is kept for compatibility; use
+    `contact_normal` in new code.
     """
 
     query_points: torch.Tensor
+    primitive_signed_distances: torch.Tensor
+    primitive_weights: torch.Tensor
+    phi_soft: torch.Tensor
     signed_distances: torch.Tensor
     penetrations: torch.Tensor
     contact_weights: torch.Tensor
     surface_normals: torch.Tensor
     contact_point: torch.Tensor
     collider_normal: torch.Tensor
+    patch_points: torch.Tensor
+    patch_normals: torch.Tensor
+    patch_weights: torch.Tensor
+    patch_penetrations: torch.Tensor
+    patch_signed_distances: torch.Tensor
 
     @property
     def min_signed_distance(self) -> torch.Tensor:
@@ -101,6 +142,372 @@ class GaussianUnionContacts:
     @property
     def max_penetration(self) -> torch.Tensor:
         return torch.max(self.penetrations)
+
+    @property
+    def contact_normal(self) -> torch.Tensor:
+        return self.collider_normal
+
+    @property
+    def num_contact_patches(self) -> int:
+        return int(self.patch_points.shape[-2])
+
+
+@dataclass(frozen=True)
+class BodyPairContacts:
+    """Bidirectional contact query result for two Gaussian collision bodies.
+
+    `a_to_b` evaluates query points from body A against body B's SDF. Its
+    normals point outward from B toward A. `b_to_a` is the opposite direction.
+    `patch_*` merges the strongest patches from both directions.
+    """
+
+    a_to_b: GaussianUnionContacts
+    b_to_a: GaussianUnionContacts
+    patch_points: torch.Tensor
+    patch_normals: torch.Tensor
+    patch_weights: torch.Tensor
+    patch_penetrations: torch.Tensor
+    patch_signed_distances: torch.Tensor
+    broad_phase_overlaps: torch.Tensor
+
+    @property
+    def has_contact(self) -> torch.Tensor:
+        return torch.max(self.patch_weights, dim=-1).values > 0.5
+
+    @property
+    def min_signed_distance(self) -> torch.Tensor:
+        return torch.minimum(self.a_to_b.min_signed_distance, self.b_to_a.min_signed_distance)
+
+
+def _validate_query_points(query_points: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
+    if query_points.shape[-1:] != (3,):
+        raise ValueError(f"query_points must end with 3 coordinates, got {tuple(query_points.shape)}.")
+    leading_shape = query_points.shape[:-1]
+    if query_points.numel() == 0:
+        raise ValueError("query_points must contain at least one point.")
+    return query_points.reshape(-1, 3), leading_shape
+
+
+def _split_query_shape(query_points: torch.Tensor) -> tuple[torch.Size, int]:
+    if query_points.ndim < 2 or query_points.shape[-1:] != (3,):
+        raise ValueError(f"query_points must have shape (..., Q, 3), got {tuple(query_points.shape)}.")
+    if query_points.shape[-2] == 0:
+        raise ValueError("query_points must contain at least one point.")
+    return query_points.shape[:-2], int(query_points.shape[-2])
+
+
+def _validate_gaussian_primitives(
+    query_points: torch.Tensor,
+    gaussian_centers: torch.Tensor,
+    gaussian_radii: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Size, int]:
+    batch_shape, _ = _split_query_shape(query_points)
+    if gaussian_centers.ndim < 2 or gaussian_centers.shape[-1] != 3:
+        raise ValueError("gaussian_centers must have shape (G, 3) or (..., G, 3).")
+    if gaussian_radii.ndim < 1:
+        raise ValueError("gaussian_radii must have shape (G,) or (..., G).")
+    if gaussian_centers.shape[-2] == 0:
+        raise ValueError("At least one Gaussian primitive is required.")
+    if gaussian_radii.shape[-1] != gaussian_centers.shape[-2]:
+        raise ValueError("The last dimension of gaussian_radii must match the Gaussian count.")
+
+    centers = gaussian_centers.to(dtype=query_points.dtype, device=query_points.device)
+    radii = gaussian_radii.to(dtype=query_points.dtype, device=query_points.device)
+    gaussian_batch_shape = centers.shape[:-2]
+    radii_batch_shape = radii.shape[:-1]
+    try:
+        output_batch_shape = torch.broadcast_shapes(batch_shape, gaussian_batch_shape, radii_batch_shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            "query_points, gaussian_centers, and gaussian_radii batch shapes are not broadcastable: "
+            f"{tuple(batch_shape)}, {tuple(gaussian_batch_shape)}, {tuple(radii_batch_shape)}."
+        ) from exc
+
+    centers = torch.broadcast_to(centers, (*output_batch_shape, centers.shape[-2], 3))
+    radii = torch.broadcast_to(radii, (*output_batch_shape, radii.shape[-1]))
+    if torch.any(radii <= 0.0):
+        raise ValueError("gaussian_radii must be positive.")
+    return centers, radii, output_batch_shape, int(centers.shape[-2])
+
+
+@dataclass(frozen=True)
+class GaussianCollisionBody:
+    """Spherical-Gaussian collision proxy in a local rigid-body frame."""
+
+    local_centers: torch.Tensor
+    radii: torch.Tensor
+    local_query_points: torch.Tensor | None = None
+
+    def to(self, *, dtype=None, device=None) -> "GaussianCollisionBody":
+        return GaussianCollisionBody(
+            self.local_centers.to(dtype=dtype, device=device),
+            self.radii.to(dtype=dtype, device=device),
+            None if self.local_query_points is None else self.local_query_points.to(dtype=dtype, device=device),
+        )
+
+    def world_centers(
+        self,
+        position: torch.Tensor,
+        *,
+        quaternion_wxyz: torch.Tensor | None = None,
+        rotation_matrix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return transform_local_points(
+            self.local_centers.to(dtype=position.dtype, device=position.device),
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        )
+
+    def query_points_world(
+        self,
+        position: torch.Tensor,
+        *,
+        quaternion_wxyz: torch.Tensor | None = None,
+        rotation_matrix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        local_queries = self.local_query_points
+        if local_queries is None:
+            local_queries = make_gaussian_proxy_query_points(
+                self.local_centers.to(dtype=position.dtype, device=position.device),
+                self.radii.to(dtype=position.dtype, device=position.device),
+            )
+        return transform_local_points(
+            local_queries.to(dtype=position.dtype, device=position.device),
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        )
+
+    def local_bounding_sphere(self) -> tuple[torch.Tensor, torch.Tensor]:
+        center = (self.local_centers.min(dim=0).values + self.local_centers.max(dim=0).values) * 0.5
+        distances = torch.linalg.norm(self.local_centers - center.unsqueeze(0), dim=-1) + self.radii
+        return center, torch.max(distances)
+
+    def world_bounding_sphere(
+        self,
+        position: torch.Tensor,
+        *,
+        quaternion_wxyz: torch.Tensor | None = None,
+        rotation_matrix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        center_local, radius = self.local_bounding_sphere()
+        center_world = transform_local_points(
+            center_local.reshape(1, 3).to(dtype=position.dtype, device=position.device),
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        ).squeeze(-2)
+        return center_world, radius.to(dtype=position.dtype, device=position.device)
+
+
+class DifferentiableCollisionEngine:
+    """Small query-based collision engine for Gaussian rigid-body proxies.
+
+    The engine does not own scene state. Callers provide world-space query
+    points and world-space Gaussian centers, or use `contacts_for_body` with a
+    local `GaussianCollisionBody` and a rigid pose.
+    """
+
+    def __init__(self, config: CollisionEngineConfig | None = None):
+        self.config = config or CollisionEngineConfig()
+
+    def evaluate_sdf(
+        self,
+        query_points: torch.Tensor,
+        gaussian_centers: torch.Tensor,
+        gaussian_radii: torch.Tensor,
+    ) -> GaussianUnionSDF:
+        cfg = self.config
+        return evaluate_gaussian_union_sdf(
+            query_points,
+            gaussian_centers,
+            gaussian_radii,
+            smooth_min_temperature=cfg.smooth_min_temperature,
+            inside_penalty=cfg.inside_penalty,
+            inside_sharpness=cfg.inside_sharpness,
+        )
+
+    def contacts(
+        self,
+        query_points: torch.Tensor,
+        gaussian_centers: torch.Tensor,
+        gaussian_radii: torch.Tensor,
+        *,
+        normal_hint: torch.Tensor | None = None,
+    ) -> GaussianUnionContacts:
+        sdf = self.evaluate_sdf(query_points, gaussian_centers, gaussian_radii)
+        return aggregate_gaussian_union_contacts(
+            sdf,
+            softness=self.config.softness,
+            normal_hint=normal_hint,
+            num_contact_patches=self.config.num_contact_patches,
+            patch_selection=self.config.patch_selection,
+        )
+
+    def contacts_for_body(
+        self,
+        query_points: torch.Tensor,
+        body: GaussianCollisionBody,
+        position: torch.Tensor,
+        *,
+        quaternion_wxyz: torch.Tensor | None = None,
+        rotation_matrix: torch.Tensor | None = None,
+        normal_hint: torch.Tensor | None = None,
+    ) -> GaussianUnionContacts:
+        centers = body.world_centers(
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        )
+        return self.contacts(query_points, centers, body.radii, normal_hint=normal_hint)
+
+    def body_pair_contacts(
+        self,
+        body_a: GaussianCollisionBody,
+        position_a: torch.Tensor,
+        body_b: GaussianCollisionBody,
+        position_b: torch.Tensor,
+        *,
+        quaternion_a_wxyz: torch.Tensor | None = None,
+        quaternion_b_wxyz: torch.Tensor | None = None,
+        rotation_a_matrix: torch.Tensor | None = None,
+        rotation_b_matrix: torch.Tensor | None = None,
+    ) -> BodyPairContacts:
+        center_a, radius_a = body_a.world_bounding_sphere(
+            position_a,
+            quaternion_wxyz=quaternion_a_wxyz,
+            rotation_matrix=rotation_a_matrix,
+        )
+        center_b, radius_b = body_b.world_bounding_sphere(
+            position_b,
+            quaternion_wxyz=quaternion_b_wxyz,
+            rotation_matrix=rotation_b_matrix,
+        )
+        center_delta = center_a - center_b
+        center_distance = torch.linalg.norm(center_delta, dim=-1)
+        broad_phase_overlaps = center_distance <= (radius_a + radius_b + float(self.config.broad_phase_margin))
+        normal_b_to_a = center_delta / torch.clamp(center_distance.unsqueeze(-1), min=1e-12)
+        normal_a_to_b = -normal_b_to_a
+
+        query_a = body_a.query_points_world(
+            position_a,
+            quaternion_wxyz=quaternion_a_wxyz,
+            rotation_matrix=rotation_a_matrix,
+        )
+        query_b = body_b.query_points_world(
+            position_b,
+            quaternion_wxyz=quaternion_b_wxyz,
+            rotation_matrix=rotation_b_matrix,
+        )
+        centers_a = body_a.world_centers(
+            position_a,
+            quaternion_wxyz=quaternion_a_wxyz,
+            rotation_matrix=rotation_a_matrix,
+        )
+        centers_b = body_b.world_centers(
+            position_b,
+            quaternion_wxyz=quaternion_b_wxyz,
+            rotation_matrix=rotation_b_matrix,
+        )
+
+        a_to_b = self.contacts(query_a, centers_b, body_b.radii, normal_hint=normal_b_to_a)
+        b_to_a = self.contacts(query_b, centers_a, body_a.radii, normal_hint=normal_a_to_b)
+        merged = merge_contact_patches(
+            a_to_b,
+            b_to_a,
+            num_contact_patches=self.config.num_contact_patches,
+            patch_selection=self.config.patch_selection,
+        )
+        patch_weights = torch.where(
+            broad_phase_overlaps.unsqueeze(-1),
+            merged["patch_weights"],
+            torch.zeros_like(merged["patch_weights"]),
+        )
+        patch_penetrations = torch.where(
+            broad_phase_overlaps.unsqueeze(-1),
+            merged["patch_penetrations"],
+            torch.zeros_like(merged["patch_penetrations"]),
+        )
+        return BodyPairContacts(
+            a_to_b=a_to_b,
+            b_to_a=b_to_a,
+            patch_points=merged["patch_points"],
+            patch_normals=merged["patch_normals"],
+            patch_weights=patch_weights,
+            patch_penetrations=patch_penetrations,
+            patch_signed_distances=merged["patch_signed_distances"],
+            broad_phase_overlaps=broad_phase_overlaps,
+        )
+
+
+def _orient_contact_normal(contact_normal: torch.Tensor, normal_hint: torch.Tensor | None) -> torch.Tensor:
+    normal_norm = torch.linalg.norm(contact_normal, dim=-1, keepdim=True)
+    if normal_hint is None:
+        return contact_normal / torch.clamp(normal_norm, min=1e-12)
+
+    hint = normal_hint.to(dtype=contact_normal.dtype, device=contact_normal.device)
+    if hint.shape[-1:] != (3,):
+        raise ValueError(f"normal_hint must end with 3 coordinates, got {tuple(hint.shape)}.")
+    hint = hint / torch.clamp(torch.linalg.norm(hint, dim=-1, keepdim=True), min=1e-12)
+    hint = torch.broadcast_to(hint, contact_normal.shape)
+    contact_normal = torch.where(normal_norm < 1e-8, hint, contact_normal / torch.clamp(normal_norm, min=1e-12))
+    flip = torch.sum(contact_normal * hint, dim=-1, keepdim=True) < 0.0
+    return torch.where(flip, -contact_normal, contact_normal)
+
+
+def quat_wxyz_to_matrix(quaternion_wxyz: torch.Tensor) -> torch.Tensor:
+    """Convert normalized-or-not quaternions with shape (..., 4) to (..., 3, 3)."""
+
+    if quaternion_wxyz.shape[-1:] != (4,):
+        raise ValueError(f"quaternion_wxyz must end with 4 values, got {tuple(quaternion_wxyz.shape)}.")
+    quat = quaternion_wxyz / torch.clamp(torch.linalg.norm(quaternion_wxyz, dim=-1, keepdim=True), min=1e-12)
+    w, x, y, z = quat.unbind(dim=-1)
+    one = torch.ones_like(w)
+    two = 2.0
+    return torch.stack(
+        (
+            torch.stack((one - two * (y * y + z * z), two * (x * y - z * w), two * (x * z + y * w)), dim=-1),
+            torch.stack((two * (x * y + z * w), one - two * (x * x + z * z), two * (y * z - x * w)), dim=-1),
+            torch.stack((two * (x * z - y * w), two * (y * z + x * w), one - two * (x * x + y * y)), dim=-1),
+        ),
+        dim=-2,
+    )
+
+
+def transform_local_points(
+    local_points: torch.Tensor,
+    position: torch.Tensor,
+    *,
+    quaternion_wxyz: torch.Tensor | None = None,
+    rotation_matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Transform local query/proxy points to world space with optional batching.
+
+    `local_points` has shape `(N, 3)`. `position` has shape `(..., 3)`.
+    The result has shape `(..., N, 3)`, or `(N, 3)` for an unbatched position.
+    """
+
+    if local_points.ndim != 2 or local_points.shape[-1] != 3:
+        raise ValueError("local_points must have shape (N, 3).")
+    if position.shape[-1:] != (3,):
+        raise ValueError(f"position must end with 3 coordinates, got {tuple(position.shape)}.")
+    if quaternion_wxyz is not None and rotation_matrix is not None:
+        raise ValueError("Pass either quaternion_wxyz or rotation_matrix, not both.")
+
+    local = local_points.to(dtype=position.dtype, device=position.device)
+    if rotation_matrix is None:
+        if quaternion_wxyz is None:
+            rotation_matrix = torch.eye(3, dtype=position.dtype, device=position.device)
+        else:
+            rotation_matrix = quat_wxyz_to_matrix(quaternion_wxyz.to(dtype=position.dtype, device=position.device))
+    else:
+        rotation_matrix = rotation_matrix.to(dtype=position.dtype, device=position.device)
+        if rotation_matrix.shape[-2:] != (3, 3):
+            raise ValueError(f"rotation_matrix must end with shape (3, 3), got {tuple(rotation_matrix.shape)}.")
+
+    rotated = torch.matmul(local, rotation_matrix.transpose(-1, -2))
+    return rotated + position.unsqueeze(-2)
 
 
 def _as_3_tensor(values: Iterable[float], *, dtype=torch.float32, device=None) -> torch.Tensor:
@@ -140,6 +547,39 @@ def make_box_query_points(
     return torch.stack(points, dim=0)
 
 
+def make_box_surface_query_points(
+    half_extents: Iterable[float],
+    *,
+    grid_resolution: int = 3,
+    dtype=torch.float32,
+    device=None,
+) -> torch.Tensor:
+    """Return local-space query points over all six faces of a box."""
+
+    if grid_resolution < 2:
+        raise ValueError("grid_resolution must be at least 2.")
+    half_extents_tensor = _as_3_tensor(half_extents, dtype=dtype, device=device)
+    hx, hy, hz = [float(v) for v in half_extents_tensor.detach().cpu().tolist()]
+    xs = torch.linspace(-hx, hx, grid_resolution, dtype=dtype, device=device)
+    ys = torch.linspace(-hy, hy, grid_resolution, dtype=dtype, device=device)
+    zs = torch.linspace(-hz, hz, grid_resolution, dtype=dtype, device=device)
+
+    faces = []
+    for z in (-hz, hz):
+        zz = torch.full((grid_resolution, grid_resolution), float(z), dtype=dtype, device=device)
+        xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+        faces.append(torch.stack((xx, yy, zz), dim=-1).reshape(-1, 3))
+    for y in (-hy, hy):
+        yy = torch.full((grid_resolution, grid_resolution), float(y), dtype=dtype, device=device)
+        xx, zz = torch.meshgrid(xs, zs, indexing="ij")
+        faces.append(torch.stack((xx, yy, zz), dim=-1).reshape(-1, 3))
+    for x in (-hx, hx):
+        xx = torch.full((grid_resolution, grid_resolution), float(x), dtype=dtype, device=device)
+        yy, zz = torch.meshgrid(ys, zs, indexing="ij")
+        faces.append(torch.stack((xx, yy, zz), dim=-1).reshape(-1, 3))
+    return torch.unique(torch.cat(faces, dim=0), dim=0)
+
+
 def make_sphere_query_points(
     radius: float,
     *,
@@ -172,6 +612,41 @@ def make_sphere_query_points(
         center = torch.zeros((1, 3), dtype=dtype, device=device)
         points = torch.cat((center, points), dim=0)
     return points
+
+
+def make_gaussian_proxy_query_points(
+    local_centers: torch.Tensor,
+    radii: torch.Tensor,
+    *,
+    directions_per_gaussian: int = 6,
+) -> torch.Tensor:
+    """Sample local query points on each spherical Gaussian primitive."""
+
+    if local_centers.ndim != 2 or local_centers.shape[-1] != 3:
+        raise ValueError("local_centers must have shape (G, 3).")
+    if radii.ndim != 1 or radii.shape[0] != local_centers.shape[0]:
+        raise ValueError("radii must have shape (G,).")
+    if directions_per_gaussian == 6:
+        dirs = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ],
+            dtype=local_centers.dtype,
+            device=local_centers.device,
+        )
+    else:
+        dirs = make_sphere_query_points(
+            1.0,
+            num_points=max(int(directions_per_gaussian), 4),
+            dtype=local_centers.dtype,
+            device=local_centers.device,
+        )
+    return (local_centers.unsqueeze(1) + radii.reshape(-1, 1, 1) * dirs.unsqueeze(0)).reshape(-1, 3)
 
 
 def make_floor_disk_query_points(
@@ -253,12 +728,14 @@ def detect_gaussian_union_contacts(
     query_points: torch.Tensor,
     gaussian_centers: torch.Tensor,
     gaussian_radii: torch.Tensor,
-    collider_normal: torch.Tensor,
+    collider_normal: torch.Tensor | None = None,
     *,
     softness: float = 1e-3,
     smooth_min_temperature: float = 2e-2,
     inside_penalty: float = 0.02,
     inside_sharpness: float = 50.0,
+    num_contact_patches: int = 1,
+    patch_selection: str = "spatial",
 ) -> GaussianUnionContacts:
     """ContactGaussian-WM differentiable union-of-spheres SDF (paper III-D-1).
 
@@ -280,63 +757,254 @@ def detect_gaussian_union_contacts(
        (paper III-D-1).
     """
 
-    if softness <= 0.0:
-        raise ValueError("softness must be positive.")
+    sdf = evaluate_gaussian_union_sdf(
+        query_points,
+        gaussian_centers,
+        gaussian_radii,
+        smooth_min_temperature=smooth_min_temperature,
+        inside_penalty=inside_penalty,
+        inside_sharpness=inside_sharpness,
+    )
+    return aggregate_gaussian_union_contacts(
+        sdf,
+        softness=softness,
+        normal_hint=collider_normal,
+        num_contact_patches=num_contact_patches,
+        patch_selection=patch_selection,
+    )
+
+
+def evaluate_gaussian_union_sdf(
+    query_points: torch.Tensor,
+    gaussian_centers: torch.Tensor,
+    gaussian_radii: torch.Tensor,
+    *,
+    smooth_min_temperature: float = 2e-2,
+    inside_penalty: float = 0.02,
+    inside_sharpness: float = 50.0,
+) -> GaussianUnionSDF:
+    """Evaluate the ContactGaussian-WM spherical-Gaussian SDF at query points.
+
+    `query_points` are supplied by the caller and may have any leading shape
+    ending in 3, for example `(Q, 3)` or `(B, Q, 3)`. No floor, plane, body
+    transform, or query-point generation is assumed here.
+    """
+
     if smooth_min_temperature <= 0.0:
         raise ValueError("smooth_min_temperature must be positive.")
     if inside_penalty <= 0.0:
         raise ValueError("inside_penalty must be positive.")
     if inside_sharpness <= 0.0:
         raise ValueError("inside_sharpness must be positive.")
-    if query_points.ndim != 2 or query_points.shape[-1] != 3:
-        raise ValueError("query_points must have shape (Q, 3).")
-    if gaussian_centers.ndim != 2 or gaussian_centers.shape[-1] != 3:
-        raise ValueError("gaussian_centers must have shape (G, 3).")
-    if gaussian_radii.ndim != 1 or gaussian_radii.shape[0] != gaussian_centers.shape[0]:
-        raise ValueError("gaussian_radii must have shape (G,).")
 
-    centers = gaussian_centers.to(dtype=query_points.dtype, device=query_points.device)
-    radii = gaussian_radii.to(dtype=query_points.dtype, device=query_points.device)
-    plane_normal = collider_normal.to(dtype=query_points.dtype, device=query_points.device)
-    plane_normal = plane_normal / torch.clamp(torch.linalg.norm(plane_normal), min=1e-12)
+    _, query_count = _split_query_shape(query_points)
+    centers, radii, batch_shape, gaussian_count = _validate_gaussian_primitives(
+        query_points,
+        gaussian_centers,
+        gaussian_radii,
+    )
+    points = torch.broadcast_to(
+        query_points,
+        (*batch_shape, query_count, 3),
+    )
 
-    offsets = query_points.unsqueeze(1) - centers.unsqueeze(0)
+    offsets = points.unsqueeze(-2) - centers.unsqueeze(-3)
     center_distances = torch.linalg.norm(offsets, dim=-1)
-    primitive_distances = center_distances - radii.unsqueeze(0)  # (Q, G)
+    primitive_distances = center_distances - radii.unsqueeze(-2)
 
-    beta = 1.0 / smooth_min_temperature
-    phi_soft = -smooth_min_temperature * torch.logsumexp(-beta * primitive_distances, dim=-1)
     primitive_weights = torch.softmax(-primitive_distances / smooth_min_temperature, dim=-1)
+    phi_soft = -smooth_min_temperature * torch.logsumexp(
+        -primitive_distances / smooth_min_temperature,
+        dim=-1,
+    )
 
     sigma_blend = torch.sigmoid(inside_sharpness * phi_soft)
     signed_distances = sigma_blend * phi_soft + (1.0 - sigma_blend) * (-inside_penalty)
 
     direction_per_prim = offsets / torch.clamp(center_distances.unsqueeze(-1), min=1e-9)
-    surface_normals = torch.sum(primitive_weights.unsqueeze(-1) * direction_per_prim, dim=1)
+    surface_normals = torch.sum(primitive_weights.unsqueeze(-1) * direction_per_prim, dim=-2)
     surface_normals = surface_normals / torch.clamp(
-        torch.linalg.norm(surface_normals, dim=-1, keepdim=True), min=1e-12
+        torch.linalg.norm(surface_normals, dim=-1, keepdim=True),
+        min=1e-12,
     )
+
+    return GaussianUnionSDF(
+        query_points=points,
+        primitive_signed_distances=primitive_distances.reshape(*batch_shape, query_count, gaussian_count),
+        primitive_weights=primitive_weights.reshape(*batch_shape, query_count, gaussian_count),
+        phi_soft=phi_soft.reshape(*batch_shape, query_count),
+        signed_distances=signed_distances.reshape(*batch_shape, query_count),
+        surface_normals=surface_normals.reshape(*batch_shape, query_count, 3),
+    )
+
+
+def _select_contact_patch_indices(
+    query_points: torch.Tensor,
+    contact_weights: torch.Tensor,
+    patch_count: int,
+    *,
+    patch_selection: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if patch_selection not in ("topk", "spatial"):
+        raise ValueError("patch_selection must be one of: topk, spatial.")
+    if patch_selection == "topk" or patch_count <= 1:
+        return torch.topk(contact_weights, k=patch_count, dim=-1)
+
+    batch_count, query_count = contact_weights.shape
+    selected_indices = []
+    selected_weights = []
+    large = torch.as_tensor(1e6, dtype=query_points.dtype, device=query_points.device)
+    min_distances = torch.full((batch_count, query_count), float("inf"), dtype=query_points.dtype, device=query_points.device)
+    score = contact_weights
+    for patch_idx in range(patch_count):
+        index = torch.argmax(score, dim=-1)
+        selected_indices.append(index)
+        selected_weights.append(torch.gather(contact_weights, dim=1, index=index.unsqueeze(-1)).squeeze(-1))
+        selected_points = torch.gather(query_points, dim=1, index=index.reshape(batch_count, 1, 1).expand(batch_count, 1, 3))
+        distances = torch.linalg.norm(query_points - selected_points, dim=-1)
+        min_distances = torch.minimum(min_distances, distances)
+        if patch_idx == 0:
+            scale = torch.clamp(torch.quantile(min_distances.masked_fill(torch.isinf(min_distances), 0.0), 0.75, dim=-1, keepdim=True), min=1e-6)
+        else:
+            scale = torch.clamp(torch.max(min_distances, dim=-1, keepdim=True).values, min=1e-6)
+        diversity = torch.clamp(min_distances / scale, max=1.0)
+        score = contact_weights * (0.25 + 0.75 * diversity)
+        score = score.scatter(1, torch.stack(selected_indices, dim=1), -large.expand(batch_count, len(selected_indices)))
+    return torch.stack(selected_weights, dim=1), torch.stack(selected_indices, dim=1)
+
+
+def _gather_patch_vectors(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    return torch.gather(values, dim=1, index=indices.unsqueeze(-1).expand(indices.shape[0], indices.shape[1], values.shape[-1]))
+
+
+def merge_contact_patches(
+    contacts_a: GaussianUnionContacts,
+    contacts_b: GaussianUnionContacts,
+    *,
+    num_contact_patches: int,
+    patch_selection: str = "spatial",
+) -> dict[str, torch.Tensor]:
+    """Merge bidirectional contact patches into one strongest patch set."""
+
+    if num_contact_patches < 1:
+        raise ValueError("num_contact_patches must be at least 1.")
+
+    points = torch.cat(
+        (
+            contacts_a.patch_points.reshape(-1, contacts_a.num_contact_patches, 3),
+            contacts_b.patch_points.reshape(-1, contacts_b.num_contact_patches, 3),
+        ),
+        dim=1,
+    )
+    normals = torch.cat(
+        (
+            contacts_a.patch_normals.reshape(-1, contacts_a.num_contact_patches, 3),
+            -contacts_b.patch_normals.reshape(-1, contacts_b.num_contact_patches, 3),
+        ),
+        dim=1,
+    )
+    weights = torch.cat(
+        (
+            contacts_a.patch_weights.reshape(-1, contacts_a.num_contact_patches),
+            contacts_b.patch_weights.reshape(-1, contacts_b.num_contact_patches),
+        ),
+        dim=1,
+    )
+    penetrations = torch.cat(
+        (
+            contacts_a.patch_penetrations.reshape(-1, contacts_a.num_contact_patches),
+            contacts_b.patch_penetrations.reshape(-1, contacts_b.num_contact_patches),
+        ),
+        dim=1,
+    )
+    signed_distances = torch.cat(
+        (
+            contacts_a.patch_signed_distances.reshape(-1, contacts_a.num_contact_patches),
+            contacts_b.patch_signed_distances.reshape(-1, contacts_b.num_contact_patches),
+        ),
+        dim=1,
+    )
+    patch_count = min(int(num_contact_patches), int(weights.shape[-1]))
+    patch_weights, patch_indices = _select_contact_patch_indices(
+        points,
+        weights,
+        patch_count,
+        patch_selection=patch_selection,
+    )
+    batch_shape = contacts_a.patch_points.shape[:-2]
+    return {
+        "patch_points": _gather_patch_vectors(points, patch_indices).reshape(*batch_shape, patch_count, 3),
+        "patch_normals": _gather_patch_vectors(normals, patch_indices).reshape(*batch_shape, patch_count, 3),
+        "patch_weights": patch_weights.reshape(*batch_shape, patch_count),
+        "patch_penetrations": torch.gather(penetrations, dim=1, index=patch_indices).reshape(*batch_shape, patch_count),
+        "patch_signed_distances": torch.gather(signed_distances, dim=1, index=patch_indices).reshape(*batch_shape, patch_count),
+    }
+
+
+def aggregate_gaussian_union_contacts(
+    sdf: GaussianUnionSDF,
+    *,
+    softness: float = 1e-3,
+    normal_hint: torch.Tensor | None = None,
+    num_contact_patches: int = 1,
+    patch_selection: str = "spatial",
+) -> GaussianUnionContacts:
+    """Convert per-query SDF values into one smooth contact summary.
+
+    `normal_hint` is optional. Pass an environment normal, such as a floor
+    normal, only when downstream dynamics require a consistently oriented
+    contact normal. Inputs shaped `(B, Q, 3)` are aggregated independently per
+    batch item. `num_contact_patches` keeps the top-k strongest query contacts
+    for multi-contact dynamics while preserving the legacy single summary.
+    """
+
+    if softness <= 0.0:
+        raise ValueError("softness must be positive.")
+    if num_contact_patches < 1:
+        raise ValueError("num_contact_patches must be at least 1.")
+
+    batch_shape, query_count = _split_query_shape(sdf.query_points)
+    query_points = sdf.query_points.reshape(-1, query_count, 3)
+    signed_distances = sdf.signed_distances.reshape(-1, query_count)
+    surface_normals = sdf.surface_normals.reshape(-1, query_count, 3)
+    batch_count = query_points.shape[0]
 
     penetrations = F.softplus(-signed_distances / softness) * softness
     contact_weights = torch.sigmoid(-signed_distances / softness)
     weight_sum = torch.clamp(torch.sum(contact_weights, dim=-1, keepdim=True), min=1e-12)
-    contact_point = torch.sum(query_points * contact_weights.unsqueeze(-1), dim=0) / weight_sum.squeeze(0)
-    contact_normal = torch.sum(surface_normals * contact_weights.unsqueeze(-1), dim=0) / weight_sum.squeeze(0)
-    contact_normal = contact_normal / torch.clamp(torch.linalg.norm(contact_normal), min=1e-12)
-    contact_normal = torch.where(
-        torch.sum(contact_normal * plane_normal) < 0.0,
-        -contact_normal,
-        contact_normal,
+    contact_point = torch.sum(query_points * contact_weights.unsqueeze(-1), dim=-2) / weight_sum
+    contact_normal = torch.sum(surface_normals * contact_weights.unsqueeze(-1), dim=-2) / weight_sum
+    contact_normal = _orient_contact_normal(contact_normal, normal_hint)
+
+    patch_count = min(int(num_contact_patches), int(query_count))
+    patch_weights, patch_indices = _select_contact_patch_indices(
+        query_points,
+        contact_weights,
+        patch_count,
+        patch_selection=patch_selection,
     )
+    patch_points = _gather_patch_vectors(query_points, patch_indices)
+    patch_normals = _gather_patch_vectors(surface_normals, patch_indices)
+    patch_normals = _orient_contact_normal(patch_normals, normal_hint.unsqueeze(-2) if normal_hint is not None and normal_hint.ndim > 1 else normal_hint)
+    patch_penetrations = torch.gather(penetrations, dim=1, index=patch_indices)
+    patch_signed_distances = torch.gather(signed_distances, dim=1, index=patch_indices)
 
     return GaussianUnionContacts(
-        query_points=query_points,
-        signed_distances=signed_distances,
-        penetrations=penetrations,
-        contact_weights=contact_weights,
-        surface_normals=surface_normals,
-        contact_point=contact_point,
-        collider_normal=contact_normal,
+        query_points=sdf.query_points,
+        primitive_signed_distances=sdf.primitive_signed_distances,
+        primitive_weights=sdf.primitive_weights,
+        phi_soft=sdf.phi_soft,
+        signed_distances=sdf.signed_distances,
+        penetrations=penetrations.reshape(*batch_shape, query_count),
+        contact_weights=contact_weights.reshape(*batch_shape, query_count),
+        surface_normals=sdf.surface_normals,
+        contact_point=contact_point.reshape(*batch_shape, 3),
+        collider_normal=contact_normal.reshape(*batch_shape, 3),
+        patch_points=patch_points.reshape(*batch_shape, patch_count, 3),
+        patch_normals=patch_normals.reshape(*batch_shape, patch_count, 3),
+        patch_weights=patch_weights.reshape(*batch_shape, patch_count),
+        patch_penetrations=patch_penetrations.reshape(*batch_shape, patch_count),
+        patch_signed_distances=patch_signed_distances.reshape(*batch_shape, patch_count),
     )
 
 
