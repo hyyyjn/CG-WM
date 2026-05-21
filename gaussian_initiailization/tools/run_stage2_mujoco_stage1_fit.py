@@ -37,6 +37,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode_root", required=True, type=Path)
     parser.add_argument("--stage1_ply", default=None, type=Path)
     parser.add_argument("--stage1_model_path", default=None, type=Path)
+    parser.add_argument(
+        "--stage1_dataset_root",
+        default=None,
+        type=Path,
+        help=(
+            "Path to the Stage 1 multi-view dataset directory that holds "
+            "dataset_manifest.json (with the object_pose field added by "
+            "generate_mujoco_synthetic_dataset.py). When given, this is "
+            "preferred over auto-discovery from --episode_root, which is "
+            "important because the Stage 2 fall-episode tree and the Stage 1 "
+            "capture tree usually live under different roots."
+        ),
+    )
     parser.add_argument("--output_dir", default=None, type=Path)
     parser.add_argument("--max_frames", default=160, type=int)
     parser.add_argument("--fit_iters", default=300, type=int)
@@ -69,6 +82,65 @@ def parse_args() -> argparse.Namespace:
 def read_json(path: Path):
     with open(path, "r", encoding="utf-8-sig") as handle:
         return json.load(handle)
+
+
+def load_stage1_object_pose(
+    episode_root: Path,
+    stage1_dataset_root: Path | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, Path | None]:
+    """Locate dataset_manifest.json and return (translation, rotation_matrix, manifest_path).
+
+    The manifest is written by generate_mujoco_synthetic_dataset.py and stores the
+    settled world pose of the target body. Stage 1 trains its Gaussians in world
+    frame, so we need this pose to convert PLY means into object-local frame before
+    Stage 2's contact loop adds per-step world positions. Returns (None, None, None)
+    if no manifest with object_pose is found - caller then falls back to bbox
+    recentering (legacy, lossy).
+
+    When ``stage1_dataset_root`` is given (CLI's --stage1_dataset_root), it is
+    consulted first. This matters because the Stage 2 fall-episode tree and the
+    Stage 1 capture tree usually live under different roots, so auto-discovery
+    relative to ``episode_root`` would silently miss the manifest.
+    """
+
+    candidates: list[Path] = []
+    if stage1_dataset_root is not None:
+        candidates.append(stage1_dataset_root / "dataset_manifest.json")
+        candidates.append(stage1_dataset_root)  # in case user passed the file path directly
+    candidates.append(episode_root / "dataset_manifest.json")
+    candidates.append(episode_root.parent / "dataset_manifest.json")
+    # Also probe one level up in case episode_root is e.g. <dataset>/episode_xxx.
+    candidates.append(episode_root.parent.parent / "dataset_manifest.json")
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                payload = read_json(cand)
+            except Exception:
+                continue
+            pose = payload.get("object_pose")
+            if not pose:
+                continue
+            t = np.asarray(pose.get("xpos", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
+            xmat = pose.get("xmat_row_major")
+            if xmat is not None and len(xmat) == 9:
+                R = np.asarray(xmat, dtype=np.float32).reshape(3, 3)
+            else:
+                quat = pose.get("xquat_wxyz")
+                if quat is not None and len(quat) == 4:
+                    w, x, y, z = (float(q) for q in quat)
+                    # Standard wxyz → rotation matrix.
+                    R = np.array(
+                        [
+                            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+                        ],
+                        dtype=np.float32,
+                    )
+                else:
+                    R = np.eye(3, dtype=np.float32)
+            return t, R, cand
+    return None, None, None
 
 
 def write_json(path: Path, payload) -> None:
@@ -144,8 +216,18 @@ def simulate(
     smooth_max_temperature: float,
     inside_penalty: float = 0.02,
     inside_sharpness: float = 50.0,
+    world_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Legacy reflection+slop dynamics (kept for --dynamics restitution)."""
+    """Legacy reflection+slop dynamics (kept for --dynamics restitution).
+
+    ``world_rotation`` is the constant body orientation R0 (3x3). Per the paper
+    (Sec. III-D), Gaussian world centers are obtained via forward kinematics
+    G_TF = FK(G, q) = R(q) c_local + p(q). The contact dynamics for angular
+    DOFs is not implemented yet, so R stays fixed at R0 throughout the roll-out;
+    this is enough to make the FK consistent with the Stage 1 capture pose
+    (which may carry yaw jitter) so collision penetration is computed against
+    the correct primitive cloud.
+    """
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
     position = initial_position
     velocity = initial_velocity
@@ -170,7 +252,11 @@ def simulate(
             ),
             dim=-1,
         )
-        gaussian_centers = local_centers + predicted_position.unsqueeze(0)
+        if world_rotation is not None:
+            rotated_local = local_centers @ world_rotation.T
+        else:
+            rotated_local = local_centers
+        gaussian_centers = rotated_local + predicted_position.unsqueeze(0)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,
@@ -216,12 +302,20 @@ def simulate_impedance(
     smooth_min_temperature: float,
     inside_penalty: float,
     inside_sharpness: float,
+    world_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paper III-D-2 impedance contact dynamics rolled out over ``steps`` frames.
 
     ``stiffness`` and ``damping`` are expected to already be positive (typically
-    produced via ``torch.exp(log_K)`` in the fit loop) — no extra SoftPlus is
+    produced via ``torch.exp(log_K)`` in the fit loop) - no extra SoftPlus is
     applied here. Single contact pair, frictionless.
+
+    ``world_rotation`` is the body orientation R0 from Stage 1's settle pose,
+    held constant throughout the roll-out (angular DOFs of the closed-form
+    contact model in Sec. III-D-2 are not wired in yet). When given, Gaussian
+    world centers are computed by forward kinematics ``R0 @ local + position``
+    per paper Eq. (4), keeping the collision geometry aligned with the actual
+    captured pose even when Stage 1 applied yaw jitter.
     """
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
     K = stiffness
@@ -252,7 +346,11 @@ def simulate_impedance(
             ),
             dim=-1,
         )
-        gaussian_centers = local_centers + position.unsqueeze(0)
+        if world_rotation is not None:
+            rotated_local = local_centers @ world_rotation.T
+        else:
+            rotated_local = local_centers
+        gaussian_centers = rotated_local + position.unsqueeze(0)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,
@@ -288,6 +386,7 @@ def fit_stage2(
     radii: torch.Tensor,
     floor_query_offsets_xy: torch.Tensor,
     args: argparse.Namespace,
+    world_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     device = torch.device(args.device)
     target_positions = target_positions.to(device=device)
@@ -295,6 +394,8 @@ def fit_stage2(
     local_centers = local_centers.to(device=device)
     radii = radii.to(device=device)
     floor_query_offsets_xy = floor_query_offsets_xy.to(device=device)
+    if world_rotation is not None:
+        world_rotation = world_rotation.to(device=device, dtype=local_centers.dtype)
     dt = infer_dt(times.detach().cpu())
 
     use_impedance = str(args.dynamics) == "impedance"
@@ -343,6 +444,7 @@ def fit_stage2(
                 smooth_min_temperature=float(args.smooth_max_temperature),
                 inside_penalty=float(args.inside_penalty),
                 inside_sharpness=float(args.inside_sharpness),
+                world_rotation=world_rotation,
             )
         restitution = torch.sigmoid(raw_restitution if grad else raw_restitution.detach())
         return simulate(
@@ -359,6 +461,7 @@ def fit_stage2(
             smooth_max_temperature=float(args.smooth_max_temperature),
             inside_penalty=float(args.inside_penalty),
             inside_sharpness=float(args.inside_sharpness),
+            world_rotation=world_rotation,
         )
 
     initial_loss = None
@@ -462,10 +565,36 @@ def main() -> None:
     output_dir = args.output_dir.resolve() if args.output_dir else episode_root / "stage2_mujoco_stage1_fit"
 
     target_positions_cpu, times_cpu, states = load_target_positions(episode_root, int(args.max_frames))
+
+    # Resolve the Stage 1 object pose so we can convert world-frame PLY means
+    # into the object-local frame Stage 2's contact loop assumes. Without this,
+    # `gaussian_centers = local + predicted_position` would double-count the
+    # Stage 1 settle translation (and ignore yaw jitter rotation entirely),
+    # causing contacts to misfire.
+    world_t, world_R, manifest_path = load_stage1_object_pose(
+        episode_root,
+        stage1_dataset_root=args.stage1_dataset_root.resolve() if args.stage1_dataset_root else None,
+    )
+    if world_t is not None:
+        print(
+            f"[stage2] Using Stage 1 object_pose from {manifest_path} - "
+            f"t={world_t.tolist()}, R has det={float(np.linalg.det(world_R)):.4f}",
+            flush=True,
+        )
+    else:
+        print(
+            "[stage2] WARNING: no dataset_manifest.json with object_pose found near "
+            f"{episode_root}; falling back to bbox recentering (lossy - collisions "
+            "may misfire if Stage 1 settled the object off-origin or applied yaw jitter).",
+            flush=True,
+        )
+
     local_centers, radii = load_gaussian_collision_primitives_from_ply(
         stage1_ply,
         radius_scale=float(args.radius_scale),
-        recenter=True,
+        recenter=(world_t is None),
+        world_translation=world_t,
+        world_rotation=world_R,
         dtype=torch.float32,
         device=torch.device(args.device),
     )
@@ -477,6 +606,9 @@ def main() -> None:
         dtype=torch.float32,
         device=torch.device(args.device),
     )
+    world_R_tensor = (
+        torch.from_numpy(world_R).to(dtype=torch.float32) if world_R is not None else None
+    )
     predicted_positions, contact_gates, diagnostics = fit_stage2(
         target_positions_cpu,
         times_cpu,
@@ -484,6 +616,7 @@ def main() -> None:
         radii,
         floor_query_offsets_xy,
         args,
+        world_rotation=world_R_tensor,
     )
 
     trajectory = {

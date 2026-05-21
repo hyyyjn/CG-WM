@@ -312,6 +312,16 @@ def main():
 
     target_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "target_geom")
     floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_body")
+
+    # Capture the settled (post-jitter, post-settle) world pose of the object that
+    # Stage 1 will reconstruct. Stage 2 needs this to undo the world-frame bias
+    # baked into the trained Gaussians (means are stored in world frame because
+    # the cameras orbit a world-frame lookat).
+    mujoco.mj_forward(model, data)
+    object_xpos = np.array(data.xpos[target_body_id], dtype=np.float64).copy()
+    object_xquat = np.array(data.xquat[target_body_id], dtype=np.float64).copy()  # MuJoCo: (w, x, y, z)
+    object_xmat = np.array(data.xmat[target_body_id], dtype=np.float64).reshape(3, 3).copy()
 
     _, default_object_height = object_geom_xml(args.object_type)
     object_height = float(default_object_height if args.object_height is None else args.object_height)
@@ -363,6 +373,18 @@ def main():
         "camera_radius": args.camera_radius,
         "elevation_deg": args.elevation_deg,
         "mujoco_gl": os.environ.get("MUJOCO_GL", mujoco_gl),
+        # World pose of the target body at the moment Stage 1 captured images.
+        # Stage 2 should use this to convert PLY means from world frame
+        # (the frame in which Stage 1 trained) into the object-local frame
+        # before adding the per-step predicted_position from the trajectory.
+        # xquat is MuJoCo's (w, x, y, z); xmat is the row-major 3x3 rotation
+        # equivalent, included for convenience so consumers don't have to
+        # re-implement quat->matrix.
+        "object_pose": {
+            "xpos": object_xpos.tolist(),
+            "xquat_wxyz": object_xquat.tolist(),
+            "xmat_row_major": object_xmat.flatten().tolist(),
+        },
     }
     (dataset_dir / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2))
 

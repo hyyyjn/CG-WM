@@ -1014,6 +1014,8 @@ def load_gaussian_collision_primitives_from_ply(
     radius_scale: float = 1.0,
     min_radius: float = 1e-4,
     recenter: bool = True,
+    world_translation: np.ndarray | "torch.Tensor" | tuple | list | None = None,
+    world_rotation: np.ndarray | "torch.Tensor" | None = None,
     dtype=torch.float32,
     device=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1023,6 +1025,19 @@ def load_gaussian_collision_primitives_from_ply(
     For collision smoke tests we use the mean exp-scale as each primitive's
     radius. This keeps the loader lightweight while matching the paper's
     spherical-Gaussian collision abstraction.
+
+    Coordinate-frame handling
+    -------------------------
+    Stage 1 trains Gaussians in **world frame** - the means in the PLY live
+    wherever the object was sitting during capture (e.g. for a sphere settled
+    on the MuJoCo floor, z ≈ 0.09). Stage 2's contact loop wants
+    **object-local** primitives so it can write ``centers = local + position``
+    every step. Pass ``world_translation`` and (optionally) ``world_rotation``
+    captured by Stage 1 (``dataset_manifest.json -> object_pose``); we then
+    return ``local = R^T (world - t)``, which is the correct local frame.
+
+    If both ``world_translation`` is given AND ``recenter=True``, the bbox
+    recenter is skipped (the explicit pose is strictly better).
     """
 
     try:
@@ -1050,7 +1065,17 @@ def load_gaussian_collision_primitives_from_ply(
         radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
     radii_np = np.maximum(radii_np, float(min_radius))
 
-    if recenter:
+    used_explicit_pose = False
+    if world_translation is not None:
+        t = np.asarray(world_translation, dtype=np.float32).reshape(3)
+        centers_np = centers_np - t[None, :]
+        if world_rotation is not None:
+            R = np.asarray(world_rotation, dtype=np.float32).reshape(3, 3)
+            # Rotate world-frame offsets into object-local frame: local = R^T (world - t).
+            centers_np = centers_np @ R  # equivalent to (R.T @ x.T).T
+        used_explicit_pose = True
+
+    if recenter and not used_explicit_pose:
         bbox_min = centers_np.min(axis=0)
         bbox_max = centers_np.max(axis=0)
         centers_np = centers_np - ((bbox_min + bbox_max) * 0.5)
