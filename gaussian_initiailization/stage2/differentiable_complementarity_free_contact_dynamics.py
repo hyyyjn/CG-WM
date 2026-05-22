@@ -241,6 +241,8 @@ class PairwiseImpedanceDynamicsConfig:
     mass_b: float = 1.0
     inertia_diag_a: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     inertia_diag_b: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    inertia_matrix_a: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = None
+    inertia_matrix_b: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = None
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     dynamic_a: bool = True
     dynamic_b: bool = True
@@ -250,9 +252,13 @@ class PairwiseImpedanceDynamicsConfig:
     inside_sharpness: float = 50.0
     num_contact_patches: int = 4
     broad_phase_margin: float = 0.02
+    broad_phase_mode: str = "sphere"
     patch_selection: str = "spatial"
     linear_damping: float = 0.0
     angular_damping: float = 0.0
+    friction_coefficient: float = 0.0
+    tangential_damping: float = 0.0
+    friction_softness: float = 1e-6
 
 
 class GaussianUnionFloorContactDynamics:
@@ -359,12 +365,48 @@ def _safe_inverse_vec(values: torch.Tensor) -> torch.Tensor:
     return 1.0 / torch.clamp(values, min=1e-12)
 
 
+def _inertia_angular_delta(
+    torque: torch.Tensor,
+    *,
+    inertia_diag: Iterable[float],
+    inertia_matrix: Optional[Iterable[Iterable[float]]],
+    dynamic: bool,
+) -> torch.Tensor:
+    if not dynamic:
+        return torch.zeros_like(torque)
+    if inertia_matrix is None:
+        inertia = _as_vec3(inertia_diag, dtype=torque.dtype, device=torque.device)
+        return _safe_inverse_vec(inertia) * torque
+
+    matrix = torch.as_tensor(inertia_matrix, dtype=torque.dtype, device=torque.device)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"inertia_matrix must have shape (3, 3), got {tuple(matrix.shape)}.")
+    regularizer = torch.eye(3, dtype=torque.dtype, device=torque.device) * 1e-9
+    return torch.linalg.solve(matrix + regularizer, torque.unsqueeze(-1)).squeeze(-1)
+
+
+def _tangent_basis(normals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    abs_normals = torch.abs(normals)
+    use_x = abs_normals[..., 0] < 0.9
+    ref_x = torch.zeros_like(normals)
+    ref_x[..., 0] = 1.0
+    ref_y = torch.zeros_like(normals)
+    ref_y[..., 1] = 1.0
+    reference = torch.where(use_x.unsqueeze(-1), ref_x, ref_y)
+    tangent_1 = _cross(normals, reference)
+    tangent_1 = tangent_1 / torch.clamp(torch.linalg.norm(tangent_1, dim=-1, keepdim=True), min=1e-12)
+    tangent_2 = _cross(normals, tangent_1)
+    tangent_2 = tangent_2 / torch.clamp(torch.linalg.norm(tangent_2, dim=-1, keepdim=True), min=1e-12)
+    return tangent_1, tangent_2
+
+
 class PairwiseGaussianBodyImpedanceDynamics:
     """Multi-contact impedance dynamics for two Gaussian collision bodies.
 
     This class consumes the `BodyPairContacts.patch_*` output from
-    `DifferentiableCollisionEngine`. Each patch contributes a frictionless
-    normal force to both linear and angular velocity. It is intended as the
+    `DifferentiableCollisionEngine`. Each patch contributes a normal impedance
+    force plus optional Coulomb-limited tangential damping to both linear and
+    angular velocity. It is intended as the
     first rigid-body dynamics bridge for object-object contact; existing
     floor-only smoke tests keep using the older classes below.
     """
@@ -391,6 +433,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
                 inside_sharpness=self.config.inside_sharpness,
                 num_contact_patches=self.config.num_contact_patches,
                 broad_phase_margin=self.config.broad_phase_margin,
+                broad_phase_mode=self.config.broad_phase_mode,
                 patch_selection=self.config.patch_selection,
             )
         )
@@ -437,27 +480,52 @@ class PairwiseGaussianBodyImpedanceDynamics:
         velocity_b_at_patch = state_b.linear_velocity.unsqueeze(-2) + _cross(state_b.angular_velocity.unsqueeze(-2), r_b)
         relative_velocity = velocity_a_at_patch - velocity_b_at_patch
         normal_velocity = torch.sum(relative_velocity * normals, dim=-1)
+        tangent_1, tangent_2 = _tangent_basis(normals)
+        tangent_velocity_1 = torch.sum(relative_velocity * tangent_1, dim=-1)
+        tangent_velocity_2 = torch.sum(relative_velocity * tangent_2, dim=-1)
+        tangential_velocity = (
+            tangent_velocity_1.unsqueeze(-1) * tangent_1
+            + tangent_velocity_2.unsqueeze(-1) * tangent_2
+        )
 
         K = F.softplus(self.stiffness).to(dtype=dtype, device=device)
         D = F.softplus(self.damping).to(dtype=dtype, device=device)
         lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
         lambdas = weights * lambda_raw
-        forces = lambdas.unsqueeze(-1) * normals
+        normal_forces = lambdas.unsqueeze(-1) * normals
+        raw_friction_forces = -float(cfg.tangential_damping) * weights.unsqueeze(-1) * tangential_velocity
+        raw_friction_norm = torch.linalg.norm(raw_friction_forces, dim=-1, keepdim=True)
+        max_friction_norm = float(cfg.friction_coefficient) * lambdas.unsqueeze(-1)
+        friction_scale = torch.tanh(
+            raw_friction_norm / torch.clamp(max_friction_norm + float(cfg.friction_softness), min=1e-12)
+        )
+        friction_forces = raw_friction_forces * (
+            friction_scale * max_friction_norm / torch.clamp(raw_friction_norm, min=1e-12)
+        )
+        forces = normal_forces + friction_forces
         total_force = torch.sum(forces, dim=-2)
         torque_a = torch.sum(_cross(r_a, forces), dim=-2)
         torque_b = torch.sum(_cross(r_b, -forces), dim=-2)
 
         inv_mass_a = 0.0 if not cfg.dynamic_a else 1.0 / float(cfg.mass_a)
         inv_mass_b = 0.0 if not cfg.dynamic_b else 1.0 / float(cfg.mass_b)
-        inertia_a = _as_vec3(cfg.inertia_diag_a, dtype=dtype, device=device)
-        inertia_b = _as_vec3(cfg.inertia_diag_b, dtype=dtype, device=device)
-        inv_inertia_a = torch.zeros_like(inertia_a) if not cfg.dynamic_a else _safe_inverse_vec(inertia_a)
-        inv_inertia_b = torch.zeros_like(inertia_b) if not cfg.dynamic_b else _safe_inverse_vec(inertia_b)
+        angular_delta_a = _inertia_angular_delta(
+            torque_a,
+            inertia_diag=cfg.inertia_diag_a,
+            inertia_matrix=cfg.inertia_matrix_a,
+            dynamic=cfg.dynamic_a,
+        )
+        angular_delta_b = _inertia_angular_delta(
+            torque_b,
+            inertia_diag=cfg.inertia_diag_b,
+            inertia_matrix=cfg.inertia_matrix_b,
+            dynamic=cfg.dynamic_b,
+        )
 
         velocity_a = state_a.linear_velocity + cfg.dt * inv_mass_a * total_force
         velocity_b = state_b.linear_velocity - cfg.dt * inv_mass_b * total_force
-        angular_a = state_a.angular_velocity + cfg.dt * inv_inertia_a * torque_a
-        angular_b = state_b.angular_velocity + cfg.dt * inv_inertia_b * torque_b
+        angular_a = state_a.angular_velocity + cfg.dt * angular_delta_a
+        angular_b = state_b.angular_velocity + cfg.dt * angular_delta_b
 
         position_a = state_a.position + cfg.dt * (velocity_a - state_a.linear_velocity)
         position_b = state_b.position + cfg.dt * (velocity_b - state_b.linear_velocity)
@@ -471,12 +539,23 @@ class PairwiseGaussianBodyImpedanceDynamics:
             "lambda": lambdas,
             "lambda_raw": lambda_raw,
             "normal_velocity": normal_velocity,
+            "tangent_basis_1": tangent_1,
+            "tangent_basis_2": tangent_2,
+            "tangential_velocity": tangential_velocity,
+            "tangent_velocity_components": torch.stack((tangent_velocity_1, tangent_velocity_2), dim=-1),
+            "friction_force": friction_forces,
+            "normal_force": normal_forces,
+            "patch_force": forces,
             "patch_weights": weights,
             "patch_penetrations": contacts.patch_penetrations,
             "patch_signed_distances": phi,
             "total_force_on_a": total_force,
             "torque_on_a": torque_a,
             "torque_on_b": torque_b,
+            "angular_delta_a": angular_delta_a,
+            "angular_delta_b": angular_delta_b,
+            "inertia_matrix_a": None if cfg.inertia_matrix_a is None else torch.as_tensor(cfg.inertia_matrix_a, dtype=dtype, device=device),
+            "inertia_matrix_b": None if cfg.inertia_matrix_b is None else torch.as_tensor(cfg.inertia_matrix_b, dtype=dtype, device=device),
             "broad_phase_overlaps": contacts.broad_phase_overlaps,
         }
         return next_a, next_b, diagnostics

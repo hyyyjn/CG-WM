@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity", default=-9.81, type=float)
     parser.add_argument("--tilt_deg", default="18 -11 23", type=str)
     parser.add_argument("--proxy_resolution", default=5, type=int)
+    parser.add_argument("--radius_scale", default=1.0, type=float)
     parser.add_argument("--query_resolution", default=17, type=int)
     parser.add_argument("--query_scale", default=1.45, type=float)
     parser.add_argument("--smooth_min_temperature", default=1.5e-2, type=float)
@@ -98,7 +99,7 @@ def quat_wxyz_to_matrix_np(quat: np.ndarray) -> np.ndarray:
     )
 
 
-def make_cube_proxy_local(half_extent: float, resolution: int) -> tuple[torch.Tensor, torch.Tensor]:
+def make_cube_proxy_local(half_extent: float, resolution: int, radius_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
     if half_extent <= 0.0:
         raise ValueError("half_extent must be positive.")
     if resolution < 2:
@@ -107,7 +108,7 @@ def make_cube_proxy_local(half_extent: float, resolution: int) -> tuple[torch.Te
     coords = torch.linspace(-half_extent, half_extent, int(resolution), dtype=torch.float32)
     grid = torch.stack(torch.meshgrid(coords, coords, coords, indexing="ij"), dim=-1).reshape(-1, 3)
     spacing = float(2.0 * half_extent / float(resolution - 1))
-    radii = torch.full((grid.shape[0],), spacing * 0.62, dtype=torch.float32)
+    radii = torch.full((grid.shape[0],), spacing * 0.62 * float(radius_scale), dtype=torch.float32)
     return grid, radii
 
 
@@ -200,7 +201,11 @@ def load_trajectory(path: Path) -> list[dict]:
 
 
 def evaluate_collision_over_trajectory(states: list[dict], args: argparse.Namespace) -> tuple[list[dict], dict]:
-    local_centers, radii = make_cube_proxy_local(float(args.half_extent), int(args.proxy_resolution))
+    local_centers, radii = make_cube_proxy_local(
+        float(args.half_extent),
+        int(args.proxy_resolution),
+        radius_scale=float(args.radius_scale),
+    )
     floor_normal = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
 
     rows = []
@@ -260,6 +265,7 @@ def evaluate_collision_over_trajectory(states: list[dict], args: argparse.Namesp
         "num_gaussian_primitives": int(local_centers.shape[0]),
         "half_extent": float(args.half_extent),
         "proxy_resolution": int(args.proxy_resolution),
+        "radius_scale": float(args.radius_scale),
         "query_resolution": int(args.query_resolution),
         "num_contact_patches": int(args.num_contact_patches),
         "first_contact_frame": int(contact_frames[0]) if contact_frames else None,

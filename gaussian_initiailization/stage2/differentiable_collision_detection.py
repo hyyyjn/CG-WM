@@ -22,6 +22,7 @@ class CollisionEngineConfig:
     inside_sharpness: float = 50.0
     num_contact_patches: int = 1
     broad_phase_margin: float = 0.0
+    broad_phase_mode: str = "sphere"
     patch_selection: str = "spatial"
 
 
@@ -169,6 +170,7 @@ class BodyPairContacts:
     patch_penetrations: torch.Tensor
     patch_signed_distances: torch.Tensor
     broad_phase_overlaps: torch.Tensor
+    broad_phase_mode: str = "sphere"
 
     @property
     def has_contact(self) -> torch.Tensor:
@@ -284,6 +286,10 @@ class GaussianCollisionBody:
         distances = torch.linalg.norm(self.local_centers - center.unsqueeze(0), dim=-1) + self.radii
         return center, torch.max(distances)
 
+    def local_aabb(self) -> tuple[torch.Tensor, torch.Tensor]:
+        radii = self.radii.unsqueeze(-1)
+        return torch.min(self.local_centers - radii, dim=0).values, torch.max(self.local_centers + radii, dim=0).values
+
     def world_bounding_sphere(
         self,
         position: torch.Tensor,
@@ -299,6 +305,24 @@ class GaussianCollisionBody:
             rotation_matrix=rotation_matrix,
         ).squeeze(-2)
         return center_world, radius.to(dtype=position.dtype, device=position.device)
+
+    def world_aabb(
+        self,
+        position: torch.Tensor,
+        *,
+        quaternion_wxyz: torch.Tensor | None = None,
+        rotation_matrix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        centers = self.world_centers(
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        )
+        radii = self.radii.to(dtype=position.dtype, device=position.device)
+        while radii.ndim < centers.ndim - 1:
+            radii = radii.unsqueeze(0)
+        radii = radii.unsqueeze(-1)
+        return torch.min(centers - radii, dim=-2).values, torch.max(centers + radii, dim=-2).values
 
 
 class DifferentiableCollisionEngine:
@@ -374,6 +398,8 @@ class DifferentiableCollisionEngine:
         rotation_a_matrix: torch.Tensor | None = None,
         rotation_b_matrix: torch.Tensor | None = None,
     ) -> BodyPairContacts:
+        if self.config.broad_phase_mode not in ("sphere", "aabb"):
+            raise ValueError("broad_phase_mode must be one of: sphere, aabb.")
         center_a, radius_a = body_a.world_bounding_sphere(
             position_a,
             quaternion_wxyz=quaternion_a_wxyz,
@@ -386,7 +412,22 @@ class DifferentiableCollisionEngine:
         )
         center_delta = center_a - center_b
         center_distance = torch.linalg.norm(center_delta, dim=-1)
-        broad_phase_overlaps = center_distance <= (radius_a + radius_b + float(self.config.broad_phase_margin))
+        sphere_overlaps = center_distance <= (radius_a + radius_b + float(self.config.broad_phase_margin))
+        if self.config.broad_phase_mode == "aabb":
+            min_a, max_a = body_a.world_aabb(
+                position_a,
+                quaternion_wxyz=quaternion_a_wxyz,
+                rotation_matrix=rotation_a_matrix,
+            )
+            min_b, max_b = body_b.world_aabb(
+                position_b,
+                quaternion_wxyz=quaternion_b_wxyz,
+                rotation_matrix=rotation_b_matrix,
+            )
+            margin = float(self.config.broad_phase_margin)
+            broad_phase_overlaps = torch.all((max_a + margin >= min_b) & (max_b + margin >= min_a), dim=-1)
+        else:
+            broad_phase_overlaps = sphere_overlaps
         normal_b_to_a = center_delta / torch.clamp(center_distance.unsqueeze(-1), min=1e-12)
         normal_a_to_b = -normal_b_to_a
 
@@ -438,6 +479,7 @@ class DifferentiableCollisionEngine:
             patch_penetrations=patch_penetrations,
             patch_signed_distances=merged["patch_signed_distances"],
             broad_phase_overlaps=broad_phase_overlaps,
+            broad_phase_mode=self.config.broad_phase_mode,
         )
 
 
@@ -1058,6 +1100,99 @@ def load_gaussian_collision_primitives_from_ply(
     centers = torch.as_tensor(centers_np, dtype=dtype, device=device)
     radii = torch.as_tensor(radii_np, dtype=dtype, device=device)
     return centers, radii
+
+
+def load_gaussian_collision_body_from_ply(
+    path: str | Path,
+    *,
+    radius_scale: float = 1.0,
+    min_radius: float = 1e-4,
+    recenter: bool = True,
+    object_id: int | None = None,
+    foreground_threshold: float | None = None,
+    opacity_threshold: float | None = None,
+    max_primitives: int | None = None,
+    use_centers_as_queries: bool = True,
+    dtype=torch.float32,
+    device=None,
+) -> GaussianCollisionBody:
+    """Build a :class:`GaussianCollisionBody` directly from a Stage 1 PLY.
+
+    This is the Stage 1 -> Stage 2 bridge: it keeps the spherical proxy logic
+    from :func:`load_gaussian_collision_primitives_from_ply`, but also honors the
+    object-aware fields Stage 1 writes (`object_id`, `foreground_logit`, and
+    `opacity`) so downstream dynamics can consume one physical body at a time.
+    """
+
+    try:
+        from plyfile import PlyData
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("plyfile is required to load Stage 1 Gaussian PLY files.") from exc
+
+    ply = PlyData.read(str(path))
+    vertices = ply["vertex"].data
+    names = vertices.dtype.names or ()
+    required = ("x", "y", "z")
+    missing = [name for name in required if name not in names]
+    if missing:
+        raise ValueError(f"{path} is missing required PLY fields: {missing}")
+
+    centers_np = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=-1).astype(np.float32)
+    keep = np.ones((centers_np.shape[0],), dtype=bool)
+    scores = np.ones((centers_np.shape[0],), dtype=np.float32)
+
+    if object_id is not None:
+        if "object_id" not in names:
+            raise ValueError(f"{path} does not contain object_id fields needed for object filtering.")
+        keep &= np.asarray(vertices["object_id"]).astype(np.int32) == int(object_id)
+
+    if foreground_threshold is not None:
+        if "foreground_logit" not in names:
+            raise ValueError(f"{path} does not contain foreground_logit needed for foreground filtering.")
+        foreground = 1.0 / (1.0 + np.exp(-np.asarray(vertices["foreground_logit"]).astype(np.float32)))
+        keep &= foreground >= float(foreground_threshold)
+        scores *= foreground
+
+    if "opacity" in names:
+        opacity = 1.0 / (1.0 + np.exp(-np.asarray(vertices["opacity"]).astype(np.float32)))
+        scores *= opacity
+        if opacity_threshold is not None:
+            keep &= opacity >= float(opacity_threshold)
+    elif opacity_threshold is not None:
+        raise ValueError(f"{path} does not contain opacity needed for opacity filtering.")
+
+    selected = np.nonzero(keep)[0]
+    if selected.size == 0:
+        raise ValueError(
+            "No Gaussian primitives remain after filtering "
+            f"(object_id={object_id}, foreground_threshold={foreground_threshold}, opacity_threshold={opacity_threshold})."
+        )
+    if max_primitives is not None and int(max_primitives) > 0 and selected.size > int(max_primitives):
+        order = np.argsort(scores[selected])[::-1]
+        selected = selected[order[: int(max_primitives)]]
+        selected = np.sort(selected)
+
+    centers_np = centers_np[selected]
+    scale_names = sorted(
+        (name for name in names if name.startswith("scale_")),
+        key=lambda name: int(name.split("_")[-1]),
+    )
+    if scale_names:
+        log_scales = np.stack([vertices[name] for name in scale_names], axis=-1).astype(np.float32)[selected]
+        radii_np = np.exp(log_scales).mean(axis=-1) * float(radius_scale)
+    else:
+        radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
+    radii_np = np.maximum(radii_np, float(min_radius))
+
+    if recenter:
+        bbox_min = centers_np.min(axis=0)
+        bbox_max = centers_np.max(axis=0)
+        centers_np = centers_np - ((bbox_min + bbox_max) * 0.5)
+
+    centers = torch.as_tensor(centers_np, dtype=dtype, device=device)
+    radii = torch.as_tensor(radii_np, dtype=dtype, device=device)
+    query_points = centers if use_centers_as_queries else None
+    return GaussianCollisionBody(centers, radii, query_points)
 
 
 def load_gaussian_points_from_ply(

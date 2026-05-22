@@ -16,12 +16,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gaussian_initiailization.stage2.differentiable_collision_detection import (
+    GaussianCollisionBody,
     PlaneCollider,
     detect_gaussian_union_contacts,
-    load_gaussian_collision_primitives_from_ply,
+    load_gaussian_collision_body_from_ply,
     make_floor_disk_query_points,
 )
 from gaussian_initiailization.stage2.differentiable_complementarity_free_contact_dynamics import (
+    PairwiseGaussianBodyImpedanceDynamics,
+    PairwiseImpedanceDynamicsConfig,
+    RigidBodyState,
     smooth_weighted_max,
 )
 import torch.nn.functional as F
@@ -42,6 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fit_iters", default=300, type=int)
     parser.add_argument("--lr", default=0.04, type=float)
     parser.add_argument("--radius_scale", default=1.0, type=float)
+    parser.add_argument("--object_id", default=None, type=int)
+    parser.add_argument("--foreground_threshold", default=None, type=float)
+    parser.add_argument("--opacity_threshold", default=None, type=float)
+    parser.add_argument("--max_primitives", default=None, type=int)
     parser.add_argument("--query_radius_scale", default=1.10, type=float)
     parser.add_argument("--query_rings", default=5, type=int)
     parser.add_argument("--query_angles", default=32, type=int)
@@ -52,15 +60,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamics",
         default="impedance",
-        choices=("impedance", "restitution"),
+        choices=("impedance", "restitution", "pairwise_impedance"),
         help=(
             "impedance: paper III-D-2 SoftPlus(-K(hJ̃b+ϕ)-D(J̃b)) form, learn (v0, g, K, D). "
-            "restitution: legacy reflection+slop, learn (v0, g, e)."
+            "restitution: legacy reflection+slop, learn (v0, g, e). "
+            "pairwise_impedance: use PairwiseGaussianBodyImpedanceDynamics against a static Gaussian body B."
         ),
     )
     parser.add_argument("--init_stiffness", default=800.0, type=float)
     parser.add_argument("--init_damping", default=30.0, type=float)
     parser.add_argument("--mass", default=1.0, type=float)
+    parser.add_argument("--pairwise_body_b_ply", default=None, type=Path)
+    parser.add_argument("--pairwise_body_b_object_id", default=None, type=int)
+    parser.add_argument("--pairwise_body_b_foreground_threshold", default=None, type=float)
+    parser.add_argument("--pairwise_body_b_opacity_threshold", default=None, type=float)
+    parser.add_argument("--pairwise_body_b_max_primitives", default=None, type=int)
+    parser.add_argument(
+        "--pairwise_static_position",
+        default="0,0,0",
+        type=str,
+        help="Static body-B position for --dynamics pairwise_impedance, as x,y,z.",
+    )
+    parser.add_argument("--pairwise_num_contact_patches", default=4, type=int)
+    parser.add_argument("--pairwise_broad_phase_margin", default=0.02, type=float)
+    parser.add_argument("--pairwise_broad_phase_mode", default="sphere", choices=("sphere", "aabb"))
+    parser.add_argument("--pairwise_friction_coefficient", default=0.0, type=float)
+    parser.add_argument("--pairwise_tangential_damping", default=0.0, type=float)
+    parser.add_argument(
+        "--orientation_loss_weight",
+        default=0.0,
+        type=float,
+        help="Weight for sign-invariant quaternion loss in --dynamics pairwise_impedance.",
+    )
+    parser.add_argument(
+        "--fit_initial_angular_velocity",
+        action="store_true",
+        help="Learn the initial angular velocity from trajectory orientation loss in pairwise mode.",
+    )
+    parser.add_argument("--angular_velocity_l2_weight", default=1e-4, type=float)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gif_fps", default=24, type=int)
     return parser.parse_args()
@@ -111,6 +148,19 @@ def load_target_positions(episode_root: Path, max_frames: int) -> tuple[torch.Te
     return positions, times, states
 
 
+def load_target_quaternions(states: list[dict]) -> torch.Tensor:
+    quaternions = [
+        state.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0])
+        for state in states
+    ]
+    return normalize_quaternion(torch.tensor(quaternions, dtype=torch.float32))
+
+
+def load_initial_angular_velocity(states: list[dict]) -> torch.Tensor:
+    angular_velocity = states[0].get("angular_velocity", [0.0, 0.0, 0.0])
+    return torch.tensor(angular_velocity, dtype=torch.float32)
+
+
 def infer_dt(times: torch.Tensor) -> float:
     diffs = times[1:] - times[:-1]
     dt = float(torch.median(diffs).item())
@@ -119,10 +169,61 @@ def infer_dt(times: torch.Tensor) -> float:
     return dt
 
 
+def parse_vec3(value: str) -> tuple[float, float, float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"Expected three comma-separated values, got: {value}")
+    return tuple(float(part) for part in parts)
+
+
+def normalize_quaternion(quaternion_wxyz: torch.Tensor) -> torch.Tensor:
+    return quaternion_wxyz / torch.clamp(torch.linalg.norm(quaternion_wxyz, dim=-1, keepdim=True), min=1e-12)
+
+
+def quaternion_loss(predicted_wxyz: torch.Tensor, target_wxyz: torch.Tensor) -> torch.Tensor:
+    predicted = normalize_quaternion(predicted_wxyz)
+    target = normalize_quaternion(target_wxyz)
+    alignment = torch.sum(predicted * target, dim=-1).abs().clamp(max=1.0)
+    return torch.mean(1.0 - alignment * alignment)
+
+
+def quaternion_rmse_degrees(predicted_wxyz: torch.Tensor, target_wxyz: torch.Tensor) -> float:
+    predicted = normalize_quaternion(predicted_wxyz)
+    target = normalize_quaternion(target_wxyz)
+    alignment = torch.sum(predicted * target, dim=-1).abs().clamp(max=1.0)
+    angles = 2.0 * torch.acos(alignment)
+    return float(torch.sqrt(torch.mean(angles * angles)).detach().cpu().item() * 180.0 / np.pi)
+
+
 def estimate_radius(local_centers: torch.Tensor, radii: torch.Tensor) -> float:
     xy_extent = torch.linalg.norm(local_centers[:, :2], dim=-1) + radii
     radius = float(torch.quantile(xy_extent.detach().cpu(), 0.98).item())
     return max(radius, 1e-3)
+
+
+def load_stage1_body_arrays(
+    path: Path,
+    args: argparse.Namespace,
+    *,
+    object_id: int | None,
+    foreground_threshold: float | None,
+    opacity_threshold: float | None,
+    max_primitives: int | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    body = load_gaussian_collision_body_from_ply(
+        path,
+        radius_scale=float(args.radius_scale),
+        recenter=True,
+        object_id=object_id,
+        foreground_threshold=foreground_threshold,
+        opacity_threshold=opacity_threshold,
+        max_primitives=max_primitives,
+        use_centers_as_queries=True,
+        dtype=torch.float32,
+        device=device,
+    )
+    return body.local_centers, body.radii
 
 
 def _smooth_min_signed(values: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -281,29 +382,127 @@ def simulate_impedance(
     return torch.stack(positions, dim=0), gates
 
 
+def simulate_pairwise_impedance(
+    initial_position: torch.Tensor,
+    initial_quaternion: torch.Tensor,
+    initial_velocity: torch.Tensor,
+    initial_angular_velocity: torch.Tensor,
+    stiffness: torch.Tensor,
+    damping: torch.Tensor,
+    local_centers_a: torch.Tensor,
+    radii_a: torch.Tensor,
+    local_centers_b: torch.Tensor,
+    radii_b: torch.Tensor,
+    static_position_b: torch.Tensor,
+    *,
+    steps: int,
+    dt: float,
+    mass: float,
+    gravity_z: float,
+    contact_softness: float,
+    smooth_min_temperature: float,
+    inside_penalty: float,
+    inside_sharpness: float,
+    num_contact_patches: int,
+    broad_phase_margin: float,
+    broad_phase_mode: str,
+    friction_coefficient: float,
+    tangential_damping: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    body_a = GaussianCollisionBody(local_centers_a, radii_a)
+    body_b = GaussianCollisionBody(local_centers_b, radii_b)
+    dynamics = PairwiseGaussianBodyImpedanceDynamics(
+        body_a,
+        body_b,
+        stiffness=stiffness,
+        damping=damping,
+        config=PairwiseImpedanceDynamicsConfig(
+            dt=float(dt),
+            mass_a=float(mass),
+            mass_b=float(mass),
+            gravity=(0.0, 0.0, float(gravity_z)),
+            dynamic_a=True,
+            dynamic_b=False,
+            contact_softness=float(contact_softness),
+            smooth_min_temperature=float(smooth_min_temperature),
+            inside_penalty=float(inside_penalty),
+            inside_sharpness=float(inside_sharpness),
+            num_contact_patches=int(num_contact_patches),
+            broad_phase_margin=float(broad_phase_margin),
+            broad_phase_mode=str(broad_phase_mode),
+            friction_coefficient=float(friction_coefficient),
+            tangential_damping=float(tangential_damping),
+        ),
+    )
+    quaternion = normalize_quaternion(initial_quaternion.to(dtype=initial_position.dtype, device=initial_position.device))
+    static_quaternion = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=initial_position.dtype, device=initial_position.device)
+    zeros = torch.zeros(3, dtype=initial_position.dtype, device=initial_position.device)
+    state_a = RigidBodyState(initial_position, quaternion, initial_velocity, initial_angular_velocity)
+    state_b = RigidBodyState(static_position_b, static_quaternion, zeros, zeros)
+    positions = [state_a.position]
+    quaternions = [state_a.quaternion_wxyz]
+    gates = []
+    for _ in range(steps - 1):
+        state_a, state_b, diagnostics = dynamics.step(state_a, state_b)
+        positions.append(state_a.position)
+        quaternions.append(state_a.quaternion_wxyz)
+        patch_weights = diagnostics["patch_weights"]
+        gates.append(torch.max(patch_weights))
+
+    if gates:
+        gate_tensor = torch.stack(gates)
+    else:
+        gate_tensor = torch.empty((0,), dtype=initial_position.dtype, device=initial_position.device)
+    return torch.stack(positions, dim=0), torch.stack(quaternions, dim=0), gate_tensor
+
+
 def fit_stage2(
     target_positions: torch.Tensor,
+    target_quaternions: torch.Tensor | None,
+    initial_angular_velocity_hint: torch.Tensor,
     times: torch.Tensor,
     local_centers: torch.Tensor,
     radii: torch.Tensor,
     floor_query_offsets_xy: torch.Tensor,
     args: argparse.Namespace,
-) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    *,
+    pairwise_body_b: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, dict]:
     device = torch.device(args.device)
     target_positions = target_positions.to(device=device)
+    if target_quaternions is not None:
+        target_quaternions = normalize_quaternion(target_quaternions.to(device=device))
+    initial_angular_velocity_hint = initial_angular_velocity_hint.to(device=device)
     times = times.to(device=device)
     local_centers = local_centers.to(device=device)
     radii = radii.to(device=device)
     floor_query_offsets_xy = floor_query_offsets_xy.to(device=device)
     dt = infer_dt(times.detach().cpu())
 
-    use_impedance = str(args.dynamics) == "impedance"
+    dynamics_mode = str(args.dynamics)
+    use_impedance = dynamics_mode == "impedance"
+    use_pairwise = dynamics_mode == "pairwise_impedance"
     initial_position = target_positions[0].detach()
+    initial_quaternion = (
+        target_quaternions[0].detach()
+        if target_quaternions is not None
+        else torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device)
+    )
     finite_velocity = (target_positions[1] - target_positions[0]) / dt
     initial_velocity = torch.nn.Parameter(finite_velocity.detach().clone())
+    initial_angular_velocity = torch.nn.Parameter(initial_angular_velocity_hint.detach().clone())
     gravity_z = torch.nn.Parameter(torch.tensor(-9.81, dtype=torch.float32, device=device))
 
-    if use_impedance:
+    if use_pairwise:
+        stiffness = torch.nn.Parameter(torch.tensor(float(args.init_stiffness), dtype=torch.float32, device=device))
+        damping = torch.nn.Parameter(torch.tensor(float(args.init_damping), dtype=torch.float32, device=device))
+        learnable = [initial_velocity, stiffness, damping]
+        if bool(args.fit_initial_angular_velocity):
+            learnable.append(initial_angular_velocity)
+        log_K = None
+        log_D = None
+        raw_restitution = None
+    elif use_impedance:
         # Reparameterise K = exp(log_K) so Adam can move K in log-space; this
         # avoids the K ~10^3 vs v0 ~10^0 scale mismatch where a shared lr keeps
         # K essentially frozen for the whole fit.
@@ -319,15 +518,55 @@ def fit_stage2(
         raw_restitution = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=device))
         log_K = None
         log_D = None
+        stiffness = None
+        damping = None
         learnable = [initial_velocity, gravity_z, raw_restitution]
 
     optimizer = torch.optim.Adam(learnable, lr=float(args.lr))
 
     def run(grad: bool):
+        if use_pairwise:
+            if pairwise_body_b is None:
+                local_centers_b, radii_b = local_centers, radii
+            else:
+                local_centers_b, radii_b = pairwise_body_b
+                local_centers_b = local_centers_b.to(device=device)
+                radii_b = radii_b.to(device=device)
+            static_position_b = torch.tensor(
+                parse_vec3(args.pairwise_static_position),
+                dtype=target_positions.dtype,
+                device=device,
+            )
+            return simulate_pairwise_impedance(
+                initial_position,
+                initial_quaternion,
+                initial_velocity if grad else initial_velocity.detach(),
+                initial_angular_velocity if grad else initial_angular_velocity.detach(),
+                stiffness if grad else stiffness.detach(),
+                damping if grad else damping.detach(),
+                local_centers,
+                radii,
+                local_centers_b,
+                radii_b,
+                static_position_b,
+                steps=target_positions.shape[0],
+                dt=dt,
+                mass=float(args.mass),
+                gravity_z=float(gravity_z.detach().cpu().item()),
+                contact_softness=float(args.contact_softness),
+                smooth_min_temperature=float(args.smooth_max_temperature),
+                inside_penalty=float(args.inside_penalty),
+                inside_sharpness=float(args.inside_sharpness),
+                num_contact_patches=int(args.pairwise_num_contact_patches),
+                broad_phase_margin=float(args.pairwise_broad_phase_margin),
+                broad_phase_mode=str(args.pairwise_broad_phase_mode),
+                friction_coefficient=float(args.pairwise_friction_coefficient),
+                tangential_damping=float(args.pairwise_tangential_damping),
+            )
         if use_impedance:
             K_tensor = torch.exp(log_K if grad else log_K.detach())
             D_tensor = torch.exp(log_D if grad else log_D.detach())
-            return simulate_impedance(
+            predicted_positions, gates = simulate_impedance(
                 initial_position,
                 initial_velocity if grad else initial_velocity.detach(),
                 gravity_z if grad else gravity_z.detach(),
@@ -344,8 +583,9 @@ def fit_stage2(
                 inside_penalty=float(args.inside_penalty),
                 inside_sharpness=float(args.inside_sharpness),
             )
+            return predicted_positions, None, gates
         restitution = torch.sigmoid(raw_restitution if grad else raw_restitution.detach())
-        return simulate(
+        predicted_positions, gates = simulate(
             initial_position,
             initial_velocity if grad else initial_velocity.detach(),
             gravity_z if grad else gravity_z.detach(),
@@ -360,28 +600,48 @@ def fit_stage2(
             inside_penalty=float(args.inside_penalty),
             inside_sharpness=float(args.inside_sharpness),
         )
+        return predicted_positions, None, gates
 
     initial_loss = None
     final_loss = None
     for iteration in range(max(1, int(args.fit_iters))):
         optimizer.zero_grad(set_to_none=True)
-        predicted, gates = run(grad=True)
+        predicted, predicted_quaternions, gates = run(grad=True)
         position_loss = torch.mean((predicted - target_positions) ** 2)
         loss = position_loss + 1e-4 * torch.mean(initial_velocity * initial_velocity)
+        orientation_loss = torch.tensor(0.0, dtype=target_positions.dtype, device=device)
+        if (
+            use_pairwise
+            and predicted_quaternions is not None
+            and target_quaternions is not None
+            and float(args.orientation_loss_weight) > 0.0
+        ):
+            orientation_loss = quaternion_loss(predicted_quaternions, target_quaternions)
+            loss = loss + float(args.orientation_loss_weight) * orientation_loss
+        if use_pairwise and bool(args.fit_initial_angular_velocity):
+            loss = loss + float(args.angular_velocity_l2_weight) * torch.mean(
+                initial_angular_velocity * initial_angular_velocity
+            )
         loss.backward()
         optimizer.step()
         if iteration == 0:
             initial_loss = float(position_loss.detach().cpu().item())
         final_loss = float(position_loss.detach().cpu().item())
 
-    predicted, gates = run(grad=False)
+    predicted, predicted_quaternions, gates = run(grad=False)
     contact_indices = torch.nonzero(gates.detach().cpu() > 0.5).flatten()
     first_contact_frame = int(contact_indices[0].item() + 1) if contact_indices.numel() else None
     rmse = torch.sqrt(torch.mean((predicted - target_positions) ** 2)).detach().cpu().item()
     diagnostics = {
         "dt": dt,
         "frames": int(target_positions.shape[0]),
-        "dynamics": "impedance" if use_impedance else "restitution",
+        "dynamics": dynamics_mode,
+        "num_primitives_a": int(local_centers.shape[0]),
+        "radius_scale": float(args.radius_scale),
+        "object_id": args.object_id,
+        "foreground_threshold": args.foreground_threshold,
+        "opacity_threshold": args.opacity_threshold,
+        "max_primitives": args.max_primitives,
         "initial_position_loss": initial_loss,
         "final_position_loss": final_loss,
         "position_rmse": float(rmse),
@@ -390,12 +650,30 @@ def fit_stage2(
         "first_contact_frame": first_contact_frame,
         "max_contact_gate": float(gates.detach().cpu().max().item()) if gates.numel() else 0.0,
     }
-    if use_impedance:
+    if use_pairwise:
+        diagnostics["learned_stiffness"] = float(F.softplus(stiffness.detach()).cpu().item())
+        diagnostics["learned_damping"] = float(F.softplus(damping.detach()).cpu().item())
+        diagnostics["pairwise_static_position"] = list(parse_vec3(args.pairwise_static_position))
+        diagnostics["pairwise_num_contact_patches"] = int(args.pairwise_num_contact_patches)
+        diagnostics["pairwise_broad_phase_mode"] = str(args.pairwise_broad_phase_mode)
+        diagnostics["pairwise_friction_coefficient"] = float(args.pairwise_friction_coefficient)
+        diagnostics["pairwise_tangential_damping"] = float(args.pairwise_tangential_damping)
+        diagnostics["gravity_fit_enabled"] = False
+        diagnostics["fit_initial_angular_velocity"] = bool(args.fit_initial_angular_velocity)
+        diagnostics["learned_initial_angular_velocity"] = initial_angular_velocity.detach().cpu().tolist()
+        diagnostics["orientation_loss_weight"] = float(args.orientation_loss_weight)
+        diagnostics["angular_velocity_l2_weight"] = float(args.angular_velocity_l2_weight)
+        if predicted_quaternions is not None and target_quaternions is not None:
+            orientation_loss_value = quaternion_loss(predicted_quaternions, target_quaternions)
+            diagnostics["orientation_loss"] = float(orientation_loss_value.detach().cpu().item())
+            diagnostics["orientation_rmse_degrees"] = quaternion_rmse_degrees(predicted_quaternions, target_quaternions)
+    elif use_impedance:
         diagnostics["learned_stiffness"] = float(torch.exp(log_K.detach()).cpu().item())
         diagnostics["learned_damping"] = float(torch.exp(log_D.detach()).cpu().item())
     else:
         diagnostics["learned_restitution"] = float(torch.sigmoid(raw_restitution.detach()).cpu().item())
-    return predicted.detach().cpu(), gates.detach().cpu(), diagnostics
+    predicted_quaternions_cpu = predicted_quaternions.detach().cpu() if predicted_quaternions is not None else None
+    return predicted.detach().cpu(), predicted_quaternions_cpu, gates.detach().cpu(), diagnostics
 
 
 def draw_follow_view(
@@ -462,13 +740,28 @@ def main() -> None:
     output_dir = args.output_dir.resolve() if args.output_dir else episode_root / "stage2_mujoco_stage1_fit"
 
     target_positions_cpu, times_cpu, states = load_target_positions(episode_root, int(args.max_frames))
-    local_centers, radii = load_gaussian_collision_primitives_from_ply(
+    target_quaternions_cpu = load_target_quaternions(states)
+    initial_angular_velocity_hint_cpu = load_initial_angular_velocity(states)
+    local_centers, radii = load_stage1_body_arrays(
         stage1_ply,
-        radius_scale=float(args.radius_scale),
-        recenter=True,
-        dtype=torch.float32,
+        args,
+        object_id=args.object_id,
+        foreground_threshold=args.foreground_threshold,
+        opacity_threshold=args.opacity_threshold,
+        max_primitives=args.max_primitives,
         device=torch.device(args.device),
     )
+    pairwise_body_b = None
+    if str(args.dynamics) == "pairwise_impedance" and args.pairwise_body_b_ply is not None:
+        pairwise_body_b = load_stage1_body_arrays(
+            args.pairwise_body_b_ply.resolve(),
+            args,
+            object_id=args.pairwise_body_b_object_id,
+            foreground_threshold=args.pairwise_body_b_foreground_threshold,
+            opacity_threshold=args.pairwise_body_b_opacity_threshold,
+            max_primitives=args.pairwise_body_b_max_primitives,
+            device=torch.device(args.device),
+        )
     query_radius = estimate_radius(local_centers.detach().cpu(), radii.detach().cpu()) * float(args.query_radius_scale)
     floor_query_offsets_xy = make_floor_disk_query_points(
         query_radius,
@@ -477,28 +770,36 @@ def main() -> None:
         dtype=torch.float32,
         device=torch.device(args.device),
     )
-    predicted_positions, contact_gates, diagnostics = fit_stage2(
+    predicted_positions, predicted_quaternions, contact_gates, diagnostics = fit_stage2(
         target_positions_cpu,
+        target_quaternions_cpu,
+        initial_angular_velocity_hint_cpu,
         times_cpu,
         local_centers,
         radii,
         floor_query_offsets_xy,
         args,
+        pairwise_body_b=pairwise_body_b,
     )
+
+    trajectory_states = []
+    for idx in range(predicted_positions.shape[0]):
+        state_payload = {
+            "frame_index": int(states[idx]["frame_index"]),
+            "time": float(states[idx].get("time", idx)),
+            "target_position": target_positions_cpu[idx].tolist(),
+            "predicted_position": predicted_positions[idx].tolist(),
+            "contact_gate": float(contact_gates[idx - 1].item()) if idx > 0 and idx - 1 < contact_gates.numel() else 0.0,
+        }
+        if predicted_quaternions is not None:
+            state_payload["target_quaternion_wxyz"] = target_quaternions_cpu[idx].tolist()
+            state_payload["predicted_quaternion_wxyz"] = predicted_quaternions[idx].tolist()
+        trajectory_states.append(state_payload)
 
     trajectory = {
         "source_episode_root": str(episode_root),
         "stage1_ply": str(stage1_ply),
-        "states": [
-            {
-                "frame_index": int(states[idx]["frame_index"]),
-                "time": float(states[idx].get("time", idx)),
-                "target_position": target_positions_cpu[idx].tolist(),
-                "predicted_position": predicted_positions[idx].tolist(),
-                "contact_gate": float(contact_gates[idx - 1].item()) if idx > 0 and idx - 1 < contact_gates.numel() else 0.0,
-            }
-            for idx in range(predicted_positions.shape[0])
-        ],
+        "states": trajectory_states,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "fit_summary.json", diagnostics)

@@ -8,7 +8,7 @@ the fit loop is the actual workhorse the team will use. The script fabricates:
   * the manifest files the fit script reads
 
 then runs `run_stage2_mujoco_stage1_fit.py` with a small fit budget so we can
-see whether the optimisation converges on (gravity, restitution, v0).
+see whether the optimisation converges for floor and pairwise dynamics modes.
 """
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ def main():
     write_synthetic_trajectory()
     ply_path = write_synthetic_stage1_ply()
 
-    for dynamics_mode in ("impedance", "restitution"):
+    for dynamics_mode in ("impedance", "restitution", "pairwise_impedance"):
         fit_output = OUT_ROOT / f"synthetic_fit_{dynamics_mode}"
         cmd = [
             sys.executable,
@@ -131,6 +131,8 @@ def main():
             "--query_angles", "16",
             "--dynamics", dynamics_mode,
         ]
+        if dynamics_mode == "pairwise_impedance":
+            cmd.extend(["--pairwise_static_position", "0,0,0"])
         print(f"\n[smoke] === {dynamics_mode} ===")
         print("[smoke] running:", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)

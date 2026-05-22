@@ -32,8 +32,10 @@ gaussian_initiailization/
   tools/                                        # Blender/MuJoCo/helper scripts
   stage2/
     differentiable_collision_detection.py
+    differentiable_contact_graph.py
     differentiable_complementarity_free_contact_dynamics.py
     gaussian_splatting_rendering.py
+    tune_collision_proxy.py
     _smoke_test_*.py
 ```
 
@@ -224,10 +226,11 @@ Collision detection:
   - optional local query points
   - quaternion / rotation matrix pose transform
   - world bounding sphere
+  - world AABB
 - `DifferentiableCollisionEngine`
   - world query vs Gaussian body contact
   - object-object bidirectional contact
-  - bounding sphere broad phase
+  - bounding sphere / AABB broad phase
 - `BodyPairContacts`
   - `a_to_b`, `b_to_a`
   - merged `patch_points`
@@ -249,6 +252,9 @@ Contact dynamics:
 - `PairwiseGaussianBodyImpedanceDynamics`
   - object-object multi-contact patch 사용
   - patch별 impedance force
+  - patch별 tangent basis / tangential velocity diagnostics
+  - Coulomb-limited tangential damping force
+  - diagonal 또는 full 3x3 inertia tensor 기반 angular update
   - linear velocity update
   - torque / angular velocity update
   - quaternion integration
@@ -266,6 +272,15 @@ conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_te
   --num_contact_patches 4
 ```
 
+collision proxy tuning sweep:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/stage2/tune_collision_proxy.py \
+  --proxy_resolutions 3,4,5,6,7 \
+  --radius_scales 0.70,0.85,1.00,1.15,1.30 \
+  --query_resolution 17
+```
+
 결과:
 
 ```text
@@ -273,6 +288,10 @@ gaussian_initiailization/stage2/_outputs/cube_floor_collision/
   cube_floor_collision_summary.json
   cube_floor_collision_frames.json
   cube_floor_collision_plot.png
+
+gaussian_initiailization/stage2/_outputs/collision_proxy_tuning/
+  collision_proxy_tuning_summary.json
+  collision_proxy_tuning_results.csv
 ```
 
 object-object pairwise dynamics smoke:
@@ -281,11 +300,61 @@ object-object pairwise dynamics smoke:
 conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_contact_dynamics.py
 ```
 
+multi-object pairwise contact graph smoke:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_contact_graph.py
+```
+
+MuJoCo bouncing ball GT fit smoke:
+
+```bash
+conda run -n mujoco python gaussian_initiailization/stage2/_smoke_test_mujoco_bouncing_ball_fit.py \
+  --mode generate_gt \
+  --output_dir gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit
+
+conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_mujoco_bouncing_ball_fit.py \
+  --mode fit \
+  --gt_json gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit/mujoco_bouncing_ball_trajectory.json \
+  --output_dir gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit
+```
+
+pairwise MuJoCo GT comparison:
+
+```bash
+conda run -n mujoco python gaussian_initiailization/stage2/_smoke_test_pairwise_mujoco_compare.py \
+  --mode generate_gt \
+  --output_dir gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare
+
+conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_mujoco_compare.py \
+  --mode compare \
+  --gt_json gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare/mujoco_pairwise_gt_trajectory.json \
+  --output_dir gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare
+```
+
 결과:
 
 ```text
 gaussian_initiailization/stage2/_outputs/pairwise_contact_dynamics/
   pairwise_contact_dynamics_summary.json
+  pairwise_contact_dynamics_frames.json
+  pairwise_contact_dynamics_plot.png
+  pairwise_contact_dynamics_rollout_plot.png
+
+gaussian_initiailization/stage2/_outputs/pairwise_contact_graph/
+  pairwise_contact_graph_summary.json
+
+gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit/
+  mujoco_bouncing_ball_trajectory.json
+  stage2_bouncing_ball_fit_summary.json
+  stage2_bouncing_ball_fit_frames.json
+  stage2_bouncing_ball_fit_plot.png
+
+gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare/
+  mujoco_pairwise_gt_trajectory.json
+  pairwise_mujoco_compare_summary.json
+  pairwise_mujoco_compare_frames.json
+  pairwise_mujoco_compare_plot.png
 ```
 
 검증된 항목:
@@ -374,12 +443,16 @@ conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_te
 ```
 
 현재 smoke 기준으로는 collision patch, broad phase, pairwise dynamics, gradient가 정상 출력됩니다.
-다만 cube analytic SDF 대비 Gaussian union SDF 오차는 아직 proxy tuning이 필요합니다.
+cube analytic SDF 대비 Gaussian union SDF 오차는 `tune_collision_proxy.py`로 radius scale / proxy
+resolution sweep을 돌려 후보를 고를 수 있습니다.
 
 ## TODO
 
 ### P0
 
+완료:
+
+- pairwise dynamics 결과를 MuJoCo GT trajectory와 비교
 - Stage 2 pairwise dynamics를 `tools/run_stage2_mujoco_stage1_fit.py`에 mode로 연결
 - Stage 1 실제 PLY에서 `GaussianCollisionBody`를 구성하는 helper 추가
 - collision proxy tuning
@@ -387,16 +460,27 @@ conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_te
   - proxy resolution sweep
   - foreground score / opacity 기반 primitive filtering
 - object-object dynamics smoke를 여러 step rollout으로 확장
-- pairwise dynamics 결과를 MuJoCo GT trajectory와 비교
 
 ### P1
 
+완료:
+
+- broad phase를 bounding sphere에서 AABB / spatial hash로 확장
+  - `CollisionEngineConfig.broad_phase_mode`에 `sphere` / `aabb` 지원
+  - `GaussianCollisionBody.world_aabb()` 추가
+  - contact graph에서 `candidate_pair_mode="spatial_hash"` 지원
+  - `tools/run_stage2_mujoco_stage1_fit.py`에 `--pairwise_broad_phase_mode` 추가
+- multi-object scene에서 pairwise contact graph 구성
+  - `stage2/differentiable_contact_graph.py` 추가
+  - multi-body node / pairwise edge / adjacency matrix / active edge serialization 지원
+  - `_smoke_test_pairwise_contact_graph.py`로 3-body graph와 gradient 연결 검증
+- quaternion / angular velocity fit loop 연결
+  - `tools/run_stage2_mujoco_stage1_fit.py`의 `pairwise_impedance` mode가 trajectory의 `quaternion_wxyz` / `angular_velocity`를 읽음
+  - `--orientation_loss_weight`, `--fit_initial_angular_velocity`, `--angular_velocity_l2_weight` 추가
+  - `predicted_trajectory.json`에 target/predicted quaternion 기록
+- inertia tensor를 diagonal 이상으로 확장
 - friction Jacobian 추가
 - tangential damping / Coulomb-like friction approximation 추가
-- inertia tensor를 diagonal 이상으로 확장
-- quaternion / angular velocity fit loop 연결
-- multi-object scene에서 pairwise contact graph 구성
-- broad phase를 bounding sphere에서 AABB / spatial hash로 확장
 
 ### P2
 
