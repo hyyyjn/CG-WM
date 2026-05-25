@@ -110,6 +110,7 @@ def setup_dataset_layout() -> None:
             "mesh_path": "",
             "stage1_dataset_path": str(STAGE1_DIR),
             "stage1_points_ply": "",
+            "stage1_gaussian_body": {"coordinate_frame": "object_local"},
             "normalization": {
                 "bbox_min": [-SPHERE_RADIUS, -SPHERE_RADIUS, -SPHERE_RADIUS],
                 "bbox_max": [SPHERE_RADIUS, SPHERE_RADIUS, SPHERE_RADIUS],
@@ -143,6 +144,7 @@ def setup_dataset_layout() -> None:
                     "scenario": "fall_and_rebound",
                     "split": split,
                     "object_name": "sphere",
+                    "stage1_gaussian_body": {"coordinate_frame": "object_local"},
                     "frames_per_episode": FRAMES_PER_EPISODE,
                     "fps": FPS,
                     "image_size": [IMAGE_W, IMAGE_H],

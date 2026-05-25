@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +25,7 @@ class RigidState:
     position: torch.Tensor
     linear_velocity: torch.Tensor
 
-    def to_serializable(self) -> Dict[str, List[float]]:
+    def to_serializable(self) -> dict[str, list[float]]:
         return {
             "position": self.position.detach().cpu().tolist(),
             "linear_velocity": self.linear_velocity.detach().cpu().tolist(),
@@ -41,7 +41,7 @@ class RigidBodyState:
     linear_velocity: torch.Tensor
     angular_velocity: torch.Tensor
 
-    def to_serializable(self) -> Dict[str, List[float]]:
+    def to_serializable(self) -> dict[str, list[float]]:
         return {
             "position": self.position.detach().cpu().tolist(),
             "quaternion_wxyz": self.quaternion_wxyz.detach().cpu().tolist(),
@@ -55,7 +55,7 @@ class ContactDynamicsConfig:
     dt: float = 1.0 / 60.0
     mass: float = 1.0
     restitution: float = 0.0
-    acceleration: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    acceleration: tuple[float, float, float] = (0.0, 0.0, 0.0)
     contact_softness: float = 1e-3
     contact_gate_softness: float = 2e-3
     smooth_max_temperature: float = 1e-2
@@ -95,7 +95,7 @@ class ComplementarityFreeContactDynamics:
         self.local_query_points = local_query_points
         self.config = config or ContactDynamicsConfig()
 
-    def step(self, state: RigidState) -> Tuple[RigidState, Dict[str, torch.Tensor]]:
+    def step(self, state: RigidState) -> tuple[RigidState, dict[str, torch.Tensor]]:
         cfg = self.config
         if cfg.dt <= 0.0:
             raise ValueError("dt must be positive.")
@@ -143,7 +143,7 @@ def rollout(
     initial_state: RigidState,
     dynamics: ComplementarityFreeContactDynamics,
     num_steps: int,
-) -> Tuple[List[RigidState], List[Dict[str, torch.Tensor]]]:
+) -> tuple[list[RigidState], list[dict[str, torch.Tensor]]]:
     if num_steps < 1:
         raise ValueError("num_steps must be at least 1.")
     states = [initial_state]
@@ -172,7 +172,7 @@ class SphereFloorQueryContactDynamics:
         self.radius = float(radius)
         self.config = config or ContactDynamicsConfig()
 
-    def step(self, state: RigidState) -> Tuple[RigidState, Dict[str, torch.Tensor]]:
+    def step(self, state: RigidState) -> tuple[RigidState, dict[str, torch.Tensor]]:
         cfg = self.config
         acceleration = _as_vec3(
             cfg.acceleration,
@@ -224,7 +224,7 @@ class ImpedanceContactDynamicsConfig:
 
     dt: float = 1.0 / 60.0
     mass: float = 1.0
-    gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
+    gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
     contact_softness: float = 1e-3
     smooth_min_temperature: float = 1e-2
     inside_penalty: float = 0.02
@@ -239,11 +239,11 @@ class PairwiseImpedanceDynamicsConfig:
     dt: float = 1.0 / 60.0
     mass_a: float = 1.0
     mass_b: float = 1.0
-    inertia_diag_a: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    inertia_diag_b: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    inertia_matrix_a: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = None
-    inertia_matrix_b: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = None
-    gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
+    inertia_diag_a: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    inertia_diag_b: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    inertia_matrix_a: Optional[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = None
+    inertia_matrix_b: Optional[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = None
+    gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
     dynamic_a: bool = True
     dynamic_b: bool = True
     contact_softness: float = 1e-3
@@ -271,15 +271,17 @@ class GaussianUnionFloorContactDynamics:
         local_gaussian_centers: torch.Tensor,
         gaussian_radii: torch.Tensor,
         *,
+        world_rotation: Optional[torch.Tensor] = None,
         config: Optional[ContactDynamicsConfig] = None,
     ):
         self.collider = collider
         self.floor_query_offsets_xy = floor_query_offsets_xy
         self.local_gaussian_centers = local_gaussian_centers
         self.gaussian_radii = gaussian_radii
+        self.world_rotation = world_rotation
         self.config = config or ContactDynamicsConfig()
 
-    def step(self, state: RigidState) -> Tuple[RigidState, Dict[str, torch.Tensor]]:
+    def step(self, state: RigidState) -> tuple[RigidState, dict[str, torch.Tensor]]:
         cfg = self.config
         acceleration = _as_vec3(cfg.acceleration, dtype=state.position.dtype, device=state.position.device)
         predicted_velocity = state.linear_velocity + acceleration * cfg.dt
@@ -294,10 +296,10 @@ class GaussianUnionFloorContactDynamics:
             ),
             dim=-1,
         )
-        gaussian_centers = self.local_gaussian_centers.to(
-            dtype=state.position.dtype,
-            device=state.position.device,
-        ) + predicted_position.unsqueeze(0)
+        local = self.local_gaussian_centers.to(dtype=state.position.dtype, device=state.position.device)
+        if self.world_rotation is not None:
+            local = local @ self.world_rotation.to(dtype=local.dtype, device=local.device).T
+        gaussian_centers = local + predicted_position.unsqueeze(0)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,
@@ -464,7 +466,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
         state_a: RigidBodyState,
         state_b: RigidBodyState,
         contacts: BodyPairContacts,
-    ) -> tuple[RigidBodyState, RigidBodyState, Dict[str, torch.Tensor]]:
+    ) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
         cfg = self.config
         dtype = state_a.position.dtype
         device = state_a.position.device
@@ -560,7 +562,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
         }
         return next_a, next_b, diagnostics
 
-    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, Dict[str, torch.Tensor]]:
+    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
         predicted_a = self._predict_free(state_a, mass=self.config.mass_a, dynamic=self.config.dynamic_a)
         predicted_b = self._predict_free(state_b, mass=self.config.mass_b, dynamic=self.config.dynamic_b)
         contacts = self.collision_engine.body_pair_contacts(
@@ -602,6 +604,7 @@ class ImpedanceFloorContactDynamics:
         *,
         stiffness: torch.Tensor,
         damping: torch.Tensor,
+        world_rotation: Optional[torch.Tensor] = None,
         config: Optional[ImpedanceContactDynamicsConfig] = None,
     ):
         self.collider = collider
@@ -610,9 +613,10 @@ class ImpedanceFloorContactDynamics:
         self.gaussian_radii = gaussian_radii
         self.stiffness = stiffness
         self.damping = damping
+        self.world_rotation = world_rotation
         self.config = config or ImpedanceContactDynamicsConfig()
 
-    def step(self, state: RigidState) -> Tuple[RigidState, Dict[str, torch.Tensor]]:
+    def step(self, state: RigidState) -> tuple[RigidState, dict[str, torch.Tensor]]:
         cfg = self.config
         gravity = _as_vec3(cfg.gravity, dtype=state.position.dtype, device=state.position.device)
         b = state.linear_velocity + cfg.dt * gravity
@@ -631,9 +635,10 @@ class ImpedanceFloorContactDynamics:
             ),
             dim=-1,
         )
-        gaussian_centers = self.local_gaussian_centers.to(
-            dtype=state.position.dtype, device=state.position.device
-        ) + state.position.unsqueeze(0)
+        local = self.local_gaussian_centers.to(dtype=state.position.dtype, device=state.position.device)
+        if self.world_rotation is not None:
+            local = local @ self.world_rotation.to(dtype=local.dtype, device=local.device).T
+        gaussian_centers = local + state.position.unsqueeze(0)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,

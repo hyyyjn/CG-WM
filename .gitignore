@@ -2,6 +2,10 @@
 .cuda-11.8/
 external/
 
+# Demo experiment outputs (not tracked)
+demo_data/
+demo_output/
+
 __pycache__/
 *.pyc
 *.pyo

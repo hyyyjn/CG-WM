@@ -48,6 +48,15 @@ def write_synthetic_trajectory():
     EPISODE_ROOT.mkdir(parents=True, exist_ok=True)
     state_dir = EPISODE_ROOT / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
+    with open(EPISODE_ROOT / "episode_manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "episode_id": "synthetic",
+                "stage1_gaussian_body": {"coordinate_frame": "object_local"},
+            },
+            handle,
+            indent=2,
+        )
 
     dt = 1.0 / 60.0
     steps = 120

@@ -18,9 +18,11 @@ if str(REPO_ROOT) not in sys.path:
 from gaussian_initiailization.stage2.differentiable_collision_detection import (
     GaussianCollisionBody,
     PlaneCollider,
+    quat_wxyz_to_matrix,
     detect_gaussian_union_contacts,
     load_gaussian_collision_body_from_ply,
     make_floor_disk_query_points,
+    transform_local_points,
 )
 from gaussian_initiailization.stage2.differentiable_complementarity_free_contact_dynamics import (
     PairwiseGaussianBodyImpedanceDynamics,
@@ -50,6 +52,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--foreground_threshold", default=None, type=float)
     parser.add_argument("--opacity_threshold", default=None, type=float)
     parser.add_argument("--max_primitives", default=None, type=int)
+    parser.add_argument(
+        "--disable_collision_bbox_calibration",
+        action="store_true",
+        help="Do not scale the Stage1 collision proxy to episode_manifest.normalization bbox.",
+    )
+    parser.add_argument(
+        "--collision_bbox_margin",
+        default=0.0,
+        type=float,
+        help="Inset each side of the manifest bbox by this many metres for the collision proxy.",
+    )
+    parser.add_argument(
+        "--collision_bbox_margin_ratio",
+        default=0.0,
+        type=float,
+        help="Inset each side of the manifest bbox by this fraction of each bbox axis length.",
+    )
+    parser.add_argument(
+        "--collision_bbox_margin_z",
+        default=None,
+        type=float,
+        help="Override the bbox inset on z only; useful when floor contact is inflated but planar contact should keep the full footprint.",
+    )
+    parser.add_argument(
+        "--collision_bbox_margin_z_ratio",
+        default=None,
+        type=float,
+        help="[Deprecated] Override the bbox inset on z as a fraction of bbox height. "
+             "Prefer --floor_clip_slack instead.",
+    )
+    parser.add_argument(
+        "--disable_floor_clip",
+        action="store_true",
+        help="Do not remove below-floor Gaussians. Use only if floor_clip causes problems.",
+    )
+    parser.add_argument(
+        "--floor_clip_slack",
+        default=0.0,
+        type=float,
+        help="Tolerance in metres for floor clip. A small positive value (e.g. 0.005) "
+             "keeps Gaussians that barely touch the floor contact plane. Default 0.0.",
+    )
+    parser.add_argument(
+        "--stage1_world_translation",
+        default=None,
+        type=str,
+        help="Debug override: Stage1 object origin in world coordinates as x,y,z.",
+    )
+    parser.add_argument(
+        "--stage1_world_rotation",
+        default=None,
+        type=str,
+        help="Stage1 local-to-world 3x3 rotation matrix, row-major 9 values. Used with --stage1_world_translation.",
+    )
     parser.add_argument("--query_radius_scale", default=1.10, type=float)
     parser.add_argument("--query_rings", default=5, type=int)
     parser.add_argument("--query_angles", default=32, type=int)
@@ -62,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         default="impedance",
         choices=("impedance", "restitution", "pairwise_impedance"),
         help=(
-            "impedance: paper III-D-2 SoftPlus(-K(hJ̃b+ϕ)-D(J̃b)) form, learn (v0, g, K, D). "
+            "impedance: paper III-D-2 SoftPlus(-K(h*Jb+phi)-D*Jb) form, learn (v0, g, K, D). "
             "restitution: legacy reflection+slop, learn (v0, g, e). "
             "pairwise_impedance: use PairwiseGaussianBodyImpedanceDynamics against a static Gaussian body B."
         ),
@@ -70,11 +126,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_stiffness", default=800.0, type=float)
     parser.add_argument("--init_damping", default=30.0, type=float)
     parser.add_argument("--mass", default=1.0, type=float)
+    parser.add_argument(
+        "--initial_velocity_source",
+        default="finite_difference",
+        choices=("finite_difference", "trajectory"),
+        help="Initial linear velocity source for the rollout.",
+    )
+    parser.add_argument(
+        "--freeze_initial_velocity",
+        action="store_true",
+        help="Use the selected initial velocity as a fixed rollout input instead of learning it.",
+    )
+    parser.add_argument(
+        "--floor_tangential_damping",
+        default=0.0,
+        type=float,
+        help="Contact-gated damping applied to floor-tangent velocity in floor dynamics.",
+    )
     parser.add_argument("--pairwise_body_b_ply", default=None, type=Path)
     parser.add_argument("--pairwise_body_b_object_id", default=None, type=int)
     parser.add_argument("--pairwise_body_b_foreground_threshold", default=None, type=float)
     parser.add_argument("--pairwise_body_b_opacity_threshold", default=None, type=float)
     parser.add_argument("--pairwise_body_b_max_primitives", default=None, type=int)
+    parser.add_argument("--pairwise_body_b_world_translation", default=None, type=str)
+    parser.add_argument("--pairwise_body_b_world_rotation", default=None, type=str)
     parser.add_argument(
         "--pairwise_static_position",
         default="0,0,0",
@@ -161,6 +236,17 @@ def load_initial_angular_velocity(states: list[dict]) -> torch.Tensor:
     return torch.tensor(angular_velocity, dtype=torch.float32)
 
 
+def load_initial_linear_velocity(states: list[dict]) -> torch.Tensor:
+    linear_velocity = states[0].get("linear_velocity")
+    if linear_velocity is None:
+        qvel = states[0].get("qvel")
+        if qvel is not None and len(qvel) >= 3:
+            linear_velocity = qvel[:3]
+    if linear_velocity is None:
+        raise ValueError("Trajectory state[0] has no linear_velocity/qvel needed for --initial_velocity_source trajectory.")
+    return torch.tensor(linear_velocity, dtype=torch.float32)
+
+
 def infer_dt(times: torch.Tensor) -> float:
     diffs = times[1:] - times[:-1]
     dt = float(torch.median(diffs).item())
@@ -169,11 +255,220 @@ def infer_dt(times: torch.Tensor) -> float:
     return dt
 
 
+def parse_float_sequence(value: str, *, expected: int, label: str) -> tuple[float, ...]:
+    raw = str(value).replace(",", " ").split()
+    if len(raw) != expected:
+        raise ValueError(f"{label} expects {expected} values, got {len(raw)}: {value}")
+    return tuple(float(part) for part in raw)
+
+
+def parse_optional_vec3(value: str | None, *, label: str) -> tuple[float, float, float] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = parse_float_sequence(value, expected=3, label=label)
+    return (parsed[0], parsed[1], parsed[2])
+
+
+def parse_optional_matrix3(value: str | None, *, label: str) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = parse_float_sequence(value, expected=9, label=label)
+    return (parsed[0:3], parsed[3:6], parsed[6:9])
+
+
 def parse_vec3(value: str) -> tuple[float, float, float]:
     parts = [part.strip() for part in value.split(",")]
     if len(parts) != 3:
         raise ValueError(f"Expected three comma-separated values, got: {value}")
     return tuple(float(part) for part in parts)
+
+
+def matrix3_to_tuple(matrix: np.ndarray) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    array = np.asarray(matrix, dtype=np.float32).reshape(3, 3)
+    return tuple(tuple(float(array[row, col]) for col in range(3)) for row in range(3))
+
+
+def quaternion_wxyz_to_matrix_tuple(values) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    quat = torch.tensor(values, dtype=torch.float32)
+    matrix = quat_wxyz_to_matrix(quat).detach().cpu().numpy()
+    return matrix3_to_tuple(matrix)
+
+
+def normalize_pose_contract(payload: dict, *, source: str) -> dict:
+    translation = (
+        payload.get("translation")
+        or payload.get("world_translation")
+        or payload.get("position")
+    )
+    if translation is None:
+        raise ValueError(f"{source} must define translation/world_translation/position.")
+    translation_tuple = parse_optional_vec3(",".join(str(v) for v in translation), label=f"{source}.translation")
+
+    rotation = payload.get("rotation_matrix") or payload.get("world_rotation")
+    if rotation is not None:
+        rotation_array = np.asarray(rotation, dtype=np.float32)
+        rotation_tuple = matrix3_to_tuple(rotation_array)
+    elif payload.get("quaternion_wxyz") is not None:
+        rotation_tuple = quaternion_wxyz_to_matrix_tuple(payload["quaternion_wxyz"])
+    else:
+        rotation_tuple = matrix3_to_tuple(np.eye(3, dtype=np.float32))
+
+    return {
+        "coordinate_frame": "world",
+        "world_translation": translation_tuple,
+        "world_rotation": rotation_tuple,
+        "source": source,
+    }
+
+
+def load_stage1_coordinate_contract(episode_root: Path, *, translation_override, rotation_override) -> dict:
+    if translation_override is not None:
+        return {
+            "coordinate_frame": "world",
+            "world_translation": translation_override,
+            "world_rotation": rotation_override,
+            "source": "cli_override",
+        }
+    if rotation_override is not None:
+        raise ValueError("--stage1_world_rotation requires --stage1_world_translation.")
+
+    manifest_path = episode_root / "episode_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing episode manifest: {manifest_path}")
+    manifest = read_json(manifest_path)
+
+    body_contract = manifest.get("stage1_gaussian_body") or {}
+    coordinate_frame = (
+        body_contract.get("coordinate_frame")
+        or manifest.get("stage1_coordinate_frame")
+        or manifest.get("stage1_points_coordinate_frame")
+    )
+    world_pose = (
+        body_contract.get("world_pose")
+        or manifest.get("stage1_object_pose")
+        or manifest.get("stage1_world_pose")
+    )
+    if world_pose is not None:
+        return normalize_pose_contract(world_pose, source="episode_manifest.stage1_gaussian_body.world_pose")
+    if coordinate_frame == "object_local":
+        return {
+            "coordinate_frame": "object_local",
+            "world_translation": None,
+            "world_rotation": None,
+            "source": "episode_manifest.stage1_gaussian_body.coordinate_frame",
+        }
+    if coordinate_frame == "world":
+        raise ValueError(
+            "episode_manifest declares Stage1 Gaussian coordinates as world-frame but does not provide "
+            "stage1_gaussian_body.world_pose."
+        )
+
+    raise ValueError(
+        "Stage1 Gaussian coordinate frame is not declared. Add "
+        "episode_manifest.stage1_gaussian_body={\"coordinate_frame\":\"object_local\"} for local PLYs, "
+        "or {\"coordinate_frame\":\"world\", \"world_pose\":{...}} for world-frame Stage1 PLYs."
+    )
+
+
+def load_manifest_collision_bbox(episode_root: Path) -> dict | None:
+    manifest_path = episode_root / "episode_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = read_json(manifest_path)
+    normalization = manifest.get("normalization") or {}
+    bbox_min = normalization.get("bbox_min")
+    bbox_max = normalization.get("bbox_max")
+    if bbox_min is None or bbox_max is None:
+        return None
+    scale = float(normalization.get("scale", 1.0))
+    bbox_min = np.asarray(bbox_min, dtype=np.float32) * scale
+    bbox_max = np.asarray(bbox_max, dtype=np.float32) * scale
+    if bbox_min.shape != (3,) or bbox_max.shape != (3,):
+        raise ValueError("episode_manifest.normalization bbox_min/bbox_max must be length-3 arrays.")
+    if np.any(bbox_max <= bbox_min):
+        raise ValueError("episode_manifest.normalization bbox_max must be greater than bbox_min on every axis.")
+    return {
+        "bbox_min": bbox_min,
+        "bbox_max": bbox_max,
+        "source": "episode_manifest.normalization",
+    }
+
+
+def floor_clip_collision_proxy(
+    local_centers: torch.Tensor,
+    radii: torch.Tensor,
+    floor_z_local: float,
+    slack: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Remove Gaussians whose bottom (center_z - radius) is below floor_z_local.
+
+    This replaces collision_bbox_margin_z_ratio: instead of compressing the
+    whole proxy vertically (which distorts top/side contact geometry too), we
+    physically-motivated remove Gaussians that bleed below the floor contact
+    plane.  Works for any object shape without per-object tuning.
+
+    Args:
+        local_centers: (N, 3) Gaussian centers in object-local frame.
+        radii:         (N,) Gaussian radii.
+        floor_z_local: z-coordinate of the floor contact plane in local frame.
+                       For an object whose asset JSON has bbox_min[2] = -h,
+                       pass floor_z_local = -h.
+        slack:         Extra tolerance (metres).  A small positive value (e.g.
+                       0.005) keeps Gaussians that barely touch the floor.
+    """
+    threshold = floor_z_local - slack
+    above = (local_centers[:, 2] - radii) >= threshold
+    n_removed = int((~above).sum().item())
+    metadata = {
+        "floor_clip_enabled": True,
+        "floor_z_local": float(floor_z_local),
+        "slack": float(slack),
+        "n_removed": n_removed,
+        "n_kept": int(above.sum().item()),
+    }
+    if n_removed > 0:
+        print(
+            f"[INFO] floor_clip: removed {n_removed} below-floor Gaussians "
+            f"(floor_z_local={floor_z_local:.4f}, slack={slack:.4f})"
+        )
+    return local_centers[above], radii[above], metadata
+
+
+def calibrate_collision_proxy_to_bbox(
+    local_centers: torch.Tensor,
+    radii: torch.Tensor,
+    collision_bbox: dict,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    target_min = torch.as_tensor(collision_bbox["bbox_min"], dtype=local_centers.dtype, device=local_centers.device)
+    target_max = torch.as_tensor(collision_bbox["bbox_max"], dtype=local_centers.dtype, device=local_centers.device)
+    margin_xyz = torch.as_tensor(collision_bbox.get("margin_xyz", [0.0, 0.0, 0.0]), dtype=local_centers.dtype, device=local_centers.device)
+    if torch.any(margin_xyz > 0.0):
+        target_min = target_min + margin_xyz
+        target_max = target_max - margin_xyz
+        if torch.any(target_max <= target_min):
+            raise ValueError(f"collision bbox margin {margin_xyz.detach().cpu().tolist()} collapses the manifest bbox.")
+    current_min = torch.min(local_centers - radii.unsqueeze(-1), dim=0).values
+    current_max = torch.max(local_centers + radii.unsqueeze(-1), dim=0).values
+    current_center = (current_min + current_max) * 0.5
+    target_center = (target_min + target_max) * 0.5
+    current_extent = torch.clamp(current_max - current_min, min=1e-6)
+    target_extent = target_max - target_min
+    axis_scale = target_extent / current_extent
+    radius_scale = torch.min(axis_scale)
+    calibrated_centers = (local_centers - current_center.unsqueeze(0)) * axis_scale.unsqueeze(0) + target_center.unsqueeze(0)
+    calibrated_radii = torch.clamp(radii * radius_scale, min=1e-6)
+    metadata = {
+        "enabled": True,
+        "source": collision_bbox["source"],
+        "current_bbox_min": current_min.detach().cpu().tolist(),
+        "current_bbox_max": current_max.detach().cpu().tolist(),
+        "target_bbox_min": target_min.detach().cpu().tolist(),
+        "target_bbox_max": target_max.detach().cpu().tolist(),
+        "margin_xyz": margin_xyz.detach().cpu().tolist(),
+        "axis_scale": axis_scale.detach().cpu().tolist(),
+        "radius_scale": float(radius_scale.detach().cpu().item()),
+    }
+    return calibrated_centers, calibrated_radii, metadata
 
 
 def normalize_quaternion(quaternion_wxyz: torch.Tensor) -> torch.Tensor:
@@ -209,21 +504,70 @@ def load_stage1_body_arrays(
     foreground_threshold: float | None,
     opacity_threshold: float | None,
     max_primitives: int | None,
+    coordinate_contract: dict,
+    collision_bbox: dict | None,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    world_translation = coordinate_contract["world_translation"]
+    world_rotation = coordinate_contract["world_rotation"]
     body = load_gaussian_collision_body_from_ply(
         path,
         radius_scale=float(args.radius_scale),
-        recenter=True,
+        recenter=False,
         object_id=object_id,
         foreground_threshold=foreground_threshold,
         opacity_threshold=opacity_threshold,
         max_primitives=max_primitives,
         use_centers_as_queries=True,
+        world_translation=world_translation,
+        world_rotation=world_rotation,
         dtype=torch.float32,
         device=device,
     )
-    return body.local_centers, body.radii
+    local_centers = body.local_centers
+    radii = body.radii
+
+    # ── Floor clip (replaces collision_bbox_margin_z_ratio) ──────────────────
+    # Remove Gaussians whose bottom face bleeds below the object's physical
+    # floor contact plane.  The floor contact z in local frame is bbox_min[2].
+    # This is object-shape-agnostic and requires no per-object tuning.
+    floor_clip_metadata = {"floor_clip_enabled": False}
+    if collision_bbox is not None and not getattr(args, "disable_floor_clip", False):
+        floor_z_local = float(collision_bbox["bbox_min"][2])
+        slack = float(getattr(args, "floor_clip_slack", 0.0))
+        local_centers, radii, floor_clip_metadata = floor_clip_collision_proxy(
+            local_centers, radii, floor_z_local, slack=slack
+        )
+        if local_centers.shape[0] == 0:
+            raise RuntimeError(
+                "floor_clip removed ALL Gaussians. "
+                "Try --floor_clip_slack 0.02 or --disable_floor_clip."
+            )
+
+    collision_bbox_metadata = {"enabled": False}
+    if collision_bbox is not None:
+        local_centers, radii, collision_bbox_metadata = calibrate_collision_proxy_to_bbox(
+            local_centers,
+            radii,
+            collision_bbox,
+        )
+    coordinate_mode = "world_pose" if world_translation is not None else "object_local"
+    metadata = {
+        "coordinate_mode": coordinate_mode,
+        "world_translation": None if world_translation is None else list(world_translation),
+        "world_rotation": None if world_rotation is None else [list(row) for row in world_rotation],
+        "coordinate_contract_source": coordinate_contract["source"],
+        "recenter": False,
+        "floor_clip": floor_clip_metadata,
+        "collision_bbox_calibration": collision_bbox_metadata,
+    }
+    return local_centers, radii, metadata
+
+
+def oriented_centers(local_centers: torch.Tensor, position: torch.Tensor, quaternion_wxyz: torch.Tensor | None) -> torch.Tensor:
+    if quaternion_wxyz is None:
+        return local_centers + position.unsqueeze(0)
+    return transform_local_points(local_centers, position, quaternion_wxyz=quaternion_wxyz)
 
 
 def _smooth_min_signed(values: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -238,6 +582,7 @@ def simulate(
     local_centers: torch.Tensor,
     radii: torch.Tensor,
     floor_query_offsets_xy: torch.Tensor,
+    orientation_sequence: torch.Tensor | None,
     *,
     steps: int,
     dt: float,
@@ -245,6 +590,7 @@ def simulate(
     smooth_max_temperature: float,
     inside_penalty: float = 0.02,
     inside_sharpness: float = 50.0,
+    floor_tangential_damping: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Legacy reflection+slop dynamics (kept for --dynamics restitution)."""
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
@@ -260,7 +606,7 @@ def simulate(
         )
     )
 
-    for _ in range(steps - 1):
+    for step_idx in range(steps - 1):
         predicted_velocity = velocity + gravity * dt
         predicted_position = position + predicted_velocity * dt
 
@@ -271,7 +617,8 @@ def simulate(
             ),
             dim=-1,
         )
-        gaussian_centers = local_centers + predicted_position.unsqueeze(0)
+        orientation = None if orientation_sequence is None else orientation_sequence[min(step_idx + 1, orientation_sequence.shape[0] - 1)]
+        gaussian_centers = oriented_centers(local_centers, predicted_position, orientation)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,
@@ -284,10 +631,19 @@ def simulate(
         )
         penetration_depth = smooth_weighted_max(contacts.penetrations, smooth_max_temperature)
         contact_gate = smooth_weighted_max(contacts.contact_weights, smooth_max_temperature)
-        normal = contacts.collider_normal.to(dtype=predicted_position.dtype, device=predicted_position.device)
+        # Floor contact should push along the plane normal.  The Gaussian SDF
+        # surface normal can be tilted on round objects and would inject
+        # horizontal velocity during a floor bounce.
+        normal = collider.normal.to(dtype=predicted_position.dtype, device=predicted_position.device)
         normal_velocity = torch.sum(predicted_velocity * normal)
         closing_speed = torch.nn.functional.softplus(-normal_velocity / contact_softness) * contact_softness
         velocity = predicted_velocity + contact_gate * (1.0 + restitution) * closing_speed * normal
+        if floor_tangential_damping > 0.0:
+            tangent_velocity = velocity - torch.sum(velocity * normal) * normal
+            damping_fraction = 1.0 - torch.exp(
+                torch.as_tensor(-float(floor_tangential_damping) * dt, dtype=velocity.dtype, device=velocity.device)
+            )
+            velocity = velocity - contact_gate * damping_fraction * tangent_velocity
         position = predicted_position + contact_gate * (penetration_depth + 1e-4) * normal
 
         positions.append(position)
@@ -309,6 +665,7 @@ def simulate_impedance(
     local_centers: torch.Tensor,
     radii: torch.Tensor,
     floor_query_offsets_xy: torch.Tensor,
+    orientation_sequence: torch.Tensor | None,
     *,
     steps: int,
     dt: float,
@@ -317,6 +674,7 @@ def simulate_impedance(
     smooth_min_temperature: float,
     inside_penalty: float,
     inside_sharpness: float,
+    floor_tangential_damping: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paper III-D-2 impedance contact dynamics rolled out over ``steps`` frames.
 
@@ -339,7 +697,7 @@ def simulate_impedance(
         )
     )
 
-    for _ in range(steps - 1):
+    for step_idx in range(steps - 1):
         b = velocity + dt * gravity
 
         floor_points = torch.cat(
@@ -353,7 +711,8 @@ def simulate_impedance(
             ),
             dim=-1,
         )
-        gaussian_centers = local_centers + position.unsqueeze(0)
+        orientation = None if orientation_sequence is None else orientation_sequence[min(step_idx, orientation_sequence.shape[0] - 1)]
+        gaussian_centers = oriented_centers(local_centers, position, orientation)
         contacts = detect_gaussian_union_contacts(
             floor_points,
             gaussian_centers,
@@ -365,11 +724,21 @@ def simulate_impedance(
             inside_sharpness=inside_sharpness,
         )
         phi_agg = _smooth_min_signed(contacts.signed_distances, smooth_min_temperature)
-        normal = contacts.collider_normal.to(dtype=position.dtype, device=position.device)
+        # Floor contact should push along the plane normal.  The Gaussian SDF
+        # normal is still useful for object/object contact, but for a static
+        # floor it leaks vertical impulse into XY motion on round proxies.
+        normal = collider.normal.to(dtype=position.dtype, device=position.device)
         Jb = torch.sum(b * normal)
         lambda_t = F.softplus(-K * (dt * Jb + phi_agg) - D * Jb)
 
         velocity = b + (dt / mass) * lambda_t * normal
+        if floor_tangential_damping > 0.0:
+            contact_gate = torch.sigmoid(-phi_agg / contact_softness)
+            tangent_velocity = velocity - torch.sum(velocity * normal) * normal
+            damping_fraction = 1.0 - torch.exp(
+                torch.as_tensor(-float(floor_tangential_damping) * dt, dtype=velocity.dtype, device=velocity.device)
+            )
+            velocity = velocity - contact_gate * damping_fraction * tangent_velocity
         position = position + dt * velocity
 
         positions.append(position)
@@ -459,6 +828,7 @@ def simulate_pairwise_impedance(
 def fit_stage2(
     target_positions: torch.Tensor,
     target_quaternions: torch.Tensor | None,
+    initial_linear_velocity_hint: torch.Tensor,
     initial_angular_velocity_hint: torch.Tensor,
     times: torch.Tensor,
     local_centers: torch.Tensor,
@@ -467,11 +837,14 @@ def fit_stage2(
     args: argparse.Namespace,
     *,
     pairwise_body_b: tuple[torch.Tensor, torch.Tensor] | None = None,
+    stage1_metadata: dict | None = None,
+    pairwise_body_b_metadata: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, dict]:
     device = torch.device(args.device)
     target_positions = target_positions.to(device=device)
     if target_quaternions is not None:
         target_quaternions = normalize_quaternion(target_quaternions.to(device=device))
+    initial_linear_velocity_hint = initial_linear_velocity_hint.to(device=device)
     initial_angular_velocity_hint = initial_angular_velocity_hint.to(device=device)
     times = times.to(device=device)
     local_centers = local_centers.to(device=device)
@@ -489,14 +862,24 @@ def fit_stage2(
         else torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device)
     )
     finite_velocity = (target_positions[1] - target_positions[0]) / dt
-    initial_velocity = torch.nn.Parameter(finite_velocity.detach().clone())
+    initial_velocity_value = (
+        initial_linear_velocity_hint
+        if str(args.initial_velocity_source) == "trajectory"
+        else finite_velocity
+    )
+    if bool(args.freeze_initial_velocity):
+        initial_velocity = initial_velocity_value.detach().clone()
+    else:
+        initial_velocity = torch.nn.Parameter(initial_velocity_value.detach().clone())
     initial_angular_velocity = torch.nn.Parameter(initial_angular_velocity_hint.detach().clone())
     gravity_z = torch.nn.Parameter(torch.tensor(-9.81, dtype=torch.float32, device=device))
 
     if use_pairwise:
         stiffness = torch.nn.Parameter(torch.tensor(float(args.init_stiffness), dtype=torch.float32, device=device))
         damping = torch.nn.Parameter(torch.tensor(float(args.init_damping), dtype=torch.float32, device=device))
-        learnable = [initial_velocity, stiffness, damping]
+        learnable = [stiffness, damping]
+        if not bool(args.freeze_initial_velocity):
+            learnable.insert(0, initial_velocity)
         if bool(args.fit_initial_angular_velocity):
             learnable.append(initial_angular_velocity)
         log_K = None
@@ -512,7 +895,9 @@ def fit_stage2(
         log_D = torch.nn.Parameter(
             torch.log(torch.tensor(float(args.init_damping), dtype=torch.float32, device=device))
         )
-        learnable = [initial_velocity, gravity_z, log_K, log_D]
+        learnable = [gravity_z, log_K, log_D]
+        if not bool(args.freeze_initial_velocity):
+            learnable.insert(0, initial_velocity)
         raw_restitution = None
     else:
         raw_restitution = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=device))
@@ -520,7 +905,9 @@ def fit_stage2(
         log_D = None
         stiffness = None
         damping = None
-        learnable = [initial_velocity, gravity_z, raw_restitution]
+        learnable = [gravity_z, raw_restitution]
+        if not bool(args.freeze_initial_velocity):
+            learnable.insert(0, initial_velocity)
 
     optimizer = torch.optim.Adam(learnable, lr=float(args.lr))
 
@@ -575,6 +962,7 @@ def fit_stage2(
                 local_centers,
                 radii,
                 floor_query_offsets_xy,
+                target_quaternions.detach() if target_quaternions is not None else None,
                 steps=target_positions.shape[0],
                 dt=dt,
                 mass=float(args.mass),
@@ -582,6 +970,7 @@ def fit_stage2(
                 smooth_min_temperature=float(args.smooth_max_temperature),
                 inside_penalty=float(args.inside_penalty),
                 inside_sharpness=float(args.inside_sharpness),
+                floor_tangential_damping=float(args.floor_tangential_damping),
             )
             return predicted_positions, None, gates
         restitution = torch.sigmoid(raw_restitution if grad else raw_restitution.detach())
@@ -593,12 +982,14 @@ def fit_stage2(
             local_centers,
             radii,
             floor_query_offsets_xy,
+            target_quaternions.detach() if target_quaternions is not None else None,
             steps=target_positions.shape[0],
             dt=dt,
             contact_softness=float(args.contact_softness),
             smooth_max_temperature=float(args.smooth_max_temperature),
             inside_penalty=float(args.inside_penalty),
             inside_sharpness=float(args.inside_sharpness),
+            floor_tangential_damping=float(args.floor_tangential_damping),
         )
         return predicted_positions, None, gates
 
@@ -646,10 +1037,16 @@ def fit_stage2(
         "final_position_loss": final_loss,
         "position_rmse": float(rmse),
         "learned_initial_velocity": initial_velocity.detach().cpu().tolist(),
+        "initial_velocity_source": str(args.initial_velocity_source),
+        "freeze_initial_velocity": bool(args.freeze_initial_velocity),
         "learned_gravity_z": float(gravity_z.detach().cpu().item()),
+        "floor_tangential_damping": float(args.floor_tangential_damping),
         "first_contact_frame": first_contact_frame,
         "max_contact_gate": float(gates.detach().cpu().max().item()) if gates.numel() else 0.0,
+        "stage1_coordinate": stage1_metadata or {},
     }
+    if pairwise_body_b_metadata is not None:
+        diagnostics["pairwise_body_b_coordinate"] = pairwise_body_b_metadata
     if use_pairwise:
         diagnostics["learned_stiffness"] = float(F.softplus(stiffness.detach()).cpu().item())
         diagnostics["learned_damping"] = float(F.softplus(damping.detach()).cpu().item())
@@ -741,27 +1138,68 @@ def main() -> None:
 
     target_positions_cpu, times_cpu, states = load_target_positions(episode_root, int(args.max_frames))
     target_quaternions_cpu = load_target_quaternions(states)
+    initial_linear_velocity_hint_cpu = load_initial_linear_velocity(states)
     initial_angular_velocity_hint_cpu = load_initial_angular_velocity(states)
-    local_centers, radii = load_stage1_body_arrays(
+    stage1_world_translation = parse_optional_vec3(args.stage1_world_translation, label="--stage1_world_translation")
+    stage1_world_rotation = parse_optional_matrix3(args.stage1_world_rotation, label="--stage1_world_rotation")
+    stage1_coordinate_contract = load_stage1_coordinate_contract(
+        episode_root,
+        translation_override=stage1_world_translation,
+        rotation_override=stage1_world_rotation,
+    )
+    collision_bbox = None if bool(args.disable_collision_bbox_calibration) else load_manifest_collision_bbox(episode_root)
+    if collision_bbox is not None:
+        bbox_extent = np.asarray(collision_bbox["bbox_max"], dtype=np.float32) - np.asarray(collision_bbox["bbox_min"], dtype=np.float32)
+        margin = float(args.collision_bbox_margin)
+        margin_ratio = float(args.collision_bbox_margin_ratio)
+        margin_xyz = (np.full(3, margin, dtype=np.float32) + bbox_extent * margin_ratio).astype(np.float32)
+        margin_z = margin if args.collision_bbox_margin_z is None else float(args.collision_bbox_margin_z)
+        if args.collision_bbox_margin_z_ratio is not None:
+            margin_z = float(args.collision_bbox_margin_z_ratio) * float(bbox_extent[2])
+        margin_xyz[2] = float(margin_z)
+        collision_bbox["margin_xyz"] = margin_xyz.tolist()
+    local_centers, radii, stage1_metadata = load_stage1_body_arrays(
         stage1_ply,
         args,
         object_id=args.object_id,
         foreground_threshold=args.foreground_threshold,
         opacity_threshold=args.opacity_threshold,
         max_primitives=args.max_primitives,
+        coordinate_contract=stage1_coordinate_contract,
+        collision_bbox=collision_bbox,
         device=torch.device(args.device),
     )
     pairwise_body_b = None
+    pairwise_body_b_metadata = None
     if str(args.dynamics) == "pairwise_impedance" and args.pairwise_body_b_ply is not None:
-        pairwise_body_b = load_stage1_body_arrays(
+        pairwise_body_b_translation = parse_optional_vec3(
+            args.pairwise_body_b_world_translation,
+            label="--pairwise_body_b_world_translation",
+        )
+        pairwise_body_b_rotation = parse_optional_matrix3(
+            args.pairwise_body_b_world_rotation,
+            label="--pairwise_body_b_world_rotation",
+        )
+        if pairwise_body_b_translation is None and pairwise_body_b_rotation is not None:
+            raise ValueError("--pairwise_body_b_world_rotation requires --pairwise_body_b_world_translation.")
+        pairwise_body_b_contract = {
+            "coordinate_frame": "world" if pairwise_body_b_translation is not None else "object_local",
+            "world_translation": pairwise_body_b_translation,
+            "world_rotation": pairwise_body_b_rotation,
+            "source": "cli_override" if pairwise_body_b_translation is not None else "implicit_pairwise_object_local",
+        }
+        local_centers_b, radii_b, pairwise_body_b_metadata = load_stage1_body_arrays(
             args.pairwise_body_b_ply.resolve(),
             args,
             object_id=args.pairwise_body_b_object_id,
             foreground_threshold=args.pairwise_body_b_foreground_threshold,
             opacity_threshold=args.pairwise_body_b_opacity_threshold,
             max_primitives=args.pairwise_body_b_max_primitives,
+            coordinate_contract=pairwise_body_b_contract,
+            collision_bbox=None,
             device=torch.device(args.device),
         )
+        pairwise_body_b = (local_centers_b, radii_b)
     query_radius = estimate_radius(local_centers.detach().cpu(), radii.detach().cpu()) * float(args.query_radius_scale)
     floor_query_offsets_xy = make_floor_disk_query_points(
         query_radius,
@@ -773,6 +1211,7 @@ def main() -> None:
     predicted_positions, predicted_quaternions, contact_gates, diagnostics = fit_stage2(
         target_positions_cpu,
         target_quaternions_cpu,
+        initial_linear_velocity_hint_cpu,
         initial_angular_velocity_hint_cpu,
         times_cpu,
         local_centers,
@@ -780,6 +1219,8 @@ def main() -> None:
         floor_query_offsets_xy,
         args,
         pairwise_body_b=pairwise_body_b,
+        stage1_metadata=stage1_metadata,
+        pairwise_body_b_metadata=pairwise_body_b_metadata,
     )
 
     trajectory_states = []

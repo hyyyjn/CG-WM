@@ -55,10 +55,16 @@ def parse_args():
     )
     parser.add_argument("--floor_rgba", default="0.92 0.92 0.92 1")
     parser.add_argument("--skybox_rgb", default="255,255,255")
-    parser.add_argument("--sphere_solref", default="-1000 0", type=str)
+    parser.add_argument("--sphere_solref", default="0.02 0.2", type=str)
     parser.add_argument("--sphere_friction", default="0.02 0.001 0.0001", type=str)
     parser.add_argument("--box_friction", default="0.35 0.01 0.001", type=str)
     parser.add_argument("--freejoint_damping", default=0.05, type=float)
+    parser.add_argument(
+        "--max_floor_penetration",
+        default=0.03,
+        type=float,
+        help="Abort sphere rollouts if the sphere bottom goes this far below z=0.",
+    )
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args()
 
@@ -147,7 +153,7 @@ def build_mjcf(
         geom_name = "box_geom"
         body_name = "box"
         face_colors = parse_face_colors(box_face_colors)
-        face_pad = max(min(hx, hy, hz) * 0.04, 0.01)
+        face_pad = max(min(hx, hy, hz) * 0.02, 0.0015)
         face_geoms = [
             ("face_px", f"{hx + face_pad * 0.5} 0 0", f"{face_pad * 0.5} {hy} {hz}", face_colors[0]),
             ("face_nx", f"{-hx - face_pad * 0.5} 0 0", f"{face_pad * 0.5} {hy} {hz}", face_colors[1]),
@@ -310,6 +316,7 @@ def rollout_episode(
         "angular_velocity": initial_angvel.tolist(),
     }
     write_json(episode_root / "episode_manifest.json", manifest)
+    return states
 
 
 def main():
@@ -389,7 +396,7 @@ def main():
         )
         init_angvel = rng.uniform(-spin_speed, spin_speed, size=3).astype(np.float64)
 
-        rollout_episode(
+        states = rollout_episode(
             model,
             data,
             renderer,
@@ -403,6 +410,14 @@ def main():
             initial_angvel=init_angvel,
             object_geom_ids=object_geom_ids,
         )
+        if physics_shape == "sphere":
+            radius = float(max(half_extents))
+            min_bottom_z = min(float(state["position"][2]) - radius for state in states)
+            if min_bottom_z < -float(args.max_floor_penetration):
+                raise RuntimeError(
+                    f"Sphere rollout penetrated the floor by {-min_bottom_z:.4f} m "
+                    f"in {episode_root}. Check --sphere_solref/--timestep."
+                )
 
     print(
         json.dumps(

@@ -404,6 +404,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = appearance_loss_tensor
             if depth_loss_tensor is not None:
                 loss = loss + depth_loss_tensor
+            object_mask_loss_tensor, object_mask_loss_value = compute_object_mask_loss(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                SPARSE_ADAM_AVAILABLE,
+                opt.object_mask_weight,
+                bce_weight=opt.object_mask_bce_weight,
+                shared_screenspace_points=render_pkg["viewspace_points"],
+            )
+            if object_mask_loss_tensor is not None:
+                loss = loss + object_mask_loss_tensor
             loss.backward()
 
             densify_render_pkg = render_pkg
@@ -426,11 +437,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
-                    "Loss": f"{ema_loss_for_log:.{7}f}",
-                    "Geom": f"{ema_geometry_loss_for_log:.{7}f}",
-                    "App": f"{ema_appearance_loss_for_log:.{7}f}",
-                    "Obj": f"{ema_object_mask_loss_for_log:.{7}f}",
-                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"
+                    "Loss": f"{ema_loss_for_log:.7f}",
+                    "Geom": f"{ema_geometry_loss_for_log:.7f}",
+                    "App": f"{ema_appearance_loss_for_log:.7f}",
+                    "Obj": f"{ema_object_mask_loss_for_log:.7f}",
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.7f}"
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:

@@ -76,6 +76,10 @@ def build_episode_manifest(object_asset, scenario_name, split_name, episode_inde
         "mesh_path": object_asset["mesh_path"],
         "stage1_dataset_path": object_asset["stage1_dataset_path"],
         "stage1_points_ply": object_asset["stage1_points_ply"],
+        "stage1_gaussian_body": object_asset.get(
+            "stage1_gaussian_body",
+            {"coordinate_frame": "object_local"},
+        ),
         "frames_per_episode": int(args.frames_per_episode),
         "fps": int(args.fps),
         "camera_count": int(args.camera_count),
@@ -122,6 +126,10 @@ def main():
                 "mesh_path": asset["mesh_path"],
                 "stage1_dataset_path": asset["stage1_dataset_path"],
                 "stage1_points_ply": asset["stage1_points_ply"],
+                "stage1_gaussian_body": asset.get(
+                    "stage1_gaussian_body",
+                    {"coordinate_frame": "object_local"},
+                ),
                 "stage1_summary_path": asset.get("stage1_summary_path", ""),
                 "source_asset_manifest_path": asset["asset_manifest_path"],
                 "normalization": asset.get("normalization", {}),

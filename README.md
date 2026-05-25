@@ -154,8 +154,8 @@ conda run -n gaussian_splatting python gaussian_initiailization/train.py \
   --sam_features sam_features_sam2 \
   --geometry_feature_dim 9 \
   --sam_feature_weight 0.1 \
-  --object_mask_weight 0.1 \
-  --object_mask_bce_weight 1.0 \
+  --object_mask_weight 1.0 \
+  --object_mask_bce_weight 2.0 \
   --init_mode visual_hull \
   --init_ply_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/visual_hull/visual_hull.ply \
   --stage1_preset contactwm \
@@ -501,6 +501,73 @@ resolution sweep을 돌려 후보를 고를 수 있습니다.
 - real-world video 입력 지원 강화
 - multi-instance object-aware Gaussian 학습
 - ContactGaussian-WM paper 전체 pipeline과 실험표 정렬
+
+## Demo 실행 방법
+
+`run_demo.ps1`로 Stage 1 학습부터 side-by-side 비교 GIF 생성까지 한 번에 실행할 수 있다.
+
+### 구체(sphere) 튀기 데모 (기본값)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1
+```
+
+기본값이 `sphere_demo`로 설정되어 있다. 구체가 바닥에서 여러 번 튀는 상황을 MuJoCo GT와 Stage 2 예측이 얼마나 일치하는지 비교한다.
+
+### 박스(box) 데모
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 `
+    -SceneName box_demo -ObjectType box -ForegroundThreshold 0.55
+```
+
+### 빠른 테스트 (Stage 1 낮은 iter, 결과 품질 낮음)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 `
+    -Stage1Iters 2000 -Stage2FitIters 100
+```
+
+### Stage 1 재사용 (이미 학습된 모델이 있을 때)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -SkipStage1
+```
+
+### 결과물 위치
+
+```text
+demo_output\sphere_demo_stage2_fit\
+  comparison_gt_vs_3dgs.gif   ← 메인 결과 (GT vs 3DGS side-by-side)
+  gt_episode.gif              ← MuJoCo ground truth 영상
+  stage2_fit_follow_view.gif  ← 위치 trajectory 비교
+  fit_summary.json            ← 학습된 물리 파라미터 (restitution 등)
+```
+
+### Prerequisites
+
+**환경 설치 (처음 한 번만):**
+
+```powershell
+# 1. conda 환경 생성
+conda env create -f environment.yml
+
+# 2. 환경 이름 확인 후 활성화 (기본: cg-wm)
+conda activate cg-wm
+```
+
+환경 이름이 다르면 `-CondaEnv` 파라미터로 지정:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 -CondaEnv cg-wm
+```
+
+**요구 사항:**
+- Windows, PowerShell 5.1 이상
+- NVIDIA GPU (VRAM 8GB 이상 권장, CUDA 11.8)
+- Visual Studio Build Tools (submodule CUDA 빌드용)
+
+---
 
 ## Git / Output Policy
 

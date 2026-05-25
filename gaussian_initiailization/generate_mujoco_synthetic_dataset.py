@@ -60,6 +60,19 @@ def parse_args():
         action="store_true",
         help="Apply a small random yaw rotation to the object before settling.",
     )
+    parser.add_argument(
+        "--box_face_colors",
+        default=(
+            "0.96 0.28 0.22;"
+            "0.22 0.72 0.32;"
+            "0.22 0.52 0.96;"
+            "0.98 0.82 0.20;"
+            "0.68 0.34 0.92;"
+            "0.20 0.84 0.88"
+        ),
+        type=str,
+        help="Six RGB triplets for box face colors, separated by ';'.",
+    )
     return parser.parse_args()
 
 
@@ -69,13 +82,57 @@ def resolve_mujoco_gl(mode: str) -> str:
     return mode
 
 
-def object_geom_xml(object_type: str) -> tuple[str, float]:
+def parse_face_colors(face_colors_arg: str) -> list[list[float]]:
+    colors = []
+    for raw_color in str(face_colors_arg).split(";"):
+        raw_color = raw_color.strip()
+        if not raw_color:
+            continue
+        values = [float(value) for value in raw_color.split()]
+        if len(values) != 3:
+            raise ValueError(
+                f"--box_face_colors expects RGB triplets separated by ';', got: {face_colors_arg}"
+            )
+        colors.append(values)
+    if len(colors) < 6:
+        raise ValueError("--box_face_colors must provide at least 6 RGB triplets.")
+    return colors[:6]
+
+
+def colored_box_geom_xml(half_extent: float, face_colors_arg: str) -> str:
+    h = float(half_extent)
+    face_colors = parse_face_colors(face_colors_arg)
+    face_pad = max(h * 0.02, 0.0015)
+    face_geoms = [
+        ("target_face_px", f"{h + face_pad * 0.5} 0 0", f"{face_pad * 0.5} {h} {h}", face_colors[0]),
+        ("target_face_nx", f"{-h - face_pad * 0.5} 0 0", f"{face_pad * 0.5} {h} {h}", face_colors[1]),
+        ("target_face_py", f"0 {h + face_pad * 0.5} 0", f"{h} {face_pad * 0.5} {h}", face_colors[2]),
+        ("target_face_ny", f"0 {-h - face_pad * 0.5} 0", f"{h} {face_pad * 0.5} {h}", face_colors[3]),
+        ("target_face_pz", f"0 0 {h + face_pad * 0.5}", f"{h} {h} {face_pad * 0.5}", face_colors[4]),
+        ("target_face_nz", f"0 0 {-h - face_pad * 0.5}", f"{h} {h} {face_pad * 0.5}", face_colors[5]),
+    ]
+    face_geom_xml = "\n          ".join(
+        (
+            f'<geom name="{name}" type="box" pos="{pos}" size="{size}" '
+            f'rgba="{color[0]} {color[1]} {color[2]} 1" '
+            'contype="0" conaffinity="0" density="0"/>'
+        )
+        for name, pos, size, color in face_geoms
+    )
+    return f"""
+          <geom name="target_geom" type="box" size="{h} {h} {h}" rgba="0.14 0.14 0.16 1"/>
+          {face_geom_xml}
+    """.strip()
+
+
+def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]:
     if object_type == "box":
+        geom_xml = colored_box_geom_xml(0.08, box_face_colors)
         return (
-            """
+            f"""
         <body name="target_body" pos="0 0 0.08">
           <freejoint/>
-          <geom name="target_geom" type="box" size="0.08 0.08 0.08" rgba="0.85 0.25 0.2 1"/>
+          {geom_xml}
         </body>
             """.strip(),
             0.08,
@@ -103,8 +160,8 @@ def object_geom_xml(object_type: str) -> tuple[str, float]:
     raise ValueError(f"Unsupported object_type: {object_type}")
 
 
-def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int) -> str:
-    object_xml, _ = object_geom_xml(object_type)
+def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int, box_face_colors: str) -> str:
+    object_xml, _ = object_geom_xml(object_type, box_face_colors)
     return f"""
 <mujoco model="cgwm_simple_scene">
   <option timestep="0.002" gravity="0 0 -9.81"/>
@@ -191,18 +248,14 @@ def save_png(imageio, path: Path, array: np.ndarray):
     imageio.imwrite(path, array)
 
 
-def segmentation_to_mask(segmentation: np.ndarray, target_geom_id: int, floor_geom_id: int | None = None) -> np.ndarray:
+def segmentation_to_mask(segmentation: np.ndarray, target_geom_ids: list[int], floor_geom_id: int | None = None) -> np.ndarray:
+    target_geom_ids = [int(geom_id) for geom_id in target_geom_ids if int(geom_id) >= 0]
     if segmentation.ndim == 2:
-        mask = segmentation == target_geom_id
+        mask = np.isin(segmentation, target_geom_ids)
     elif segmentation.ndim == 3:
-        mask = np.zeros(segmentation.shape[:2], dtype=bool)
-        for channel in range(segmentation.shape[-1]):
-            mask |= segmentation[..., channel] == target_geom_id
+        mask = np.isin(segmentation[..., 0], target_geom_ids)
         if not mask.any() and floor_geom_id is not None:
-            non_floor = np.ones(segmentation.shape[:2], dtype=bool)
-            for channel in range(segmentation.shape[-1]):
-                non_floor &= segmentation[..., channel] != floor_geom_id
-            mask = non_floor
+            mask = segmentation[..., 0] != floor_geom_id
     else:
         raise ValueError(f"Unsupported segmentation shape: {segmentation.shape}")
     return mask.astype(np.uint8)
@@ -231,7 +284,7 @@ def render_split(
     dataset_dir: Path,
     positions: list[np.ndarray],
     lookat: np.ndarray,
-    target_geom_id: int,
+    target_geom_ids: list[int],
     floor_geom_id: int | None,
     width: int,
     height: int,
@@ -252,7 +305,7 @@ def render_split(
         renderer.update_scene(data, camera="render_cam")
         segmentation = renderer.render()
 
-        mask = segmentation_to_mask(segmentation, target_geom_id=target_geom_id, floor_geom_id=floor_geom_id)
+        mask = segmentation_to_mask(segmentation, target_geom_ids=target_geom_ids, floor_geom_id=floor_geom_id)
         rgba = build_rgba(rgb, mask)
 
         stem = f"{split_name}_{index:03d}"
@@ -292,7 +345,7 @@ def main():
     dataset_dir = Path(args.output_root).expanduser().resolve() / args.scene_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    xml = build_model_xml(args.object_type, args.fovy_deg, args.width, args.height)
+    xml = build_model_xml(args.object_type, args.fovy_deg, args.width, args.height, args.box_face_colors)
     (dataset_dir / "scene.xml").write_text(xml)
 
     model = mujoco.MjModel.from_xml_string(xml)
@@ -310,10 +363,14 @@ def main():
             "`MUJOCO_GL=egl` first, then `MUJOCO_GL=osmesa` if EGL is unavailable."
         ) from exc
 
-    target_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "target_geom")
     floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    target_geom_ids = [
+        geom_id
+        for geom_id in range(model.ngeom)
+        if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) != "floor"
+    ]
 
-    _, default_object_height = object_geom_xml(args.object_type)
+    _, default_object_height = object_geom_xml(args.object_type, args.box_face_colors)
     object_height = float(default_object_height if args.object_height is None else args.object_height)
     lookat = np.array([0.0, 0.0, object_height], dtype=np.float32)
     train_positions = orbit_camera_positions(args.train_views, args.camera_radius, args.elevation_deg, lookat)
@@ -331,7 +388,7 @@ def main():
         dataset_dir=dataset_dir,
         positions=train_positions,
         lookat=lookat,
-        target_geom_id=target_geom_id,
+        target_geom_ids=target_geom_ids,
         floor_geom_id=floor_geom_id,
         width=args.width,
         height=args.height,
@@ -346,7 +403,7 @@ def main():
         dataset_dir=dataset_dir,
         positions=test_positions,
         lookat=lookat,
-        target_geom_id=target_geom_id,
+        target_geom_ids=target_geom_ids,
         floor_geom_id=floor_geom_id,
         width=args.width,
         height=args.height,

@@ -83,6 +83,7 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.tmp_radii = None
         self.optimizer = None
         self.geometry_optimizer = None
         self.appearance_optimizer = None
@@ -334,7 +335,7 @@ class GaussianModel:
             if self.optimizer_type == "sparse_adam":
                 try:
                     return SparseGaussianAdam(param_groups, lr=0.0, eps=1e-15)
-                except:
+                except Exception:
                     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
             return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
@@ -404,7 +405,10 @@ class GaussianModel:
             if group.get("name") is not None
         }
         if not saved_groups_by_name:
-            raise
+            raise RuntimeError(
+                "Checkpoint optimizer state has no named param groups; "
+                "cannot do partial restore across parameter layout changes."
+            )
 
         optimizer.state.clear()
         saved_state = state_dict["state"]
@@ -486,7 +490,7 @@ class GaussianModel:
             dtype_full.append((attribute, 'i4' if attribute == 'object_id' else 'f4'))
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, f_geo, foreground_logit, object_ids[:, None], opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, f_geo, foreground_logit, object_ids[:, None].astype(np.float32), opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)

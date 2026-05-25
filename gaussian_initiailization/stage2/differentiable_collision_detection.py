@@ -1107,12 +1107,14 @@ def load_gaussian_collision_body_from_ply(
     *,
     radius_scale: float = 1.0,
     min_radius: float = 1e-4,
-    recenter: bool = True,
+    recenter: bool = False,
     object_id: int | None = None,
     foreground_threshold: float | None = None,
     opacity_threshold: float | None = None,
     max_primitives: int | None = None,
     use_centers_as_queries: bool = True,
+    world_translation: "np.ndarray | torch.Tensor | tuple | list | None" = None,
+    world_rotation: "np.ndarray | torch.Tensor | None" = None,
     dtype=torch.float32,
     device=None,
 ) -> GaussianCollisionBody:
@@ -1122,6 +1124,16 @@ def load_gaussian_collision_body_from_ply(
     from :func:`load_gaussian_collision_primitives_from_ply`, but also honors the
     object-aware fields Stage 1 writes (`object_id`, `foreground_logit`, and
     `opacity`) so downstream dynamics can consume one physical body at a time.
+
+    Coordinate-frame handling
+    -------------------------
+    Stage 2 expects a rigid-body local frame. If the PLY stores world-frame
+    means, pass ``world_translation`` and ``world_rotation`` from the Stage 2
+    manifest contract to convert them into object-local coordinates:
+    ``local = R^T (world - t)``. In row-vector form this is
+    ``local = (world - t) @ R``. If the PLY is already object-local, leave both
+    pose arguments unset. Bounding-box recentering is intentionally rejected for
+    this bridge because it creates an implicit, data-dependent body frame.
     """
 
     try:
@@ -1184,10 +1196,20 @@ def load_gaussian_collision_body_from_ply(
         radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
     radii_np = np.maximum(radii_np, float(min_radius))
 
-    if recenter:
-        bbox_min = centers_np.min(axis=0)
-        bbox_max = centers_np.max(axis=0)
-        centers_np = centers_np - ((bbox_min + bbox_max) * 0.5)
+    if world_rotation is not None and world_translation is None:
+        raise ValueError("world_rotation requires world_translation so the object-local frame origin is explicit.")
+    if recenter and world_translation is None:
+        raise ValueError(
+            "Implicit bbox recentering is not allowed for Stage1 -> Stage2 collision bodies. "
+            "Declare stage1_gaussian_body.coordinate_frame='object_local' or provide stage1_gaussian_body.world_pose."
+        )
+
+    if world_translation is not None:
+        t = np.asarray(world_translation, dtype=np.float32).reshape(3)
+        centers_np = centers_np - t[None, :]
+        if world_rotation is not None:
+            R = np.asarray(world_rotation, dtype=np.float32).reshape(3, 3)
+            centers_np = centers_np @ R
 
     centers = torch.as_tensor(centers_np, dtype=dtype, device=device)
     radii = torch.as_tensor(radii_np, dtype=dtype, device=device)
