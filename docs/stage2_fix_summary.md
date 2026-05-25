@@ -1,15 +1,24 @@
-# Stage 2 수정 사항 정리
+# Stage 1/2 Validation Fix — 수정 사항 정리
 
-## 요약
+> 브랜치: `stage1_2_validation_fix` (base: `stage2_collision_cleanup`)
 
-이번 수정은 Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting과 비교 렌더링에 안정적으로 연결하기 위한 정리다. 핵심은 Stage 1/Stage 2 좌표 contract를 명시하고, object mask가 실제 학습 loss에 반영되게 하며, Stage 2 collision proxy가 dataset manifest의 metric bbox와 일관되게 쓰이도록 하는 것이다.
+## 이전 브랜치 대비 이번에 새로 수정한 것
 
-추가 점검 중 sphere demo에서 두 가지 문제가 확인되었다.
+`stage2_collision_cleanup`에서 좌표 contract, object mask, floor normal 등 기초를 잡았고, 이번 브랜치에서는 실제 sphere demo를 end-to-end로 돌렸을 때 나온 문제들을 추가로 수정했다.
 
-- MuJoCo sphere rollout의 `sphere_solref="-1000 0"` 설정 때문에 GT trajectory 자체가 바닥을 심하게 관통했다.
-- Stage 2 floor dynamics가 Gaussian SDF 표면 법선을 그대로 반발 법선으로 써서, sphere처럼 둥근 proxy에서 수직 반발 에너지가 XY 속도로 새고 있었다.
+| 항목 | 이전 브랜치 | 이번 브랜치 |
+|------|------------|------------|
+| `sphere_solref` | `-1000 0` (MuJoCo 불안정, floor 관통) | `"0.02 0.2"` (안정, restitution ≈ 0.28) |
+| Stage 2 restitution 수렴 | v0와 e를 동시에 학습 → gradient vanishing | `--freeze_initial_velocity`로 v0 고정, e만 학습 |
+| `run_demo.ps1` | `conda run --no-capture-output` → 19회 중복 실행 | `--no-capture-output` 제거 |
+| Stage 1 PLY 경로 | `-SkipStage1` 시 iteration 불일치하면 에러 | 최신 checkpoint 자동 fallback |
+| stage1_centroid | `"0,0,0.08"` 하드코딩 | object type별 `cz` 동적 반영 |
+| 비교 렌더링 | 없음 | `render_trajectory_comparison.py` 추가 (GT vs 3DGS GIF) |
+| 검증 결과 | sphere end-to-end 미확인 | `position_rmse = 0.013 m`, `learned_restitution = 0.285` 확인 |
 
-현재는 sphere 접촉 설정을 안정값으로 바꾸고, floor 반발 법선을 바닥 법선으로 고정해서 같은 sphere episode 기준 짧은 fitting RMSE가 약 `0.574 m`에서 `0.017 m` 수준으로 줄어든 것을 확인했다.
+## 전체 요약
+
+Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting에 안정적으로 연결하고, sphere demo를 실제로 돌려 수렴하는 것을 확인했다. 핵심 문제는 두 가지였다 — MuJoCo sphere GT가 바닥을 관통하는 것, Stage 2 optimizer의 gradient vanishing.
 
 ## 주요 수정
 
