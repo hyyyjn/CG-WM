@@ -19,6 +19,10 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = "$PSScriptRoot\gaussian_initiailization"
 $Conda = "conda"
 
+# Resolve Python executable once — avoids conda run duplication bug on Windows
+$PythonExe = (& $Conda run -n $CondaEnv python -c "import sys; print(sys.executable)").Trim()
+Write-Host "Python : $PythonExe" -ForegroundColor DarkGray
+
 # Derived paths
 $DatasetDir     = "$OutputRoot\$SceneName"
 $ModelDir       = "$ModelRoot\${SceneName}_stage1"
@@ -36,7 +40,7 @@ function Run([string[]]$Cmd) {
 }
 
 function Py([string[]]$PythonArgs) {
-    Run (@($Conda, "run", "-n", $CondaEnv, "python") + $PythonArgs)
+    Run (@($PythonExe) + $PythonArgs)
 }
 
 Write-Host "=== ContactGaussian-WM Demo ===" -ForegroundColor Green
