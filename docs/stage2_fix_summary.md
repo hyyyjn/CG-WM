@@ -1,6 +1,5 @@
 # Stage 1/2 Validation Fix — 수정 사항 정리
 
-> 브랜치: `stage1_2_validation_fix` (base: `stage2_collision_cleanup`)
 
 ## 이전 브랜치 대비 이번에 새로 수정한 것
 
@@ -10,7 +9,7 @@
 |------|------------|------------|
 | `sphere_solref` | `-1000 0` (MuJoCo 불안정, floor 관통) | `"0.02 0.2"` (안정, restitution ≈ 0.28) |
 | Stage 2 restitution 수렴 | v0와 e를 동시에 학습 → gradient vanishing | `--freeze_initial_velocity`로 v0 고정, e만 학습 |
-| `run_demo.ps1` | `conda run --no-capture-output` → 19회 중복 실행 | `--no-capture-output` 제거 |
+| 실행 스크립트 | `run_demo.ps1` (conda 중복 실행 버그) | `run_demo.py`로 교체 (conda 불필요, 실시간 출력) |
 | Stage 1 PLY 경로 | `-SkipStage1` 시 iteration 불일치하면 에러 | 최신 checkpoint 자동 fallback |
 | stage1_centroid | `"0,0,0.08"` 하드코딩 | object type별 `cz` 동적 반영 |
 | 비교 렌더링 | 없음 | `render_trajectory_comparison.py` 추가 (GT vs 3DGS GIF) |
@@ -67,11 +66,10 @@ Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting에 안정적으로 연�
 - `--initial_velocity_source trajectory` 옵션과 함께 쓴다.
 - 이 수정으로 500 Adam step 이내에 GT restitution에 수렴하는 것을 확인했다.
 
-### `run_demo.ps1` conda 중복 실행 버그 수정
+### 데모 파이프라인 스크립트 교체 (`run_demo.ps1` → `run_demo.py`)
 
-- `conda run --no-capture-output` 명령이 Windows에서 batch activation script의 CALL 루프로 인해 Python 프로세스가 N번 중복 실행되는 버그가 있었다.
-- Step 1의 `[DONE]`이 21번 출력되고, Step 2의 train.py가 19회 이상 연속 실행되어 Stage 1 학습에 ~18분이 소요됐다.
-- `Py` 함수에서 `--no-capture-output` 옵션을 제거해서 해결했다. 출력은 명령 완료 후 일괄 표시된다.
+- `run_demo.ps1`은 `conda run --no-capture-output`이 Windows batch activation의 CALL 루프를 유발해 Python 프로세스가 19회 중복 실행되는 버그가 있었다.
+- `run_demo.py`로 교체해서 conda 없이 `sys.executable`로 직접 호출한다. 플랫폼 무관하고 실시간 출력도 된다.
 
 ### 비교 렌더링 추가
 
@@ -81,30 +79,35 @@ Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting에 안정적으로 연�
 
 ## 실행 방법
 
-PowerShell에서 repository root 기준으로 실행한다.
+conda env 안에서 repository root 기준으로 실행한다.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1
+```bash
+python run_demo.py
 ```
 
-기본 conda 환경 이름은 `gs`다. 다른 환경 이름을 쓰는 경우:
+빠른 테스트 (Stage 1 3000 iter):
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -CondaEnv my_env_name
+```bash
+python run_demo.py --stage1_iters 3000
 ```
 
-기존 Stage 1 checkpoint를 재사용하려면:
+기존 Stage 1 checkpoint 재사용:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -SkipStage1
+```bash
+python run_demo.py --skip_stage1
 ```
 
-`-SkipStage1`을 쓸 때 요청한 iteration의 PLY가 없으면 가장 최신 `iteration_*` checkpoint를 자동으로 찾는다. 그래도 PLY가 없으면 manifest를 잘못 만들지 않고 즉시 실패한다.
+`--skip_stage1` 시 요청한 iteration의 PLY가 없으면 가장 최신 `iteration_*` checkpoint를 자동으로 찾는다.
 
-Sphere demo 예시는 다음처럼 실행할 수 있다.
+전체 옵션:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -SceneName sphere_demo -ObjectType sphere -Stage1Iters 3000 -Stage2FitIters 120
+```
+--scene_name           기본 sphere_demo
+--object_type          box | sphere | cylinder  (기본 sphere)
+--stage1_iters         기본 10000
+--stage2_fit_iters     기본 500
+--foreground_threshold 기본 0.50
+--skip_stage1          Stage 1 건너뛰기
 ```
 
 ## 확인한 결과
