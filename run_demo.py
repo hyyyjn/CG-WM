@@ -84,6 +84,7 @@ def main():
     p.add_argument("--stage2_fit_iters",     type=int, default=500)
     p.add_argument("--foreground_threshold", type=float, default=0.50)
     p.add_argument("--sphere_solref",        default="0.02 0.2")
+    p.add_argument("--mujoco_gl",            default="egl", choices=["auto", "egl", "osmesa", "glfw"])
     p.add_argument("--skip_stage1",          action="store_true")
     args = p.parse_args()
 
@@ -120,7 +121,7 @@ def main():
         "--test_views",  "8",
         "--width",       "512",
         "--height",      "512",
-        "--mujoco_gl",   "glfw",
+        "--mujoco_gl",   args.mujoco_gl,
     ])
 
     # ── STEP 2  Stage 1 training ────────────────

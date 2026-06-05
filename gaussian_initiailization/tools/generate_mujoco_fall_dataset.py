@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 try:
     import mujoco
@@ -64,6 +64,11 @@ def parse_args():
         default=0.03,
         type=float,
         help="Abort sphere rollouts if the sphere bottom goes this far below z=0.",
+    )
+    parser.add_argument(
+        "--skip_render",
+        action="store_true",
+        help="Run MuJoCo physics and write simple placeholder RGB/masks without creating an OpenGL renderer.",
     )
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args()
@@ -210,6 +215,47 @@ def save_mask(path: Path, segmentation, object_geom_ids):
     Image.fromarray(mask, mode="L").save(path)
 
 
+def save_placeholder_frame(path: Path, mask_path: Path, position, image_size):
+    width, height = [int(v) for v in image_size]
+    rgb = Image.new("RGB", (width, height), (246, 247, 248))
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(rgb)
+    mask_draw = ImageDraw.Draw(mask)
+    floor_y = int(height * 0.82)
+    draw.rectangle((0, floor_y, width, height), fill=(224, 226, 226))
+    draw.line((0, floor_y, width, floor_y), fill=(80, 82, 82), width=max(2, width // 256))
+
+    z = float(position[2])
+    x = float(position[0])
+    cube_size = max(12, int(min(width, height) * 0.12))
+    x_px = int(width * 0.5 + x * width * 0.7)
+    y_px = int(floor_y - max(z, 0.0) * height * 0.55)
+    half = cube_size // 2
+    depth = max(8, cube_size // 3)
+    front = [
+        (x_px - half, y_px - half),
+        (x_px + half, y_px - half),
+        (x_px + half, y_px + half),
+        (x_px - half, y_px + half),
+    ]
+    offset = (depth, -depth)
+    back = [(px + offset[0], py + offset[1]) for px, py in front]
+    top = [front[0], front[1], back[1], back[0]]
+    side = [front[1], front[2], back[2], back[1]]
+    outline = (35, 35, 35)
+    draw.polygon(top, fill=(242, 132, 78), outline=outline)
+    draw.polygon(side, fill=(172, 52, 44), outline=outline)
+    draw.polygon(front, fill=(220, 68, 48), outline=outline)
+    draw.line(front + [front[0]], fill=outline, width=max(2, width // 256))
+    draw.line(back + [back[0]], fill=outline, width=max(1, width // 384))
+    draw.line([front[0], back[0], back[1], front[1]], fill=outline, width=max(1, width // 384))
+    mask_draw.polygon(front + back, fill=255)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mask_path.parent.mkdir(parents=True, exist_ok=True)
+    rgb.save(path)
+    mask.save(mask_path)
+
+
 def get_episode_roots(dataset_root: Path, object_name: str, split: str):
     scenario_root = dataset_root / "stage2" / "fall_and_rebound"
     splits = ["train", "test"] if split == "all" else [split]
@@ -264,23 +310,31 @@ def rollout_episode(
         for _ in range(steps_per_frame):
             mujoco.mj_step(model, data)
 
-        renderer.update_scene(data, camera=camera_name)
-        rgb = renderer.render()
-        rgb = np.asarray(rgb, dtype=np.uint8)
-        rgb = np.ascontiguousarray(rgb[..., :3])
-
-        # fill alpha-less background consistently for threshold masks
-        if rgb.ndim == 3 and rgb.shape[2] == 3:
-            rgb[(rgb.sum(axis=-1) == 0)] = bg_rgb
-
-        renderer.enable_segmentation_rendering()
-        renderer.update_scene(data, camera=camera_name)
-        segmentation = np.asarray(renderer.render(), dtype=np.int32)
-        renderer.disable_segmentation_rendering()
-
         stem = f"{frame_idx:06d}"
-        save_rgb(rgb_dir / f"{stem}.png", rgb)
-        save_mask(mask_dir / f"{stem}.png", segmentation, object_geom_ids)
+        if renderer is None:
+            save_placeholder_frame(
+                rgb_dir / f"{stem}.png",
+                mask_dir / f"{stem}.png",
+                data.qpos[:3],
+                manifest.get("image_size", [640, 480]),
+            )
+        else:
+            renderer.update_scene(data, camera=camera_name)
+            rgb = renderer.render()
+            rgb = np.asarray(rgb, dtype=np.uint8)
+            rgb = np.ascontiguousarray(rgb[..., :3])
+
+            # fill alpha-less background consistently for threshold masks
+            if rgb.ndim == 3 and rgb.shape[2] == 3:
+                rgb[(rgb.sum(axis=-1) == 0)] = bg_rgb
+
+            renderer.enable_segmentation_rendering()
+            renderer.update_scene(data, camera=camera_name)
+            segmentation = np.asarray(renderer.render(), dtype=np.int32)
+            renderer.disable_segmentation_rendering()
+
+            save_rgb(rgb_dir / f"{stem}.png", rgb)
+            save_mask(mask_dir / f"{stem}.png", segmentation, object_geom_ids)
 
         states.append(
             {
@@ -357,7 +411,7 @@ def main():
 
     scenario_manifest = read_json(dataset_root / "stage2" / "fall_and_rebound" / "scenario_manifest.json")
     width, height = scenario_manifest["image_size"]
-    renderer = mujoco.Renderer(model, height=int(height), width=int(width))
+    renderer = None if bool(args.skip_render) else mujoco.Renderer(model, height=int(height), width=int(width))
     data = mujoco.MjData(model)
 
     rng = np.random.default_rng(args.seed)

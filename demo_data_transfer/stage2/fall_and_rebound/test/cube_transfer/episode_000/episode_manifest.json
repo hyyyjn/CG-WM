@@ -1,0 +1,89 @@
+{
+  "episode_id": "test_000",
+  "scenario": "fall_and_rebound",
+  "split": "test",
+  "object_name": "cube_transfer",
+  "object_asset_path": "/home/cgr-ugrad-2026/work/CG-WM/demo_data_transfer/cube_transfer_asset.json",
+  "mesh_path": "",
+  "stage1_dataset_path": "gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512",
+  "stage1_points_ply": "gaussian_initiailization/output/mujoco_box_eval_v24_t8_r512_res2_alt_10k_final/point_cloud/iteration_10000/point_cloud.ply",
+  "stage1_gaussian_body": {
+    "coordinate_frame": "world",
+    "world_pose": {
+      "translation": [
+        0.0,
+        0.0,
+        0.08
+      ],
+      "rotation_matrix": [
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  },
+  "frames_per_episode": 140,
+  "fps": 30,
+  "camera_count": 1,
+  "image_size": [
+    640,
+    480
+  ],
+  "physics_prior": {},
+  "physics_shape": "box",
+  "normalization": {
+    "bbox_min": [
+      -0.08,
+      -0.08,
+      -0.08
+    ],
+    "bbox_max": [
+      0.08,
+      0.08,
+      0.08
+    ],
+    "scale": 1.0
+  },
+  "action_type": "initial_pose_and_release",
+  "motion_type": "high_dynamic_discrete_contact",
+  "notes": "Populate rgb/, masks/, state/, and actions/ from your MuJoCo rollout/export pipeline.",
+  "generator": {
+    "name": "generate_mujoco_fall_dataset.py",
+    "camera_name": "cam0"
+  },
+  "initial_state": {
+    "position": [
+      0.09587318112501803,
+      -0.16114930036529077,
+      1.35
+    ],
+    "quaternion_wxyz": [
+      0.8290638107946577,
+      -0.24436003055729666,
+      -0.4996663594210082,
+      0.05722676261709189
+    ],
+    "linear_velocity": [
+      0.9128580437532203,
+      -0.5573857227325864,
+      0.0
+    ],
+    "angular_velocity": [
+      6.884896829519953,
+      1.3087497439626858,
+      13.052172713633048
+    ]
+  }
+}

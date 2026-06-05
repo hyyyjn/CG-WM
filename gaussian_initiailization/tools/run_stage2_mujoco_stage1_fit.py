@@ -527,10 +527,16 @@ def load_stage1_body_arrays(
     local_centers = body.local_centers
     radii = body.radii
 
-    # ── Floor clip (replaces collision_bbox_margin_z_ratio) ──────────────────
-    # Remove Gaussians whose bottom face bleeds below the object's physical
-    # floor contact plane.  The floor contact z in local frame is bbox_min[2].
-    # This is object-shape-agnostic and requires no per-object tuning.
+    collision_bbox_metadata = {"enabled": False}
+    if collision_bbox is not None:
+        local_centers, radii, collision_bbox_metadata = calibrate_collision_proxy_to_bbox(
+            local_centers,
+            radii,
+            collision_bbox,
+        )
+
+    # Floor clip must run after bbox calibration so the manifest floor plane and
+    # the Gaussian proxy are in the same local metric frame.
     floor_clip_metadata = {"floor_clip_enabled": False}
     if collision_bbox is not None and not getattr(args, "disable_floor_clip", False):
         floor_z_local = float(collision_bbox["bbox_min"][2])
@@ -543,14 +549,6 @@ def load_stage1_body_arrays(
                 "floor_clip removed ALL Gaussians. "
                 "Try --floor_clip_slack 0.02 or --disable_floor_clip."
             )
-
-    collision_bbox_metadata = {"enabled": False}
-    if collision_bbox is not None:
-        local_centers, radii, collision_bbox_metadata = calibrate_collision_proxy_to_bbox(
-            local_centers,
-            radii,
-            collision_bbox,
-        )
     coordinate_mode = "world_pose" if world_translation is not None else "object_local"
     metadata = {
         "coordinate_mode": coordinate_mode,
@@ -1080,6 +1078,7 @@ def draw_follow_view(
     output_gif: Path,
     *,
     fps: int,
+    object_shape: str = "sphere",
 ) -> None:
     output_gif.parent.mkdir(parents=True, exist_ok=True)
     width, height = 640, 480
@@ -1096,6 +1095,24 @@ def draw_follow_view(
         t = (z - z_min) / max(z_max - z_min, 1e-6)
         return int(floor_y - t * (floor_y - 64))
 
+    def draw_cube(draw: ImageDraw.ImageDraw, center_x: int, center_y: int, size: int, *, fill_front, fill_top, fill_side, outline):
+        half = size // 2
+        depth = max(8, size // 3)
+        front = [
+            (center_x - half, center_y - half),
+            (center_x + half, center_y - half),
+            (center_x + half, center_y + half),
+            (center_x - half, center_y + half),
+        ]
+        back = [(x + depth, y - depth) for x, y in front]
+        top = [front[0], front[1], back[1], back[0]]
+        side = [front[1], front[2], back[2], back[1]]
+        draw.polygon(top, fill=fill_top, outline=outline)
+        draw.polygon(side, fill=fill_side, outline=outline)
+        draw.polygon(front, fill=fill_front, outline=outline)
+        draw.line(front + [front[0]], fill=outline, width=3)
+        draw.line([front[0], back[0], back[1], front[1]], fill=outline, width=2)
+
     for idx, (target, pred) in enumerate(zip(target_positions, predicted_positions)):
         frame = Image.new("RGB", (width, height), (248, 247, 241))
         draw = ImageDraw.Draw(frame)
@@ -1111,18 +1128,41 @@ def draw_follow_view(
         pred_y = z_to_y(float(pred[2]))
         gate = float(contact_gates[idx - 1]) if idx > 0 and idx - 1 < len(contact_gates) else 0.0
         gate_color = (34, 120, 215) if gate < 0.5 else (220, 72, 48)
-        draw.ellipse(
-            (center_x - radius_px, target_y - radius_px, center_x + radius_px, target_y + radius_px),
-            outline=(25, 82, 130),
-            width=4,
-            fill=(78, 150, 219),
-        )
-        draw.ellipse(
-            (center_x - 7, pred_y - 7, center_x + 7, pred_y + 7),
-            fill=gate_color,
-            outline=(30, 30, 30),
-        )
-        draw.line((center_x - 34, target_y, center_x + 34, target_y), fill=(25, 82, 130), width=1)
+        if object_shape == "box":
+            draw_cube(
+                draw,
+                center_x - 56,
+                target_y,
+                44,
+                fill_front=(78, 150, 219),
+                fill_top=(126, 184, 232),
+                fill_side=(45, 108, 172),
+                outline=(25, 82, 130),
+            )
+            draw_cube(
+                draw,
+                center_x + 48,
+                pred_y,
+                30,
+                fill_front=gate_color,
+                fill_top=(245, 154, 103) if gate >= 0.5 else (88, 164, 226),
+                fill_side=(172, 52, 44) if gate >= 0.5 else (30, 95, 160),
+                outline=(30, 30, 30),
+            )
+            draw.line((center_x - 90, target_y + 26, center_x - 24, target_y + 26), fill=(25, 82, 130), width=1)
+        else:
+            draw.ellipse(
+                (center_x - radius_px, target_y - radius_px, center_x + radius_px, target_y + radius_px),
+                outline=(25, 82, 130),
+                width=4,
+                fill=(78, 150, 219),
+            )
+            draw.ellipse(
+                (center_x - 7, pred_y - 7, center_x + 7, pred_y + 7),
+                fill=gate_color,
+                outline=(30, 30, 30),
+            )
+            draw.line((center_x - 34, target_y, center_x + 34, target_y), fill=(25, 82, 130), width=1)
         draw.text((18, height - 30), f"target_z={target[2]:.3f} pred_z={pred[2]:.3f} contact_gate={gate:.3f}", fill=(20, 20, 18))
         frames.append(frame)
 
@@ -1135,10 +1175,15 @@ def main() -> None:
     episode_root = args.episode_root.resolve()
     stage1_ply = resolve_stage1_ply(args.stage1_ply, args.stage1_model_path)
     output_dir = args.output_dir.resolve() if args.output_dir else episode_root / "stage2_mujoco_stage1_fit"
+    episode_manifest = read_json(episode_root / "episode_manifest.json")
+    object_shape = str(episode_manifest.get("physics_shape", "sphere"))
 
     target_positions_cpu, times_cpu, states = load_target_positions(episode_root, int(args.max_frames))
     target_quaternions_cpu = load_target_quaternions(states)
-    initial_linear_velocity_hint_cpu = load_initial_linear_velocity(states)
+    if str(args.initial_velocity_source) == "trajectory":
+        initial_linear_velocity_hint_cpu = load_initial_linear_velocity(states)
+    else:
+        initial_linear_velocity_hint_cpu = torch.zeros_like(target_positions_cpu[0])
     initial_angular_velocity_hint_cpu = load_initial_angular_velocity(states)
     stage1_world_translation = parse_optional_vec3(args.stage1_world_translation, label="--stage1_world_translation")
     stage1_world_rotation = parse_optional_matrix3(args.stage1_world_rotation, label="--stage1_world_rotation")
@@ -1252,6 +1297,7 @@ def main() -> None:
         contact_gates.numpy(),
         gif_path,
         fps=int(args.gif_fps),
+        object_shape=object_shape,
     )
     diagnostics["output_dir"] = str(output_dir)
     diagnostics["diagnostic_gif"] = str(gif_path)

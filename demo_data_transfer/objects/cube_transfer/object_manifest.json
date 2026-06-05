@@ -1,0 +1,50 @@
+{
+  "object_name": "cube_transfer",
+  "physics_shape": "box",
+  "mesh_path": "",
+  "stage1_dataset_path": "gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512",
+  "stage1_points_ply": "gaussian_initiailization/output/mujoco_box_eval_v24_t8_r512_res2_alt_10k_final/point_cloud/iteration_10000/point_cloud.ply",
+  "stage1_gaussian_body": {
+    "coordinate_frame": "world",
+    "world_pose": {
+      "translation": [
+        0.0,
+        0.0,
+        0.08
+      ],
+      "rotation_matrix": [
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  },
+  "stage1_summary_path": "",
+  "source_asset_manifest_path": "/home/cgr-ugrad-2026/work/CG-WM/demo_data_transfer/cube_transfer_asset.json",
+  "normalization": {
+    "bbox_min": [
+      -0.08,
+      -0.08,
+      -0.08
+    ],
+    "bbox_max": [
+      0.08,
+      0.08,
+      0.08
+    ],
+    "scale": 1.0
+  },
+  "physics_prior": {}
+}
