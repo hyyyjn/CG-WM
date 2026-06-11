@@ -3,19 +3,21 @@
 Stage1 가우시안 에셋 하나를 N개 인스턴스로 복제해 MuJoCo GT와 비교하는
 멀티 주사위 파이프라인의 재현 절차. 모든 명령은 저장소 루트에서 실행한다.
 
-환경: conda env `gs` (mujoco 3.8, torch 2.5, imageio, Pillow)
+요구 패키지: `mujoco`(3.x), `torch`, `imageio`, `Pillow`, `numpy`
+(설치된 본인의 파이썬 환경에서 실행하면 된다. conda 환경이라면
+`conda activate <env>` 후 아래 명령을 그대로 사용.)
 
 ## 1. Stage1 주사위 에셋 생성
 
 ```bash
 # 합성 데이터셋 (눈금 있는 주사위, 궤도 뷰 16/4장)
-conda run -n gs python gaussian_initiailization/generate_mujoco_synthetic_dataset.py \
+python gaussian_initiailization/generate_mujoco_synthetic_dataset.py \
   --object_type dice --scene_name dice_asset_smoke \
   --train_views 16 --test_views 4 --width 256 --height 256 \
   --output_root actual_dice_stage1_data
 
 # Stage1 학습 (smoke: 3000 iter)
-conda run -n gs python gaussian_initiailization/train.py \
+python gaussian_initiailization/train.py \
   --source_path actual_dice_stage1_data/dice_asset_smoke \
   --model_path actual_dice_stage1_output/dice_asset_smoke_stage1_3000 \
   --masks_dir actual_dice_stage1_data/dice_asset_smoke/masks \
@@ -28,7 +30,7 @@ conda run -n gs python gaussian_initiailization/train.py \
 ## 2. MuJoCo GT 멀티 주사위 롤아웃 생성
 
 ```bash
-conda run -n gs python gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py \
+python gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py \
   --output_dir actual_multi_dice_mujoco/episode_000 \
   --dice_count 5 --frames 150 --seed 23
 ```
@@ -39,7 +41,7 @@ GT GIF와 몽타주.
 ## 3. 접촉 그래프 평가
 
 ```bash
-conda run -n gs python gaussian_initiailization/tools/evaluate_multi_dice_contact_graph.py \
+python gaussian_initiailization/tools/evaluate_multi_dice_contact_graph.py \
   --trajectory actual_multi_dice_mujoco/episode_000/trajectory.json \
   --stage1_ply $PLY \
   --rgb_dir actual_multi_dice_mujoco/episode_000/rgb \
@@ -60,7 +62,7 @@ conda run -n gs python gaussian_initiailization/tools/evaluate_multi_dice_contac
 ## 4. Stage2 롤아웃 비교 (GT vs 예측)
 
 ```bash
-conda run -n gs python gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
+python gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
   --trajectory actual_multi_dice_mujoco/episode_000/trajectory.json \
   --gt_rgb_dir actual_multi_dice_mujoco/episode_000/rgb \
   --stage1_ply $PLY \
@@ -85,3 +87,5 @@ conda run -n gs python gaussian_initiailization/tools/run_stage2_multi_dice_roll
   전체 구간을 fit하면 카오스 노이즈가 gradient를 오염시켜 오히려 나빠진다.
 - fit은 CPU에서 도는 것이 빠르다(`--device cpu` 기본). 텐서가 작아 GPU 이득이 없다.
 - 빠른 동작 확인만 하려면 `--fit_iters 0 --max_frames 40`으로 2~3분이면 끝난다.
+- 렌더링은 `--mujoco_gl` 기본값 `glfw` 기준이다. 디스플레이 없는 환경(서버)에서는
+  `--mujoco_gl egl` 또는 `osmesa`로 바꾼다.
