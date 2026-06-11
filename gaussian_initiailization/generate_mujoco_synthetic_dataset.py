@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--object_type",
         default="box",
-        choices=["box", "sphere", "cylinder"],
+        choices=["box", "sphere", "cylinder", "dice"],
         help="Simple object primitive to render.",
     )
     parser.add_argument("--train_views", default=24, type=int, help="Number of train views on the orbit.")
@@ -127,6 +127,47 @@ def colored_box_geom_xml(half_extent: float, face_colors_arg: str) -> str:
     """.strip()
 
 
+def dice_pip_positions(number_name: str) -> list[tuple[float, float]]:
+    layouts = {
+        "one": [(0.0, 0.0)],
+        "two": [(-0.022, -0.022), (0.022, 0.022)],
+        "three": [(-0.024, -0.024), (0.0, 0.0), (0.024, 0.024)],
+        "four": [(-0.023, -0.023), (0.023, -0.023), (-0.023, 0.023), (0.023, 0.023)],
+        "five": [(-0.024, -0.024), (0.024, -0.024), (0.0, 0.0), (-0.024, 0.024), (0.024, 0.024)],
+        "six": [(-0.024, -0.028), (0.024, -0.028), (-0.024, 0.0), (0.024, 0.0), (-0.024, 0.028), (0.024, 0.028)],
+    }
+    return layouts[number_name]
+
+
+def dice_geom_xml(half_extent: float) -> str:
+    h = float(half_extent)
+    face_specs = [
+        ("px", "three", (h + 0.001, 0, 0), "y", "z"),
+        ("nx", "four", (-h - 0.001, 0, 0), "y", "z"),
+        ("py", "two", (0, h + 0.001, 0), "x", "z"),
+        ("ny", "five", (0, -h - 0.001, 0), "x", "z"),
+        ("pz", "six", (0, 0, h + 0.001), "x", "y"),
+        ("nz", "one", (0, 0, -h - 0.001), "x", "y"),
+    ]
+    axis_index = {"x": 0, "y": 1, "z": 2}
+    pips = []
+    for face_name, number_name, base, axis_u, axis_v in face_specs:
+        for pip_idx, (u, v) in enumerate(dice_pip_positions(number_name)):
+            pos = [float(base[0]), float(base[1]), float(base[2])]
+            pos[axis_index[axis_u]] += u
+            pos[axis_index[axis_v]] += v
+            pips.append(
+                f'<geom name="target_pip_{face_name}_{pip_idx:02d}" '
+                f'type="sphere" pos="{pos[0]} {pos[1]} {pos[2]}" size="0.0085" '
+                'rgba="0.02 0.02 0.018 1" contype="0" conaffinity="0" density="0"/>'
+            )
+    pip_xml = "\n          ".join(pips)
+    return f"""
+          <geom name="target_geom" type="box" size="{h} {h} {h}" rgba="0.93 0.92 0.86 1"/>
+          {pip_xml}
+    """.strip()
+
+
 def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]:
     if object_type == "box":
         geom_xml = colored_box_geom_xml(0.08, box_face_colors)
@@ -148,6 +189,17 @@ def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]
         </body>
             """.strip(),
             0.09,
+        )
+    if object_type == "dice":
+        geom_xml = dice_geom_xml(0.08)
+        return (
+            f"""
+        <body name="target_body" pos="0 0 0.08">
+          <freejoint/>
+          {geom_xml}
+        </body>
+            """.strip(),
+            0.08,
         )
     if object_type == "cylinder":
         return (

@@ -6,6 +6,9 @@ external/
 demo_data/
 demo_output/
 
+# Multi-dice / smoke test outputs (regenerate via test.md)
+actual_*/
+
 __pycache__/
 *.pyc
 *.pyo
