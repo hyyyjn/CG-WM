@@ -257,8 +257,39 @@ class PairwiseImpedanceDynamicsConfig:
     linear_damping: float = 0.0
     angular_damping: float = 0.0
     friction_coefficient: float = 0.0
+    static_friction_coefficient: Optional[float] = None
     tangential_damping: float = 0.0
     friction_softness: float = 1e-6
+    friction_transition_velocity: float = 1e-3
+
+
+@dataclass(frozen=True)
+class MultiBodyImpedanceDynamicsConfig:
+    """N-body Gaussian impedance dynamics using the Stage 2 contact graph."""
+
+    dt: float = 1.0 / 60.0
+    masses: tuple[float, ...] | None = None
+    inertia_diags: tuple[tuple[float, float, float], ...] | None = None
+    dynamic_flags: tuple[bool, ...] | None = None
+    gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
+    contact_softness: float = 1e-3
+    smooth_min_temperature: float = 1e-2
+    inside_penalty: float = 0.02
+    inside_sharpness: float = 50.0
+    num_contact_patches: int = 4
+    broad_phase_margin: float = 0.02
+    broad_phase_mode: str = "aabb"
+    patch_selection: str = "spatial"
+    candidate_pair_mode: str = "spatial_hash"
+    spatial_hash_cell_size: float = 0.15
+    contact_threshold: float = 0.5
+    linear_damping: float = 0.0
+    angular_damping: float = 0.0
+    friction_coefficient: float = 0.0
+    static_friction_coefficient: Optional[float] = None
+    tangential_damping: float = 0.0
+    friction_softness: float = 1e-6
+    friction_transition_velocity: float = 1e-3
 
 
 class GaussianUnionFloorContactDynamics:
@@ -402,6 +433,53 @@ def _tangent_basis(normals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return tangent_1, tangent_2
 
 
+def _friction_cone_forces(
+    tangential_velocity: torch.Tensor,
+    weights: torch.Tensor,
+    normal_lambdas: torch.Tensor,
+    *,
+    tangential_damping: torch.Tensor,
+    dynamic_mu: torch.Tensor,
+    static_mu: torch.Tensor | None,
+    friction_softness: float,
+    transition_velocity: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Soft Coulomb cone projection for tangential damping forces.
+
+    Inside the cone, the raw damping force is kept nearly unchanged (sticking).
+    Outside the cone, it is smoothly projected onto ``||f_t|| <= mu * lambda_n``
+    along the opposite slip direction (sliding).
+    """
+
+    raw_friction = -tangential_damping * weights.unsqueeze(-1) * tangential_velocity
+    raw_norm = torch.linalg.norm(raw_friction, dim=-1, keepdim=True)
+    slip_speed = torch.linalg.norm(tangential_velocity, dim=-1, keepdim=True)
+    if static_mu is None:
+        effective_mu = dynamic_mu
+        static_gate = torch.zeros_like(raw_norm)
+    else:
+        transition = max(float(transition_velocity), 1e-9)
+        static_gate = torch.sigmoid((transition - slip_speed) / transition)
+        effective_mu = dynamic_mu + (torch.clamp(static_mu, min=dynamic_mu) - dynamic_mu) * static_gate
+    cone_radius = effective_mu * normal_lambdas.unsqueeze(-1)
+    softness = max(float(friction_softness), 1e-12)
+    sliding_gate = torch.sigmoid((raw_norm - cone_radius) / softness)
+    projected_scale = cone_radius / torch.clamp(raw_norm, min=1e-12)
+    scale = (1.0 - sliding_gate) + sliding_gate * projected_scale
+    friction = raw_friction * scale
+    diagnostics = {
+        "raw_friction_force": raw_friction,
+        "raw_friction_norm": raw_norm.squeeze(-1),
+        "friction_cone_radius": cone_radius.squeeze(-1),
+        "friction_cone_scale": scale.squeeze(-1),
+        "friction_sliding_gate": sliding_gate.squeeze(-1),
+        "friction_static_gate": static_gate.squeeze(-1),
+        "effective_friction_coefficient": torch.as_tensor(effective_mu, dtype=raw_friction.dtype, device=raw_friction.device),
+        "slip_speed": slip_speed.squeeze(-1),
+    }
+    return friction, diagnostics
+
+
 class PairwiseGaussianBodyImpedanceDynamics:
     """Multi-contact impedance dynamics for two Gaussian collision bodies.
 
@@ -495,14 +573,19 @@ class PairwiseGaussianBodyImpedanceDynamics:
         lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
         lambdas = weights * lambda_raw
         normal_forces = lambdas.unsqueeze(-1) * normals
-        raw_friction_forces = -float(cfg.tangential_damping) * weights.unsqueeze(-1) * tangential_velocity
-        raw_friction_norm = torch.linalg.norm(raw_friction_forces, dim=-1, keepdim=True)
-        max_friction_norm = float(cfg.friction_coefficient) * lambdas.unsqueeze(-1)
-        friction_scale = torch.tanh(
-            raw_friction_norm / torch.clamp(max_friction_norm + float(cfg.friction_softness), min=1e-12)
-        )
-        friction_forces = raw_friction_forces * (
-            friction_scale * max_friction_norm / torch.clamp(raw_friction_norm, min=1e-12)
+        friction_forces, friction_diagnostics = _friction_cone_forces(
+            tangential_velocity,
+            weights,
+            lambdas,
+            tangential_damping=torch.as_tensor(float(cfg.tangential_damping), dtype=dtype, device=device),
+            dynamic_mu=torch.as_tensor(float(cfg.friction_coefficient), dtype=dtype, device=device),
+            static_mu=(
+                None
+                if cfg.static_friction_coefficient is None
+                else torch.as_tensor(float(cfg.static_friction_coefficient), dtype=dtype, device=device)
+            ),
+            friction_softness=float(cfg.friction_softness),
+            transition_velocity=float(cfg.friction_transition_velocity),
         )
         forces = normal_forces + friction_forces
         total_force = torch.sum(forces, dim=-2)
@@ -546,6 +629,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
             "tangential_velocity": tangential_velocity,
             "tangent_velocity_components": torch.stack((tangent_velocity_1, tangent_velocity_2), dim=-1),
             "friction_force": friction_forces,
+            **friction_diagnostics,
             "normal_force": normal_forces,
             "patch_force": forces,
             "patch_weights": weights,
@@ -574,6 +658,241 @@ class PairwiseGaussianBodyImpedanceDynamics:
             quaternion_b_wxyz=predicted_b.quaternion_wxyz,
         )
         return self._apply_patch_forces(predicted_a, predicted_b, contacts)
+
+
+class MultiBodyGaussianImpedanceDynamics:
+    """Sparse N-body impedance dynamics over Gaussian collision bodies.
+
+    This is the multi-object counterpart to
+    :class:`PairwiseGaussianBodyImpedanceDynamics`: it predicts free motion once
+    for every body, builds the Stage 2 pairwise contact graph, then accumulates
+    the same impedance/friction patch forces over all active graph edges.
+    """
+
+    def __init__(
+        self,
+        bodies: Iterable[GaussianCollisionBody],
+        *,
+        stiffness: torch.Tensor,
+        damping: torch.Tensor,
+        friction_coefficient: torch.Tensor | None = None,
+        tangential_damping: torch.Tensor | None = None,
+        mass_multiplier: torch.Tensor | None = None,
+        names: Iterable[str] | None = None,
+        config: Optional[MultiBodyImpedanceDynamicsConfig] = None,
+    ):
+        self.bodies = tuple(bodies)
+        if len(self.bodies) < 2:
+            raise ValueError("MultiBodyGaussianImpedanceDynamics needs at least two bodies.")
+        self.names = None if names is None else tuple(str(name) for name in names)
+        if self.names is not None and len(self.names) != len(self.bodies):
+            raise ValueError(f"names must have length {len(self.bodies)}, got {len(self.names)}.")
+        self.stiffness = stiffness
+        self.damping = damping
+        self.friction_coefficient = friction_coefficient
+        self.tangential_damping = tangential_damping
+        self.mass_multiplier = mass_multiplier
+        self.config = config or MultiBodyImpedanceDynamicsConfig()
+
+    def _masses(self) -> tuple[float, ...]:
+        if self.config.masses is None:
+            return tuple(1.0 for _ in self.bodies)
+        if len(self.config.masses) != len(self.bodies):
+            raise ValueError(f"masses must have length {len(self.bodies)}, got {len(self.config.masses)}.")
+        return tuple(float(mass) for mass in self.config.masses)
+
+    def _inertia_diags(self) -> tuple[tuple[float, float, float], ...]:
+        if self.config.inertia_diags is None:
+            return tuple((1.0, 1.0, 1.0) for _ in self.bodies)
+        if len(self.config.inertia_diags) != len(self.bodies):
+            raise ValueError(
+                f"inertia_diags must have length {len(self.bodies)}, got {len(self.config.inertia_diags)}."
+            )
+        return tuple(tuple(float(v) for v in inertia) for inertia in self.config.inertia_diags)
+
+    def _dynamic_flags(self) -> tuple[bool, ...]:
+        if self.config.dynamic_flags is None:
+            return tuple(True for _ in self.bodies)
+        if len(self.config.dynamic_flags) != len(self.bodies):
+            raise ValueError(
+                f"dynamic_flags must have length {len(self.bodies)}, got {len(self.config.dynamic_flags)}."
+            )
+        return tuple(bool(flag) for flag in self.config.dynamic_flags)
+
+    def _predict_free(
+        self,
+        states: Iterable[RigidBodyState],
+        masses: tuple[float, ...],
+        dynamic_flags: tuple[bool, ...],
+    ) -> tuple[RigidBodyState, ...]:
+        cfg = self.config
+        states = tuple(states)
+        if len(states) != len(self.bodies):
+            raise ValueError(f"states must have length {len(self.bodies)}, got {len(states)}.")
+        if cfg.dt <= 0.0:
+            raise ValueError("dt must be positive.")
+        predicted = []
+        for state, mass, dynamic in zip(states, masses, dynamic_flags):
+            if mass <= 0.0 and dynamic:
+                raise ValueError("dynamic bodies require positive mass.")
+            gravity = _as_vec3(cfg.gravity, dtype=state.position.dtype, device=state.position.device)
+            if dynamic:
+                linear_velocity = state.linear_velocity + cfg.dt * gravity
+                linear_velocity = linear_velocity * max(0.0, 1.0 - float(cfg.linear_damping) * cfg.dt)
+                angular_velocity = state.angular_velocity * max(0.0, 1.0 - float(cfg.angular_damping) * cfg.dt)
+                position = state.position + cfg.dt * linear_velocity
+                quaternion = _integrate_quaternion_wxyz(state.quaternion_wxyz, angular_velocity, cfg.dt)
+            else:
+                linear_velocity = torch.zeros_like(state.linear_velocity)
+                angular_velocity = torch.zeros_like(state.angular_velocity)
+                position = state.position
+                quaternion = _normalize_quaternion(state.quaternion_wxyz)
+            predicted.append(RigidBodyState(position, quaternion, linear_velocity, angular_velocity))
+        return tuple(predicted)
+
+    def step(self, states: Iterable[RigidBodyState]) -> tuple[tuple[RigidBodyState, ...], dict[str, object]]:
+        from .differentiable_contact_graph import build_pairwise_contact_graph
+
+        cfg = self.config
+        masses = self._masses()
+        inertia_diags = self._inertia_diags()
+        dynamic_flags = self._dynamic_flags()
+        predicted = self._predict_free(states, masses, dynamic_flags)
+        names = self.names or tuple(f"body_{idx}" for idx in range(len(self.bodies)))
+        graph = build_pairwise_contact_graph(
+            self.bodies,
+            predicted,
+            names=names,
+            dynamic_flags=dynamic_flags,
+            candidate_pair_mode=cfg.candidate_pair_mode,
+            spatial_hash_cell_size=float(cfg.spatial_hash_cell_size),
+            collision_config=CollisionEngineConfig(
+                softness=float(cfg.contact_softness),
+                smooth_min_temperature=float(cfg.smooth_min_temperature),
+                inside_penalty=float(cfg.inside_penalty),
+                inside_sharpness=float(cfg.inside_sharpness),
+                num_contact_patches=int(cfg.num_contact_patches),
+                broad_phase_margin=float(cfg.broad_phase_margin),
+                broad_phase_mode=str(cfg.broad_phase_mode),
+                patch_selection=str(cfg.patch_selection),
+            ),
+            include_inactive=False,
+            contact_threshold=float(cfg.contact_threshold),
+        )
+
+        dtype = predicted[0].position.dtype
+        device = predicted[0].position.device
+        mass_scale = (
+            torch.ones((), dtype=dtype, device=device)
+            if self.mass_multiplier is None
+            else F.softplus(self.mass_multiplier).to(dtype=dtype, device=device)
+        )
+        mass_tensors = [
+            torch.as_tensor(float(mass), dtype=dtype, device=device) * (mass_scale if dynamic else 1.0)
+            for mass, dynamic in zip(masses, dynamic_flags)
+        ]
+        force_accum = [torch.zeros(3, dtype=dtype, device=device) for _ in predicted]
+        torque_accum = [torch.zeros(3, dtype=dtype, device=device) for _ in predicted]
+        K = F.softplus(self.stiffness).to(dtype=dtype, device=device)
+        D = F.softplus(self.damping).to(dtype=dtype, device=device)
+        mu = (
+            torch.as_tensor(float(cfg.friction_coefficient), dtype=dtype, device=device)
+            if self.friction_coefficient is None
+            else F.softplus(self.friction_coefficient).to(dtype=dtype, device=device)
+        )
+        tangential_damping = (
+            torch.as_tensor(float(cfg.tangential_damping), dtype=dtype, device=device)
+            if self.tangential_damping is None
+            else F.softplus(self.tangential_damping).to(dtype=dtype, device=device)
+        )
+        static_mu = (
+            None
+            if cfg.static_friction_coefficient is None
+            else torch.as_tensor(float(cfg.static_friction_coefficient), dtype=dtype, device=device)
+        )
+        active_edges = []
+        lambda_terms = []
+        friction_terms = []
+        for edge in graph.active_edges(contact_threshold=float(cfg.contact_threshold)):
+            contacts = edge.contacts
+            i, j = int(edge.body_i), int(edge.body_j)
+            state_i = predicted[i]
+            state_j = predicted[j]
+            normals = contacts.patch_normals.to(dtype=dtype, device=device)
+            points = contacts.patch_points.to(dtype=dtype, device=device)
+            weights = contacts.patch_weights.to(dtype=dtype, device=device)
+            phi = contacts.patch_signed_distances.to(dtype=dtype, device=device)
+            r_i = points - state_i.position.unsqueeze(-2)
+            r_j = points - state_j.position.unsqueeze(-2)
+            velocity_i = state_i.linear_velocity.unsqueeze(-2) + _cross(state_i.angular_velocity.unsqueeze(-2), r_i)
+            velocity_j = state_j.linear_velocity.unsqueeze(-2) + _cross(state_j.angular_velocity.unsqueeze(-2), r_j)
+            relative_velocity = velocity_i - velocity_j
+            normal_velocity = torch.sum(relative_velocity * normals, dim=-1)
+            tangent_1, tangent_2 = _tangent_basis(normals)
+            tangent_velocity_1 = torch.sum(relative_velocity * tangent_1, dim=-1)
+            tangent_velocity_2 = torch.sum(relative_velocity * tangent_2, dim=-1)
+            tangential_velocity = tangent_velocity_1.unsqueeze(-1) * tangent_1 + tangent_velocity_2.unsqueeze(-1) * tangent_2
+            lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
+            lambdas = weights * lambda_raw
+            normal_forces = lambdas.unsqueeze(-1) * normals
+            friction, friction_diagnostics = _friction_cone_forces(
+                tangential_velocity,
+                weights,
+                lambdas,
+                tangential_damping=tangential_damping,
+                dynamic_mu=mu,
+                static_mu=static_mu,
+                friction_softness=float(cfg.friction_softness),
+                transition_velocity=float(cfg.friction_transition_velocity),
+            )
+            patch_forces = normal_forces + friction
+            total_force_on_i = torch.sum(patch_forces, dim=-2)
+            torque_on_i = torch.sum(_cross(r_i, patch_forces), dim=-2)
+            torque_on_j = torch.sum(_cross(r_j, -patch_forces), dim=-2)
+            force_accum[i] = force_accum[i] + total_force_on_i
+            force_accum[j] = force_accum[j] - total_force_on_i
+            torque_accum[i] = torque_accum[i] + torque_on_i
+            torque_accum[j] = torque_accum[j] + torque_on_j
+            active_edges.append((i, j))
+            lambda_terms.append(lambdas)
+            friction_terms.append(
+                {
+                    "edge": (i, j),
+                    "friction_force": friction,
+                    "normal_force": normal_forces,
+                    "tangential_velocity": tangential_velocity,
+                    **friction_diagnostics,
+                }
+            )
+
+        next_states = []
+        for idx, state in enumerate(predicted):
+            if not dynamic_flags[idx]:
+                next_states.append(state)
+                continue
+            inv_mass = 1.0 / torch.clamp(mass_tensors[idx], min=1e-9)
+            scaled_inertia = tuple(float(value) * float(masses[idx]) for value in inertia_diags[idx])
+            angular_delta = _inertia_angular_delta(
+                torque_accum[idx],
+                inertia_diag=scaled_inertia,
+                inertia_matrix=None,
+                dynamic=True,
+            ) / torch.clamp(mass_scale, min=1e-9)
+            linear_velocity = state.linear_velocity + cfg.dt * inv_mass * force_accum[idx]
+            angular_velocity = state.angular_velocity + cfg.dt * angular_delta
+            position = state.position + cfg.dt * (linear_velocity - state.linear_velocity)
+            quaternion = _integrate_quaternion_wxyz(state.quaternion_wxyz, angular_velocity, cfg.dt)
+            next_states.append(RigidBodyState(position, quaternion, linear_velocity, angular_velocity))
+
+        diagnostics = {
+            "graph": graph,
+            "active_edges": active_edges,
+            "lambda": lambda_terms,
+            "friction": friction_terms,
+            "force_accum": force_accum,
+            "torque_accum": torque_accum,
+        }
+        return tuple(next_states), diagnostics
 
 
 class ImpedanceFloorContactDynamics:

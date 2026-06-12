@@ -1,588 +1,212 @@
 # CG-WM
 
-한양대학교 졸프용 ContactGaussian-WM 실험 저장소입니다.
+ContactGaussian-WM 논문 아이디어를 바탕으로 Stage 1 Gaussian scene initialization과 Stage 2 differentiable contact simulation을 실험하는 연구용 저장소입니다.
 
-현재 구현의 중심은 `gaussian_initiailization/` 아래에 있습니다. 폴더 이름은 기존 저장소 상태를 따라
-`initiailization` 오타가 남아 있습니다.
+현재 코드는 논문 전체를 완전히 재현한 공식 구현체가 아니라, 주사위/박스 같은 rigid object를 대상으로 object-aware Gaussian proxy를 만들고, 그 proxy를 이용해 differentiable collision/contact dynamics를 검증하는 프로토타입입니다.
 
-이 저장소는 ContactGaussian-WM 전체를 완성한 코드라기보다, 아래 두 축을 구현하고 검증하는 연구용
-프로토타입입니다.
+`gaussian_initiailization/` 폴더명에는 기존 저장소의 오타(`initiailization`)가 그대로 남아 있습니다.
 
-- Stage 1: multi-view 관측에서 object-aware spherical Gaussian scene initialization
-- Stage 2: spherical Gaussian proxy 기반 differentiable collision detection 및 contact dynamics
+## 구현 범위
 
-## Repository Layout
+### Stage 1: Gaussian Initialization
 
-```text
-gaussian_initiailization/
-  train.py                                      # Stage 1 학습
-  render.py                                     # 학습 결과 렌더 / foreground debug render
-  metrics.py                                    # 렌더 결과 metric 계산
-  run_scene_initialization_pipeline.py          # mask, COLMAP, visual hull, SAM2, train wrapper
-  generate_mujoco_synthetic_dataset.py          # MuJoCo synthetic multi-view dataset 생성
-  build_visual_hull.py                          # mask 기반 visual hull seed 생성
-  extract_sam2_features.py                      # SAM2 feature map 추출
-  extract_object_masks.py                       # 입력 이미지에서 object mask 생성
-  estimate_masked_colmap.py                     # mask 반영 COLMAP 재추정
-  assign_object_ids.py                          # 수동 object id 할당
-  auto_assign_object_ids.py                     # 자동 object id 할당
-  export_physics_scene.py                       # physics-friendly intermediate export
-  scene/gaussian_model.py                       # spherical Gaussian model, foreground/object fields
-  gaussian_renderer/                            # 3DGS rasterizer wrapper
-  tools/                                        # Blender/MuJoCo/helper scripts
-  stage2/
-    differentiable_collision_detection.py
-    differentiable_contact_graph.py
-    differentiable_complementarity_free_contact_dynamics.py
-    gaussian_splatting_rendering.py
-    tune_collision_proxy.py
-    _smoke_test_*.py
-```
-
-## Stage 1: Scene Initialization
-
-Stage 1은 multi-view RGB, mask, camera pose, optional SAM2 feature를 받아 spherical Gaussian 표현을
-학습합니다. 목표는 이후 physics stage에서 쓰기 쉬운 object-centric Gaussian representation을 만드는
-것입니다.
-
-### 구현된 내용
-
-- 기본 3D Gaussian Splatting 학습, 렌더, metric 계산
-- isotropic spherical Gaussian 제약
-  - 3축 scale 평균 사용
-  - rotation은 identity에 가깝게 고정
-- geometry / appearance decoupled optimization
-  - alternating optimization
-  - joint optimization 옵션
-- Stage 1 preset
-  - `--stage1_preset contactwm`
-  - SG-GS strict mode
-  - SAM feature 필수화
-  - geometry RGB pressure 제어
-  - densification 조기 종료
-  - 후반 appearance refine
-- SAM2 feature supervision
-  - `.npy` feature map 로딩
-  - `--geometry_feature_dim`으로 3채널 이상 supervision 지원
-- object mask prior supervision
-  - `--masks_dir`
-  - foreground mask BCE + L1 loss
-- per-Gaussian learned foreground score
-  - `foreground_logit`
-  - checkpoint / PLY save-load round trip
-  - foreground score render
-  - foreground threshold render
-- object id 저장 / 복구 / PLY export
-- manual / automatic object grouping
+- multi-view RGB/mask 기반 3D Gaussian Splatting 학습
+- spherical Gaussian 제약
+- foreground/object-aware Gaussian field
+- object mask supervision
+- optional SAM feature supervision
 - visual hull seed initialization
-- masked COLMAP preprocessing path
-- physics export용 metadata 생성
-- densification statistics logging
+- object id 저장/복구 및 physics export
+- reproducible training preset/schedule runner
 
-### Stage 1 입력
-
-지원하는 대표 입력 구조는 Blender/NeRF-style synthetic dataset입니다.
+주요 파일:
 
 ```text
-<scene>/
-  images/
-    train/
-    test/
-  masks/
-    train/
-    test/
-  transforms_train.json
-  transforms_test.json
-  points3d.ply
-  visual_hull/
-    visual_hull.ply
+gaussian_initiailization/train.py
+gaussian_initiailization/render.py
+gaussian_initiailization/metrics.py
+gaussian_initiailization/export_physics_scene.py
+gaussian_initiailization/stage1_training_presets.json
+gaussian_initiailization/tools/run_stage1_training_schedule.py
 ```
 
-COLMAP 형식도 일부 지원합니다.
+### Stage 2: Differentiable Collision And Dynamics
+
+- spherical Gaussian union SDF collision detection
+- aggregate contact patch selection
+- rigid Gaussian body pose transform
+- broad phase collision filtering
+- pairwise/multibody contact dynamics
+- differentiable impedance contact
+- Coulomb-style friction cone projection
+- learnable initial velocity, physics parameter, and geometry refinement
+- MuJoCo rollout comparison
+- mask/RGB/Gaussian renderer based fitting hooks
+- automated multi-variant evaluation
+
+주요 파일:
 
 ```text
-<scene>/
-  images/
-  sparse/0/
-    cameras.bin or cameras.txt
-    images.bin or images.txt
+gaussian_initiailization/stage2/differentiable_collision_detection.py
+gaussian_initiailization/stage2/differentiable_contact_graph.py
+gaussian_initiailization/stage2/differentiable_complementarity_free_contact_dynamics.py
+gaussian_initiailization/stage2/renderable_gaussian_asset.py
+gaussian_initiailization/stage2/differentiable_gaussian_render_loss.py
+gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py
+gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py
+gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py
 ```
 
-### Stage 1 사용 예시
+## 빠른 실행
 
-MuJoCo synthetic dataset 생성:
+### Stage 1 Schedule Dry Run
+
+실제 학습을 돌리기 전에 어떤 명령이 실행되는지 확인합니다.
 
 ```bash
-MUJOCO_GL=egl conda run -n mujoco python gaussian_initiailization/generate_mujoco_synthetic_dataset.py \
-  --output_root gaussian_initiailization/output/mujoco_data \
-  --scene_name box_eval_v24_t8_r512 \
-  --object_type box \
-  --train_views 24 \
-  --test_views 8 \
-  --width 512 \
-  --height 512
+python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+  --preset dice_smoke \
+  --dry_run
 ```
 
-visual hull seed 생성:
+ContactGaussian-WM 스타일 preset은 SAM feature가 필요합니다.
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/build_visual_hull.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
-  --grid_resolution 128 \
-  --max_points 200000
+python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+  --preset contactwm_smoke \
+  --dry_run \
+  --print_json
 ```
 
-SAM2 feature 추출:
+### Stage 1 Smoke Schedule
 
 ```bash
-conda run -n sam2cpu python gaussian_initiailization/extract_sam2_features.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --output_dir sam_features_sam2 \
-  --output_channels 9 \
-  --feature_source high_res0
+python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+  --preset dice_smoke
 ```
 
-Stage 1 학습:
+이 runner는 `--python`과 `--mujoco_python`에 shell command가 아니라 Python executable 경로를 받습니다. Conda 환경을 분리해서 쓰는 경우에는 dataset 생성, train, render 단계를 따로 실행하거나 각 환경의 Python 실행 파일 경로를 넘겨야 합니다.
+
+### Multi-Dice MuJoCo Dataset
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/train.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --model_path gaussian_initiailization/output/stage1_box_contactwm \
-  --images images \
-  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
-  --sam_features sam_features_sam2 \
-  --geometry_feature_dim 9 \
-  --sam_feature_weight 0.1 \
-  --object_mask_weight 1.0 \
-  --object_mask_bce_weight 2.0 \
-  --init_mode visual_hull \
-  --init_ply_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/visual_hull/visual_hull.ply \
-  --stage1_preset contactwm \
-  --iterations 10000 \
-  --eval \
-  --disable_viewer
-```
-
-렌더:
-
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/render.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --model_path gaussian_initiailization/output/stage1_box_contactwm \
-  --images images \
-  --masks_dir gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512/masks \
-  --sam_features sam_features_sam2 \
-  --geometry_feature_dim 9 \
-  --iteration 10000 \
-  --skip_train \
-  --eval
-```
-
-foreground threshold render:
-
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/render.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --model_path gaussian_initiailization/output/stage1_box_contactwm \
-  --iteration 10000 \
-  --skip_train \
-  --eval \
-  --foreground_threshold 0.5
-```
-
-physics export:
-
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/export_physics_scene.py \
-  --source_path gaussian_initiailization/output/mujoco_data/box_eval_v24_t8_r512 \
-  --model_path gaussian_initiailization/output/stage1_box_contactwm \
-  --iteration 10000
-```
-
-## Stage 2: Collision And Dynamics
-
-Stage 2는 Stage 1에서 얻은 spherical Gaussian proxy를 이용해 differentiable collision detection과
-contact dynamics를 구성하는 실험 코드입니다.
-
-### 구현된 내용
-
-Collision detection:
-
-- spherical Gaussian union SDF
-  - primitive distance
-  - LogSumExp smooth min
-  - sigmoid-blended inside penalty
-  - analytic surface normal
-- `evaluate_gaussian_union_sdf(...)`
-  - `(Q, 3)` query 지원
-  - `(B, Q, 3)` batch query 지원
-  - `(G, 3)` / `(B, G, 3)` Gaussian centers 지원
-- `aggregate_gaussian_union_contacts(...)`
-  - batch별 aggregate contact
-  - top-k / spatial contact patch 선택
-- `GaussianCollisionBody`
-  - local Gaussian proxy
-  - optional local query points
-  - quaternion / rotation matrix pose transform
-  - world bounding sphere
-  - world AABB
-- `DifferentiableCollisionEngine`
-  - world query vs Gaussian body contact
-  - object-object bidirectional contact
-  - bounding sphere / AABB broad phase
-- `BodyPairContacts`
-  - `a_to_b`, `b_to_a`
-  - merged `patch_points`
-  - `patch_normals`
-  - `patch_weights`
-  - `patch_penetrations`
-  - `patch_signed_distances`
-
-Contact dynamics:
-
-- 기존 floor/sphere smoke dynamics 유지
-- `ImpedanceFloorContactDynamics`
-  - paper-style frictionless one-pair impedance contact
-- `RigidBodyState`
-  - position
-  - quaternion
-  - linear velocity
-  - angular velocity
-- `PairwiseGaussianBodyImpedanceDynamics`
-  - object-object multi-contact patch 사용
-  - patch별 impedance force
-  - patch별 tangent basis / tangential velocity diagnostics
-  - Coulomb-limited tangential damping force
-  - diagonal 또는 full 3x3 inertia tensor 기반 angular update
-  - linear velocity update
-  - torque / angular velocity update
-  - quaternion integration
-  - dynamic/static body option
-
-### Stage 2 사용 예시
-
-cube-floor collision detection smoke:
-
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_cube_floor_collision.py \
+conda run -n mujoco python gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py \
+  --output_root actual_multi_dice_mujoco \
+  --scene_name demo_codex \
+  --num_dice 3 \
   --frames 120 \
-  --query_resolution 17 \
-  --proxy_resolution 5 \
-  --num_contact_patches 4
+  --width 256 \
+  --height 256
 ```
 
-collision proxy tuning sweep:
+### Stage 2 Rollout Comparison
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/tune_collision_proxy.py \
-  --proxy_resolutions 3,4,5,6,7 \
-  --radius_scales 0.70,0.85,1.00,1.15,1.30 \
-  --query_resolution 17
+conda run -n gaussian_splatting python gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
+  --trajectory actual_multi_dice_mujoco/demo_codex/trajectory.json \
+  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
+  --output_dir actual_stage2_comparison/demo_codex \
+  --dynamics_backend stage2_impedance \
+  --fit_iters 40 \
+  --fit_physics_iters 40 \
+  --fit_geometry_radii \
+  --fit_geometry_centers \
+  --stage2_static_friction 0.4
 ```
 
-결과:
+### Stage 2 Variant Evaluation
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
+  --trajectory actual_multi_dice_mujoco/demo_codex/trajectory.json \
+  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
+  --output_root actual_stage2_eval/demo_codex \
+  --variants impulse stage2 velocity_fit physics_fit \
+  --max_frames 100
+```
+
+결과는 variant별 output directory와 함께 아래 파일로 저장됩니다.
 
 ```text
-gaussian_initiailization/stage2/_outputs/cube_floor_collision/
-  cube_floor_collision_summary.json
-  cube_floor_collision_frames.json
-  cube_floor_collision_plot.png
-
-gaussian_initiailization/stage2/_outputs/collision_proxy_tuning/
-  collision_proxy_tuning_summary.json
-  collision_proxy_tuning_results.csv
+multi_dice_stage2_variant_report.json
+multi_dice_stage2_variant_report.csv
 ```
 
-object-object pairwise dynamics smoke:
+## Gaussian Renderer Loss
+
+Stage 2 pose trajectory를 Gaussian renderer로 렌더링하고 RGB supervision loss를 걸 수 있는 hook이 구현되어 있습니다.
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_contact_dynamics.py
+conda run -n gaussian_splatting python gaussian_initiailization/tools/render_stage2_gaussian_pose_smoke.py \
+  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
+  --output_path actual_stage2_render/pose_smoke.png \
+  --device cuda
 ```
 
-multi-object pairwise contact graph smoke:
+주의: `diff-gaussian-rasterization` 기반 renderer는 CUDA가 필요합니다. CPU-only 환경에서는 renderer backward까지 검증할 수 없습니다.
 
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_contact_graph.py
-```
+## 검증한 항목
 
-MuJoCo bouncing ball GT fit smoke:
+최근 smoke 기준으로 확인한 항목입니다.
 
-```bash
-conda run -n mujoco python gaussian_initiailization/stage2/_smoke_test_mujoco_bouncing_ball_fit.py \
-  --mode generate_gt \
-  --output_dir gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit
+- Python syntax compile
+- Gaussian union SDF와 aggregate contact gradient
+- pairwise/multibody contact dynamics rollout
+- friction cone projection gradient
+- geometry refinement parameter save/load
+- Stage 2 evaluator dry/smoke run
+- Stage 1 schedule dry run
 
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_mujoco_bouncing_ball_fit.py \
-  --mode fit \
-  --gt_json gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit/mujoco_bouncing_ball_trajectory.json \
-  --output_dir gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit
-```
-
-pairwise MuJoCo GT comparison:
-
-```bash
-conda run -n mujoco python gaussian_initiailization/stage2/_smoke_test_pairwise_mujoco_compare.py \
-  --mode generate_gt \
-  --output_dir gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare
-
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_mujoco_compare.py \
-  --mode compare \
-  --gt_json gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare/mujoco_pairwise_gt_trajectory.json \
-  --output_dir gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare
-```
-
-결과:
-
-```text
-gaussian_initiailization/stage2/_outputs/pairwise_contact_dynamics/
-  pairwise_contact_dynamics_summary.json
-  pairwise_contact_dynamics_frames.json
-  pairwise_contact_dynamics_plot.png
-  pairwise_contact_dynamics_rollout_plot.png
-
-gaussian_initiailization/stage2/_outputs/pairwise_contact_graph/
-  pairwise_contact_graph_summary.json
-
-gaussian_initiailization/stage2/_outputs/mujoco_bouncing_ball_fit/
-  mujoco_bouncing_ball_trajectory.json
-  stage2_bouncing_ball_fit_summary.json
-  stage2_bouncing_ball_fit_frames.json
-  stage2_bouncing_ball_fit_plot.png
-
-gaussian_initiailization/stage2/_outputs/pairwise_mujoco_compare/
-  mujoco_pairwise_gt_trajectory.json
-  pairwise_mujoco_compare_summary.json
-  pairwise_mujoco_compare_frames.json
-  pairwise_mujoco_compare_plot.png
-```
-
-검증된 항목:
-
-- contact patch 생성
-- broad phase overlap
-- patch별 impedance force
-- linear/angular update
-- finite gradient
-
-직접 API 사용 예시:
-
-```python
-import torch
-
-from gaussian_initiailization.stage2.differentiable_collision_detection import (
-    CollisionEngineConfig,
-    DifferentiableCollisionEngine,
-    GaussianCollisionBody,
-    make_box_surface_query_points,
-)
-from gaussian_initiailization.stage2.differentiable_complementarity_free_contact_dynamics import (
-    PairwiseGaussianBodyImpedanceDynamics,
-    PairwiseImpedanceDynamicsConfig,
-    RigidBodyState,
-)
-
-queries = make_box_surface_query_points([0.1, 0.1, 0.1], grid_resolution=3)
-radii = torch.full((queries.shape[0],), 0.025)
-body = GaussianCollisionBody(queries, radii, queries)
-
-engine = DifferentiableCollisionEngine(CollisionEngineConfig(num_contact_patches=4))
-contacts = engine.body_pair_contacts(
-    body,
-    torch.tensor([0.0, 0.0, 0.0]),
-    body,
-    torch.tensor([0.15, 0.0, 0.0]),
-)
-
-dynamics = PairwiseGaussianBodyImpedanceDynamics(
-    body,
-    body,
-    stiffness=torch.tensor(250.0),
-    damping=torch.tensor(10.0),
-    config=PairwiseImpedanceDynamicsConfig(gravity=(0.0, 0.0, 0.0)),
-)
-
-state_a = RigidBodyState(
-    position=torch.tensor([0.0, 0.0, 0.0]),
-    quaternion_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0]),
-    linear_velocity=torch.tensor([1.0, 0.0, 0.0]),
-    angular_velocity=torch.zeros(3),
-)
-state_b = RigidBodyState(
-    position=torch.tensor([0.15, 0.0, 0.0]),
-    quaternion_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0]),
-    linear_velocity=torch.zeros(3),
-    angular_velocity=torch.zeros(3),
-)
-
-next_a, next_b, diagnostics = dynamics.step(state_a, state_b)
-```
-
-## Current Verification
-
-최근 확인한 smoke tests:
+대표 검증 명령:
 
 ```bash
 python -m py_compile \
   gaussian_initiailization/stage2/differentiable_collision_detection.py \
   gaussian_initiailization/stage2/differentiable_complementarity_free_contact_dynamics.py \
-  gaussian_initiailization/stage2/_smoke_test_cube_floor_collision.py \
-  gaussian_initiailization/stage2/_smoke_test_pairwise_contact_dynamics.py
+  gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
+  gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
+  gaussian_initiailization/tools/run_stage1_training_schedule.py
 ```
 
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_cube_floor_collision.py \
-  --frames 20 \
-  --query_resolution 9 \
-  --proxy_resolution 4 \
-  --num_contact_patches 4
-```
+## Git에 올리지 않는 파일
 
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_pairwise_contact_dynamics.py
-```
-
-현재 smoke 기준으로는 collision patch, broad phase, pairwise dynamics, gradient가 정상 출력됩니다.
-cube analytic SDF 대비 Gaussian union SDF 오차는 `tune_collision_proxy.py`로 radius scale / proxy
-resolution sweep을 돌려 후보를 고를 수 있습니다.
-
-## TODO
-
-### P0
-
-완료:
-
-- pairwise dynamics 결과를 MuJoCo GT trajectory와 비교
-- Stage 2 pairwise dynamics를 `tools/run_stage2_mujoco_stage1_fit.py`에 mode로 연결
-- Stage 1 실제 PLY에서 `GaussianCollisionBody`를 구성하는 helper 추가
-- collision proxy tuning
-  - radius scale sweep
-  - proxy resolution sweep
-  - foreground score / opacity 기반 primitive filtering
-- object-object dynamics smoke를 여러 step rollout으로 확장
-
-### P1
-
-완료:
-
-- broad phase를 bounding sphere에서 AABB / spatial hash로 확장
-  - `CollisionEngineConfig.broad_phase_mode`에 `sphere` / `aabb` 지원
-  - `GaussianCollisionBody.world_aabb()` 추가
-  - contact graph에서 `candidate_pair_mode="spatial_hash"` 지원
-  - `tools/run_stage2_mujoco_stage1_fit.py`에 `--pairwise_broad_phase_mode` 추가
-- multi-object scene에서 pairwise contact graph 구성
-  - `stage2/differentiable_contact_graph.py` 추가
-  - multi-body node / pairwise edge / adjacency matrix / active edge serialization 지원
-  - `_smoke_test_pairwise_contact_graph.py`로 3-body graph와 gradient 연결 검증
-- quaternion / angular velocity fit loop 연결
-  - `tools/run_stage2_mujoco_stage1_fit.py`의 `pairwise_impedance` mode가 trajectory의 `quaternion_wxyz` / `angular_velocity`를 읽음
-  - `--orientation_loss_weight`, `--fit_initial_angular_velocity`, `--angular_velocity_l2_weight` 추가
-  - `predicted_trajectory.json`에 target/predicted quaternion 기록
-- inertia tensor를 diagonal 이상으로 확장
-- friction Jacobian 추가
-- tangential damping / Coulomb-like friction approximation 추가
-
-### P2
-
-- foreground/background 분리 품질 metric 추가
-  - mask IoU
-  - precision / recall
-  - threshold sweep
-  - foreground histogram
-- Stage 1 visual hull bounds 개선
-  - object bounds 수동 지정
-  - mask ray 기반 bounds 추정
-- Stage 1 output quality report 자동 생성
-- train + render + metrics + physics export 통합 runner 정리
-
-### P3
-
-- differentiable image loss 연결
-- real-world video 입력 지원 강화
-- multi-instance object-aware Gaussian 학습
-- ContactGaussian-WM paper 전체 pipeline과 실험표 정렬
-
-## Demo 실행 방법
-
-`run_demo.ps1`로 Stage 1 학습부터 side-by-side 비교 GIF 생성까지 한 번에 실행할 수 있다.
-
-### 구체(sphere) 튀기 데모 (기본값)
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1
-```
-
-기본값이 `sphere_demo`로 설정되어 있다. 구체가 바닥에서 여러 번 튀는 상황을 MuJoCo GT와 Stage 2 예측이 얼마나 일치하는지 비교한다.
-
-### 박스(box) 데모
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 `
-    -SceneName box_demo -ObjectType box -ForegroundThreshold 0.55
-```
-
-### 빠른 테스트 (Stage 1 낮은 iter, 결과 품질 낮음)
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 `
-    -Stage1Iters 2000 -Stage2FitIters 100
-```
-
-### Stage 1 재사용 (이미 학습된 모델이 있을 때)
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -SkipStage1
-```
-
-### 결과물 위치
+다음 파일/폴더는 실험 결과물 또는 재생성 가능한 캐시라서 `.gitignore`에 포함되어 있습니다.
 
 ```text
-demo_output\sphere_demo_stage2_fit\
-  comparison_gt_vs_3dgs.gif   ← 메인 결과 (GT vs 3DGS side-by-side)
-  gt_episode.gif              ← MuJoCo ground truth 영상
-  stage2_fit_follow_view.gif  ← 위치 trajectory 비교
-  fit_summary.json            ← 학습된 물리 파라미터 (restitution 등)
+__pycache__/
+*.pyc
+actual_*/
+gaussian_initiailization/output/
+gaussian_initiailization/stage2/_outputs/
+gaussian_initiailization/sam_features_sam2/
+gaussian_initiailization/**/visual_hull/
+gaussian_initiailization/**/physics_export/
+gaussian_initiailization/**/build/
 ```
 
-### Prerequisites
+학습된 모델 checkpoint, 렌더 결과, MuJoCo rollout, evaluation report는 필요한 경우 별도 artifact storage에 보관하는 것을 권장합니다.
 
-**환경 설치 (처음 한 번만):**
+## 현재 한계
 
-```powershell
-# 1. conda 환경 생성
-conda env create -f environment.yml
+- ContactGaussian-WM 논문의 전체 공식 pipeline 재현은 아닙니다.
+- Stage 1의 SAM feature supervision은 데이터셋에 precomputed feature map이 있어야 합니다.
+- Gaussian renderer loss는 CUDA 환경에서만 실제 backward 검증이 가능합니다.
+- real-world video 입력과 논문 표 수준의 benchmark 자동화는 아직 정리 중입니다.
 
-# 2. 환경 이름 확인 후 활성화 (기본: cg-wm)
-conda activate cg-wm
+## 브랜치 업로드 예시
+
+```bash
+git switch -c contactgaussian-wm-stage1-stage2
+git add -u
+git add \
+  gaussian_initiailization/stage1_training_presets.json \
+  gaussian_initiailization/stage2/differentiable_gaussian_render_loss.py \
+  gaussian_initiailization/stage2/renderable_gaussian_asset.py \
+  gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
+  gaussian_initiailization/tools/render_stage2_gaussian_pose_smoke.py \
+  gaussian_initiailization/tools/render_stage2_gaussian_trajectory.py \
+  gaussian_initiailization/tools/run_stage1_training_schedule.py \
+  gaussian_initiailization/tools/smoke_stage2_gaussian_render_loss_backward.py
+git commit -m "Implement ContactGaussian-WM stage1 stage2 prototype"
+git push -u origin contactgaussian-wm-stage1-stage2
 ```
-
-환경 이름이 다르면 `-CondaEnv` 파라미터로 지정:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 -CondaEnv cg-wm
-```
-
-**요구 사항:**
-- Windows, PowerShell 5.1 이상
-- NVIDIA GPU (VRAM 8GB 이상 권장, CUDA 11.8)
-- Visual Studio Build Tools (submodule CUDA 빌드용)
-
----
-
-## Git / Output Policy
-
-커밋 대상:
-
-- source code
-- root `README.md`
-- lightweight config files
-
-커밋 제외 대상:
-
-- `gaussian_initiailization/output/`
-- `gaussian_initiailization/stage2/_outputs/`
-- `sam_features_sam2/`
-- `masked_colmap/`
-- `visual_hull/`
-- `physics_export/`
-- checkpoint, render image, GIF, PNG, NPZ, cache, `__pycache__`

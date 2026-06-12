@@ -8,7 +8,7 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep", default=0.002, type=float)
     parser.add_argument("--mujoco_gl", default="glfw", choices=("glfw", "egl", "osmesa"))
     parser.add_argument("--seed", default=11, type=int)
+    parser.add_argument(
+        "--skip_render",
+        action="store_true",
+        help="Run MuJoCo physics and write trajectory/top-down GIF without requiring an OpenGL renderer.",
+    )
     return parser.parse_args()
 
 
@@ -265,6 +270,63 @@ def save_masks(segmentation: np.ndarray, geom_ids_by_die: dict[int, list[int]], 
     Image.fromarray(union, mode="L").save(masks_root / "all" / f"{stem}.png")
 
 
+def quat_wxyz_to_rotmat_xy(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = (float(v) for v in quat)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def draw_topdown_frame(frame: dict, *, half: float, size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    image = Image.new("RGB", (width, height), (245, 245, 242))
+    pixels = image.load()
+    tile = 28
+    for y in range(0, height, tile):
+        for x in range(0, width, tile):
+            if ((x // tile) + (y // tile)) % 2 == 0:
+                for yy in range(y, min(y + tile, height)):
+                    for xx in range(x, min(x + tile, width)):
+                        pixels[xx, yy] = (235, 235, 230)
+    colors = [
+        (235, 42, 48),
+        (48, 95, 235),
+        (46, 170, 86),
+        (236, 178, 40),
+        (130, 78, 210),
+        (35, 176, 186),
+    ]
+    draw = ImageDraw.Draw(image, "RGBA")
+    bounds = (-0.78, 0.78, -0.72, 0.72)
+
+    def project_xy(point: np.ndarray) -> tuple[float, float]:
+        xmin, xmax, ymin, ymax = bounds
+        px = 28 + (float(point[0]) - xmin) / (xmax - xmin) * (width - 56)
+        py = height - 28 - (float(point[1]) - ymin) / (ymax - ymin) * (height - 56)
+        return px, py
+
+    draw.text((12, 10), f"frame {int(frame.get('frame_index', 0)):03d}  t={float(frame.get('time', 0.0)):.2f}s", fill=(30, 30, 30, 255))
+    for die in frame["dice"]:
+        idx = int(die["die"])
+        pos = np.asarray(die["position"], dtype=np.float64)
+        quat = np.asarray(die["quaternion_wxyz"], dtype=np.float64)
+        rot_xy = quat_wxyz_to_rotmat_xy(quat)
+        corners = []
+        for sx, sy in [(-1, -1), (1, -1), (1, 1), (-1, 1)]:
+            local = np.array([sx * half, sy * half], dtype=np.float64)
+            corner_xy = pos[:2] + rot_xy @ local
+            corners.append(project_xy(corner_xy))
+        color = colors[idx % len(colors)]
+        draw.polygon(corners, fill=(*color, 220), outline=(25, 25, 25, 210))
+        cx, cy = project_xy(pos[:2])
+        draw.text((cx - 4, cy - 7), str(idx), fill=(255, 255, 255, 255))
+    return np.asarray(image, dtype=np.uint8)
+
+
 def main() -> None:
     args = parse_args()
     os.environ["MUJOCO_GL"] = args.mujoco_gl
@@ -287,7 +349,7 @@ def main() -> None:
     rng = np.random.default_rng(int(args.seed))
     initial_states = set_initial_state(model, data, rng, dice_count)
     geom_ids_by_die = die_geom_ids(model, dice_count)
-    renderer = mujoco.Renderer(model, height=int(args.height), width=int(args.width))
+    renderer = None if args.skip_render else mujoco.Renderer(model, height=int(args.height), width=int(args.width))
     steps_per_frame = max(1, int(round(1.0 / (float(args.fps) * float(args.timestep)))))
 
     states = []
@@ -297,6 +359,18 @@ def main() -> None:
             mujoco.mj_step(model, data)
 
         stem = f"{frame_idx:06d}"
+        frame_payload = {
+            "frame_index": frame_idx,
+            "time": float(data.time),
+            "dice": capture_state(model, data, dice_count),
+            "mujoco_contacts": capture_contacts(model, data),
+        }
+        states.append(frame_payload)
+
+        if renderer is None:
+            gif_frames.append(draw_topdown_frame(frame_payload, half=half, size=(int(args.width), int(args.height))))
+            continue
+
         renderer.update_scene(data, camera="cam0")
         rgb = np.asarray(renderer.render(), dtype=np.uint8)[..., :3]
         rgb[(rgb.sum(axis=-1) == 0)] = np.array([248, 248, 244], dtype=np.uint8)
@@ -308,15 +382,6 @@ def main() -> None:
         segmentation = np.asarray(renderer.render(), dtype=np.int32)
         renderer.disable_segmentation_rendering()
         save_masks(segmentation, geom_ids_by_die, masks_root, stem)
-
-        states.append(
-            {
-                "frame_index": frame_idx,
-                "time": float(data.time),
-                "dice": capture_state(model, data, dice_count),
-                "mujoco_contacts": capture_contacts(model, data),
-            }
-        )
 
     gif_path = output_dir / "multi_dice_mujoco_gt.gif"
     imageio.mimsave(gif_path, gif_frames, fps=int(args.fps))
@@ -347,6 +412,7 @@ def main() -> None:
         output_dir / "manifest.json",
         {
             "kind": "mujoco_multi_dice_rollout",
+            "render_mode": "topdown_fallback" if args.skip_render else "mujoco_renderer",
             "rgb_dir": str(rgb_dir),
             "masks_dir": str(masks_root),
             "gif": str(gif_path),

@@ -1,0 +1,135 @@
+{
+  "dice_smoke": {
+    "description": "Fast object-aware Stage1 dice asset smoke schedule.",
+    "dataset": {
+      "object_type": "dice",
+      "train_views": 16,
+      "test_views": 4,
+      "width": 256,
+      "height": 256,
+      "mujoco_gl": "auto",
+      "seed": 0
+    },
+    "training": {
+      "iterations": 3000,
+      "stage1_preset": "none",
+      "object_mask_weight": 0.1,
+      "object_mask_bce_weight": 1.0,
+      "densify_from_iter": 300,
+      "densify_until_iter": 1800,
+      "densification_interval": 100,
+      "opacity_reset_interval": 1000,
+      "test_iterations": [1000, 3000],
+      "save_iterations": [1000, 3000],
+      "disable_viewer": true,
+      "eval": true
+    },
+    "render": {
+      "enabled": true,
+      "iteration": 3000,
+      "skip_train": true
+    },
+    "metrics": {
+      "enabled": true
+    },
+    "export_physics": {
+      "enabled": true,
+      "iteration": 3000,
+      "background_id": 0,
+      "density": 1000.0,
+      "friction": 0.5,
+      "restitution": 0.1
+    }
+  },
+  "dice_full": {
+    "description": "Higher quality object-aware Stage1 dice asset schedule.",
+    "dataset": {
+      "object_type": "dice",
+      "train_views": 72,
+      "test_views": 12,
+      "width": 512,
+      "height": 512,
+      "mujoco_gl": "auto",
+      "seed": 0,
+      "add_pose_jitter": true
+    },
+    "training": {
+      "iterations": 30000,
+      "stage1_preset": "none",
+      "object_mask_weight": 0.1,
+      "object_mask_bce_weight": 1.0,
+      "densify_from_iter": 500,
+      "densify_until_iter": 15000,
+      "densification_interval": 100,
+      "opacity_reset_interval": 3000,
+      "test_iterations": [7000, 15000, 30000],
+      "save_iterations": [7000, 15000, 30000],
+      "disable_viewer": true,
+      "eval": true
+    },
+    "render": {
+      "enabled": true,
+      "iteration": 30000,
+      "skip_train": true
+    },
+    "metrics": {
+      "enabled": true
+    },
+    "export_physics": {
+      "enabled": true,
+      "iteration": 30000,
+      "background_id": 0,
+      "density": 1000.0,
+      "friction": 0.5,
+      "restitution": 0.1
+    }
+  },
+  "contactwm_smoke": {
+    "description": "ContactGaussian-WM-style Stage1 preset. Requires precomputed SAM feature maps.",
+    "dataset": {
+      "object_type": "dice",
+      "train_views": 16,
+      "test_views": 4,
+      "width": 256,
+      "height": 256,
+      "mujoco_gl": "auto",
+      "seed": 0
+    },
+    "training": {
+      "iterations": 3000,
+      "stage1_preset": "contactwm",
+      "sam_features": "sam_features_sam2",
+      "sam_feature_weight": 0.1,
+      "sam_feature_normalization": "per_view_minmax",
+      "object_mask_weight": 0.1,
+      "object_mask_bce_weight": 1.0,
+      "geometry_feature_dim": 3,
+      "stage1_densify_ratio": 0.6,
+      "densify_from_iter": 300,
+      "densify_until_iter": 1800,
+      "densification_interval": 100,
+      "opacity_reset_interval": 1000,
+      "test_iterations": [1000, 3000],
+      "save_iterations": [1000, 3000],
+      "disable_viewer": true,
+      "eval": true
+    },
+    "render": {
+      "enabled": true,
+      "iteration": 3000,
+      "skip_train": true,
+      "foreground_threshold": 0.5
+    },
+    "metrics": {
+      "enabled": true
+    },
+    "export_physics": {
+      "enabled": true,
+      "iteration": 3000,
+      "background_id": 0,
+      "density": 1000.0,
+      "friction": 0.5,
+      "restitution": 0.1
+    }
+  }
+}
