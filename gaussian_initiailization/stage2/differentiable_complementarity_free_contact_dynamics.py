@@ -17,6 +17,40 @@ from .differentiable_collision_detection import (
     detect_sphere_floor_contacts,
 )
 
+DYNAMICS_BACKEND_STAGE2_IMPEDANCE = "stage2_impedance"
+DYNAMICS_BACKEND_IMPULSE_BASELINE = "impulse_baseline"
+DYNAMICS_BACKEND_LEGACY_IMPULSE = "impulse"
+FRICTION_MODEL_SOFT_PROJECTION = "soft_projection"
+FRICTION_MODEL_DUAL_CONE = "dual_cone"
+
+
+def normalize_dynamics_backend(name: str) -> str:
+    """Return the canonical Stage 2 dynamics backend name.
+
+    `stage2_impedance` is the paper-aligned path used for ContactGaussian-WM
+    experiments. `impulse` is accepted as a legacy spelling of the old demo
+    solver and normalized to `impulse_baseline` so summaries do not blur the
+    two dynamics families.
+    """
+
+    if name == DYNAMICS_BACKEND_STAGE2_IMPEDANCE:
+        return DYNAMICS_BACKEND_STAGE2_IMPEDANCE
+    if name in (DYNAMICS_BACKEND_IMPULSE_BASELINE, DYNAMICS_BACKEND_LEGACY_IMPULSE):
+        return DYNAMICS_BACKEND_IMPULSE_BASELINE
+    raise ValueError(
+        "dynamics backend must be one of: "
+        f"{DYNAMICS_BACKEND_STAGE2_IMPEDANCE!r}, {DYNAMICS_BACKEND_IMPULSE_BASELINE!r}."
+    )
+
+
+def validate_friction_model(name: str) -> str:
+    if name in (FRICTION_MODEL_SOFT_PROJECTION, FRICTION_MODEL_DUAL_CONE):
+        return name
+    raise ValueError(
+        "friction_model must be one of: "
+        f"{FRICTION_MODEL_SOFT_PROJECTION!r}, {FRICTION_MODEL_DUAL_CONE!r}."
+    )
+
 
 @dataclass(frozen=True)
 class RigidState:
@@ -77,12 +111,15 @@ def smooth_weighted_max(values: torch.Tensor, temperature: float) -> torch.Tenso
 
 
 class ComplementarityFreeContactDynamics:
-    """A small differentiable contact integrator for floor collisions.
+    """Legacy smooth-correction floor integrator.
 
     The integrator predicts constant-velocity motion, detects soft plane
     penetration at query points, and applies smooth normal position/velocity
-    corrections. It avoids LCP/complementarity branching, which keeps the demo
-    differentiable end-to-end.
+    corrections. Keep this class for smoke tests and the impulse-style
+    baseline; the paper-aligned Stage 2 path starts at
+    :class:`ImpedanceFloorContactDynamics`,
+    :class:`PairwiseGaussianBodyImpedanceDynamics`, or
+    :class:`MultiBodyGaussianImpedanceDynamics`.
     """
 
     def __init__(
@@ -157,7 +194,7 @@ def rollout(
 
 
 class SphereFloorQueryContactDynamics:
-    """Sphere/floor contact dynamics using environment-side floor query points."""
+    """Legacy sphere/floor baseline using environment-side floor query points."""
 
     def __init__(
         self,
@@ -229,6 +266,7 @@ class ImpedanceContactDynamicsConfig:
     smooth_min_temperature: float = 1e-2
     inside_penalty: float = 0.02
     inside_sharpness: float = 50.0
+    normal_mode: str = "phi_soft"
     query_radius_floor: float = 0.0
 
 
@@ -250,6 +288,7 @@ class PairwiseImpedanceDynamicsConfig:
     smooth_min_temperature: float = 1e-2
     inside_penalty: float = 0.02
     inside_sharpness: float = 50.0
+    normal_mode: str = "phi_soft"
     num_contact_patches: int = 4
     broad_phase_margin: float = 0.02
     broad_phase_mode: str = "sphere"
@@ -261,6 +300,8 @@ class PairwiseImpedanceDynamicsConfig:
     tangential_damping: float = 0.0
     friction_softness: float = 1e-6
     friction_transition_velocity: float = 1e-3
+    friction_model: str = FRICTION_MODEL_SOFT_PROJECTION
+    friction_num_directions: int = 8
 
 
 @dataclass(frozen=True)
@@ -276,6 +317,7 @@ class MultiBodyImpedanceDynamicsConfig:
     smooth_min_temperature: float = 1e-2
     inside_penalty: float = 0.02
     inside_sharpness: float = 50.0
+    normal_mode: str = "phi_soft"
     num_contact_patches: int = 4
     broad_phase_margin: float = 0.02
     broad_phase_mode: str = "aabb"
@@ -290,10 +332,17 @@ class MultiBodyImpedanceDynamicsConfig:
     tangential_damping: float = 0.0
     friction_softness: float = 1e-6
     friction_transition_velocity: float = 1e-3
+    friction_model: str = FRICTION_MODEL_SOFT_PROJECTION
+    friction_num_directions: int = 8
 
 
 class GaussianUnionFloorContactDynamics:
-    """Contact dynamics using floor queries against spherical Gaussian collision geometry."""
+    """Legacy floor baseline using floor queries against Gaussian geometry.
+
+    This keeps the differentiable Gaussian SDF but still applies smooth
+    velocity/position corrections. Use :class:`ImpedanceFloorContactDynamics`
+    for the paper-aligned floor contact model.
+    """
 
     def __init__(
         self,
@@ -438,18 +487,27 @@ def _friction_cone_forces(
     weights: torch.Tensor,
     normal_lambdas: torch.Tensor,
     *,
+    tangent_1: torch.Tensor,
+    tangent_2: torch.Tensor,
     tangential_damping: torch.Tensor,
     dynamic_mu: torch.Tensor,
     static_mu: torch.Tensor | None,
     friction_softness: float,
     transition_velocity: float,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Soft Coulomb cone projection for tangential damping forces.
+    friction_model: str = FRICTION_MODEL_SOFT_PROJECTION,
+    num_directions: int = 8,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Differentiable Coulomb-style tangential forces.
 
-    Inside the cone, the raw damping force is kept nearly unchanged (sticking).
-    Outside the cone, it is smoothly projected onto ``||f_t|| <= mu * lambda_n``
-    along the opposite slip direction (sliding).
+    ``soft_projection`` keeps the historical radial projection path. ``dual_cone``
+    approximates the friction cone with tangent-plane facet directions and
+    smoothly distributes the raw damping force over those facet forces before
+    applying the same Coulomb budget.
     """
+
+    friction_model = validate_friction_model(friction_model)
+    if friction_model == FRICTION_MODEL_DUAL_CONE and num_directions < 4:
+        raise ValueError("num_directions must be at least 4 for facet friction.")
 
     raw_friction = -tangential_damping * weights.unsqueeze(-1) * tangential_velocity
     raw_norm = torch.linalg.norm(raw_friction, dim=-1, keepdim=True)
@@ -463,19 +521,68 @@ def _friction_cone_forces(
         effective_mu = dynamic_mu + (torch.clamp(static_mu, min=dynamic_mu) - dynamic_mu) * static_gate
     cone_radius = effective_mu * normal_lambdas.unsqueeze(-1)
     softness = max(float(friction_softness), 1e-12)
+    cone_violation = raw_norm - cone_radius
     sliding_gate = torch.sigmoid((raw_norm - cone_radius) / softness)
-    projected_scale = cone_radius / torch.clamp(raw_norm, min=1e-12)
-    scale = (1.0 - sliding_gate) + sliding_gate * projected_scale
-    friction = raw_friction * scale
+
+    if friction_model == FRICTION_MODEL_SOFT_PROJECTION:
+        projected_scale = cone_radius / torch.clamp(raw_norm, min=1e-12)
+        scale = (1.0 - sliding_gate) + sliding_gate * projected_scale
+        friction = raw_friction * scale
+        facet_directions = None
+        facet_coefficients = None
+        facet_alignments = None
+        facet_budget = None
+        facet_budget_scale = None
+        facet_reconstruction_error = torch.zeros_like(raw_norm)
+    else:
+        angles = torch.linspace(
+            0.0,
+            2.0 * torch.pi,
+            int(num_directions) + 1,
+            dtype=raw_friction.dtype,
+            device=raw_friction.device,
+        )[:-1]
+        facet_directions = (
+            torch.cos(angles).view(*((1,) * (tangent_1.ndim - 1)), -1, 1) * tangent_1.unsqueeze(-2)
+            + torch.sin(angles).view(*((1,) * (tangent_2.ndim - 1)), -1, 1) * tangent_2.unsqueeze(-2)
+        )
+        facet_alignments = torch.sum(raw_friction.unsqueeze(-2) * facet_directions, dim=-1)
+        angular_temperature = max(softness, 1e-4)
+        facet_weights = torch.softmax(facet_alignments / angular_temperature, dim=-1)
+        raw_facet_coefficients = raw_norm * facet_weights
+        facet_budget = torch.sum(raw_facet_coefficients, dim=-1, keepdim=True)
+        projected_scale = cone_radius / torch.clamp(facet_budget, min=1e-12)
+        scale = (1.0 - sliding_gate) + sliding_gate * projected_scale
+        facet_coefficients = raw_facet_coefficients * scale
+        friction = torch.sum(facet_coefficients.unsqueeze(-1) * facet_directions, dim=-2)
+        facet_budget_scale = scale.squeeze(-1)
+        facet_reconstruction_error = torch.linalg.norm(friction - raw_friction * scale, dim=-1, keepdim=True)
+
+    friction_norm = torch.linalg.norm(friction, dim=-1, keepdim=True)
     diagnostics = {
+        "friction_model": friction_model,
         "raw_friction_force": raw_friction,
         "raw_friction_norm": raw_norm.squeeze(-1),
+        "raw_tangent_force": raw_friction,
+        "raw_tangent_force_norm": raw_norm.squeeze(-1),
         "friction_cone_radius": cone_radius.squeeze(-1),
+        "friction_cone_violation": cone_violation.squeeze(-1),
         "friction_cone_scale": scale.squeeze(-1),
         "friction_sliding_gate": sliding_gate.squeeze(-1),
+        "friction_sticking_gate": (1.0 - sliding_gate).squeeze(-1),
+        "friction_inside_cone": raw_norm.squeeze(-1) <= cone_radius.squeeze(-1),
         "friction_static_gate": static_gate.squeeze(-1),
         "effective_friction_coefficient": torch.as_tensor(effective_mu, dtype=raw_friction.dtype, device=raw_friction.device),
         "slip_speed": slip_speed.squeeze(-1),
+        "friction_force_norm": friction_norm.squeeze(-1),
+        "friction_force_to_cone_radius_ratio": friction_norm.squeeze(-1) / torch.clamp(cone_radius.squeeze(-1), min=1e-12),
+        "friction_num_directions": int(num_directions),
+        "friction_facet_directions": facet_directions,
+        "friction_facet_coefficients": facet_coefficients,
+        "friction_facet_alignments": facet_alignments,
+        "friction_facet_budget": None if facet_budget is None else facet_budget.squeeze(-1),
+        "friction_facet_budget_scale": facet_budget_scale,
+        "friction_facet_reconstruction_error": facet_reconstruction_error.squeeze(-1),
     }
     return friction, diagnostics
 
@@ -511,6 +618,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
                 smooth_min_temperature=self.config.smooth_min_temperature,
                 inside_penalty=self.config.inside_penalty,
                 inside_sharpness=self.config.inside_sharpness,
+                normal_mode=self.config.normal_mode,
                 num_contact_patches=self.config.num_contact_patches,
                 broad_phase_margin=self.config.broad_phase_margin,
                 broad_phase_mode=self.config.broad_phase_mode,
@@ -544,8 +652,9 @@ class PairwiseGaussianBodyImpedanceDynamics:
         state_a: RigidBodyState,
         state_b: RigidBodyState,
         contacts: BodyPairContacts,
-    ) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
+    ) -> tuple[RigidBodyState, RigidBodyState, dict[str, object]]:
         cfg = self.config
+        validate_friction_model(str(cfg.friction_model))
         dtype = state_a.position.dtype
         device = state_a.position.device
 
@@ -577,6 +686,8 @@ class PairwiseGaussianBodyImpedanceDynamics:
             tangential_velocity,
             weights,
             lambdas,
+            tangent_1=tangent_1,
+            tangent_2=tangent_2,
             tangential_damping=torch.as_tensor(float(cfg.tangential_damping), dtype=dtype, device=device),
             dynamic_mu=torch.as_tensor(float(cfg.friction_coefficient), dtype=dtype, device=device),
             static_mu=(
@@ -586,6 +697,8 @@ class PairwiseGaussianBodyImpedanceDynamics:
             ),
             friction_softness=float(cfg.friction_softness),
             transition_velocity=float(cfg.friction_transition_velocity),
+            friction_model=str(cfg.friction_model),
+            num_directions=int(cfg.friction_num_directions),
         )
         forces = normal_forces + friction_forces
         total_force = torch.sum(forces, dim=-2)
@@ -646,7 +759,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
         }
         return next_a, next_b, diagnostics
 
-    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
+    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, dict[str, object]]:
         predicted_a = self._predict_free(state_a, mass=self.config.mass_a, dynamic=self.config.dynamic_a)
         predicted_b = self._predict_free(state_b, mass=self.config.mass_b, dynamic=self.config.dynamic_b)
         contacts = self.collision_engine.body_pair_contacts(
@@ -666,7 +779,10 @@ class MultiBodyGaussianImpedanceDynamics:
     This is the multi-object counterpart to
     :class:`PairwiseGaussianBodyImpedanceDynamics`: it predicts free motion once
     for every body, builds the Stage 2 pairwise contact graph, then accumulates
-    the same impedance/friction patch forces over all active graph edges.
+    the same impedance/friction patch forces over all candidate graph edges.
+    Non-contact edges stay in the computation and are softly gated by the
+    differentiable patch weights instead of being removed by a Python-side
+    contact threshold.
     """
 
     def __init__(
@@ -754,6 +870,7 @@ class MultiBodyGaussianImpedanceDynamics:
         from .differentiable_contact_graph import build_pairwise_contact_graph
 
         cfg = self.config
+        validate_friction_model(str(cfg.friction_model))
         masses = self._masses()
         inertia_diags = self._inertia_diags()
         dynamic_flags = self._dynamic_flags()
@@ -771,12 +888,13 @@ class MultiBodyGaussianImpedanceDynamics:
                 smooth_min_temperature=float(cfg.smooth_min_temperature),
                 inside_penalty=float(cfg.inside_penalty),
                 inside_sharpness=float(cfg.inside_sharpness),
+                normal_mode=str(cfg.normal_mode),
                 num_contact_patches=int(cfg.num_contact_patches),
                 broad_phase_margin=float(cfg.broad_phase_margin),
                 broad_phase_mode=str(cfg.broad_phase_mode),
                 patch_selection=str(cfg.patch_selection),
             ),
-            include_inactive=False,
+            include_inactive=True,
             contact_threshold=float(cfg.contact_threshold),
         )
 
@@ -811,9 +929,11 @@ class MultiBodyGaussianImpedanceDynamics:
             else torch.as_tensor(float(cfg.static_friction_coefficient), dtype=dtype, device=device)
         )
         active_edges = []
+        candidate_edges = []
+        edge_gates = []
         lambda_terms = []
         friction_terms = []
-        for edge in graph.active_edges(contact_threshold=float(cfg.contact_threshold)):
+        for edge in graph.edges:
             contacts = edge.contacts
             i, j = int(edge.body_i), int(edge.body_j)
             state_i = predicted[i]
@@ -839,11 +959,15 @@ class MultiBodyGaussianImpedanceDynamics:
                 tangential_velocity,
                 weights,
                 lambdas,
+                tangent_1=tangent_1,
+                tangent_2=tangent_2,
                 tangential_damping=tangential_damping,
                 dynamic_mu=mu,
                 static_mu=static_mu,
                 friction_softness=float(cfg.friction_softness),
                 transition_velocity=float(cfg.friction_transition_velocity),
+                friction_model=str(cfg.friction_model),
+                num_directions=int(cfg.friction_num_directions),
             )
             patch_forces = normal_forces + friction
             total_force_on_i = torch.sum(patch_forces, dim=-2)
@@ -853,11 +977,16 @@ class MultiBodyGaussianImpedanceDynamics:
             force_accum[j] = force_accum[j] - total_force_on_i
             torque_accum[i] = torque_accum[i] + torque_on_i
             torque_accum[j] = torque_accum[j] + torque_on_j
-            active_edges.append((i, j))
+            edge_gate = torch.max(weights)
+            candidate_edges.append((i, j))
+            edge_gates.append(edge_gate)
+            if bool((edge_gate > float(cfg.contact_threshold)).detach().cpu().item()):
+                active_edges.append((i, j))
             lambda_terms.append(lambdas)
             friction_terms.append(
                 {
                     "edge": (i, j),
+                    "edge_gate": edge_gate,
                     "friction_force": friction,
                     "normal_force": normal_forces,
                     "tangential_velocity": tangential_velocity,
@@ -886,7 +1015,9 @@ class MultiBodyGaussianImpedanceDynamics:
 
         diagnostics = {
             "graph": graph,
+            "candidate_edges": candidate_edges,
             "active_edges": active_edges,
+            "edge_gates": edge_gates,
             "lambda": lambda_terms,
             "friction": friction_terms,
             "force_accum": force_accum,
@@ -967,6 +1098,7 @@ class ImpedanceFloorContactDynamics:
             smooth_min_temperature=cfg.smooth_min_temperature,
             inside_penalty=cfg.inside_penalty,
             inside_sharpness=cfg.inside_sharpness,
+            normal_mode=cfg.normal_mode,
         )
 
         phi_agg = _smooth_min(contacts.signed_distances, cfg.smooth_min_temperature)
@@ -993,3 +1125,25 @@ class ImpedanceFloorContactDynamics:
             "min_signed_distance": contacts.min_signed_distance,
         }
         return RigidState(position_next, velocity_next), diagnostics
+
+
+# Explicit public names used by scripts and docs to distinguish the paper path
+# from older smoke-test baselines without breaking existing imports.
+Stage2FloorImpedanceDynamics = ImpedanceFloorContactDynamics
+Stage2PairwiseImpedanceDynamics = PairwiseGaussianBodyImpedanceDynamics
+Stage2MultiBodyImpedanceDynamics = MultiBodyGaussianImpedanceDynamics
+
+LegacyPlaneCorrectionDynamics = ComplementarityFreeContactDynamics
+LegacySphereFloorCorrectionDynamics = SphereFloorQueryContactDynamics
+LegacyGaussianUnionFloorCorrectionDynamics = GaussianUnionFloorContactDynamics
+
+STAGE2_MAIN_DYNAMICS_CLASSES = (
+    Stage2FloorImpedanceDynamics,
+    Stage2PairwiseImpedanceDynamics,
+    Stage2MultiBodyImpedanceDynamics,
+)
+DEMO_BASELINE_DYNAMICS_CLASSES = (
+    LegacyPlaneCorrectionDynamics,
+    LegacySphereFloorCorrectionDynamics,
+    LegacyGaussianUnionFloorCorrectionDynamics,
+)

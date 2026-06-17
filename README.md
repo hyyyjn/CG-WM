@@ -114,6 +114,40 @@ conda run -n gaussian_splatting python gaussian_initiailization/tools/run_stage2
   --stage2_static_friction 0.4
 ```
 
+`stage2_impedance`가 논문식 Stage 2 main path입니다. 예전 impulse solver는
+`impulse_baseline` backend로 남겨 두었고 비교용 baseline으로만 취급합니다.
+`--stage2_patch_selection soft`를 쓰면 top-k/argmax patch identity 대신
+query point 전체의 soft weighted pooling으로 contact patches를 만듭니다.
+`--stage2_normal_mode signed_distance`는 sigmoid-blended SDF의 실제 gradient
+normal을 사용합니다. `autograd`는 느린 검증용 모드입니다.
+`normal_hint`는 floor/static plane처럼 외부 normal이 알려진 contact 전용이며,
+object-object contact에서는 SDF gradient normal만 사용합니다.
+`--stage2_friction_model soft_projection`은 differentiable Coulomb-style radial
+projection approximation입니다. `--stage2_friction_model dual_cone`은 tangent
+plane facet 방향으로 raw friction을 부드럽게 분해한 뒤 `mu * lambda_n` budget
+안으로 제한하는 differentiable cone approximation입니다.
+`--stage2_friction_num_directions`로 facet 방향 수를 조절할 수 있습니다.
+rollout summary의 `metrics.stage2_contact_diagnostics`에는 frame별/전체
+`max_friction_cone_violation`, `max_friction_force_to_cone_radius_ratio`,
+`max_friction_facet_budget`, `max_friction_facet_reconstruction_error`가 기록되어
+`soft_projection`과 `dual_cone`을 비교할 수 있습니다.
+variant evaluator에서 `--friction_model_sweep soft_projection dual_cone`을 주면
+Stage2 variant를 두 마찰 모델로 각각 실행하고
+`multi_dice_stage2_friction_model_comparison.csv`에 delta table을 저장합니다.
+전체 variant는 trajectory error와 contact stability metric을 함께 normalized
+score로 랭킹하며, 결과는 `multi_dice_stage2_variant_ranking.csv`와 report의
+`ranking` 블록에 저장됩니다. score는 낮을수록 좋습니다.
+evaluator는 각 run의 `refined_params.json`을 저장하고, ranking 1위의 파일을
+`best_refined_params.json`으로 복사합니다. 이후 rollout에는
+`--load_refined_params <output_root>/best_refined_params.json`을 넘겨 같은
+초기 속도/physics/geometry refinement를 재사용할 수 있습니다.
+짧은 end-to-end smoke는 synthetic trajectory/PLY로 evaluator sweep, ranking,
+best params export, reload rollout을 한 번에 검증합니다:
+
+```bash
+conda run -n gaussian_splatting python gaussian_initiailization/stage2/_smoke_test_stage2_variant_e2e.py
+```
+
 ### Stage 2 Variant Evaluation
 
 ```bash
@@ -152,6 +186,7 @@ conda run -n gaussian_splatting python gaussian_initiailization/tools/render_sta
 - Python syntax compile
 - Gaussian union SDF와 aggregate contact gradient
 - pairwise/multibody contact dynamics rollout
+- object-object contact learning smoke
 - friction cone projection gradient
 - geometry refinement parameter save/load
 - Stage 2 evaluator dry/smoke run
@@ -166,6 +201,13 @@ python -m py_compile \
   gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
   gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
   gaussian_initiailization/tools/run_stage1_training_schedule.py
+```
+
+Object-object contact와 geometry-only refinement 경로를 빠르게 확인하려면 아래 smoke를 실행합니다.
+
+```bash
+conda run -n gaussian_splatting python \
+  gaussian_initiailization/stage2/_smoke_test_object_object_learning.py
 ```
 
 ## Git에 올리지 않는 파일

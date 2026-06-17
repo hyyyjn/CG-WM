@@ -24,9 +24,15 @@ from gaussian_initiailization.stage2.differentiable_collision_detection import (
     make_box_surface_query_points,
 )
 from gaussian_initiailization.stage2.differentiable_complementarity_free_contact_dynamics import (  # noqa: E402
+    DYNAMICS_BACKEND_IMPULSE_BASELINE,
+    DYNAMICS_BACKEND_LEGACY_IMPULSE,
+    DYNAMICS_BACKEND_STAGE2_IMPEDANCE,
+    FRICTION_MODEL_DUAL_CONE,
+    FRICTION_MODEL_SOFT_PROJECTION,
     MultiBodyGaussianImpedanceDynamics,
     MultiBodyImpedanceDynamicsConfig,
     RigidBodyState,
+    normalize_dynamics_backend,
 )
 from gaussian_initiailization.stage2.differentiable_contact_graph import (  # noqa: E402
     build_pairwise_contact_graph,
@@ -119,15 +125,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussian_render_white_background", action="store_true")
     parser.add_argument(
         "--dynamics_backend",
-        default="stage2_impedance",
-        choices=("stage2_impedance", "impulse"),
-        help="stage2_impedance uses the core Stage2 Gaussian N-body impedance dynamics; impulse keeps the old demo solver.",
+        default=DYNAMICS_BACKEND_STAGE2_IMPEDANCE,
+        choices=(
+            DYNAMICS_BACKEND_STAGE2_IMPEDANCE,
+            DYNAMICS_BACKEND_IMPULSE_BASELINE,
+            DYNAMICS_BACKEND_LEGACY_IMPULSE,
+        ),
+        help=(
+            "stage2_impedance uses the paper-aligned Gaussian N-body impedance dynamics; "
+            "impulse_baseline keeps the old demo solver. impulse is a deprecated alias."
+        ),
     )
     parser.add_argument("--stage2_stiffness", default=72.0, type=float)
     parser.add_argument("--stage2_damping", default=4.0, type=float)
     parser.add_argument("--stage2_tangential_damping", default=1.2, type=float)
     parser.add_argument("--stage2_static_friction", default=0.0, type=float)
     parser.add_argument("--stage2_friction_transition_velocity", default=1e-3, type=float)
+    parser.add_argument(
+        "--stage2_friction_model",
+        default=FRICTION_MODEL_SOFT_PROJECTION,
+        choices=(FRICTION_MODEL_SOFT_PROJECTION, FRICTION_MODEL_DUAL_CONE),
+        help="Tangential contact model. dual_cone uses a differentiable tangent-facet cone approximation.",
+    )
+    parser.add_argument("--stage2_friction_num_directions", default=8, type=int)
+    parser.add_argument(
+        "--stage2_patch_selection",
+        default="spatial",
+        choices=("spatial", "topk", "soft"),
+        help="Contact patch construction for Stage 2 impedance dynamics. soft avoids discrete top-k/argmax patch identity.",
+    )
+    parser.add_argument(
+        "--stage2_normal_mode",
+        default="phi_soft",
+        choices=("phi_soft", "signed_distance", "autograd"),
+        help="Surface normal source for Gaussian SDF contacts. autograd is intended for validation and is slower.",
+    )
     parser.add_argument("--floor_half_extent", default=1.8, type=float)
     parser.add_argument("--floor_thickness", default=0.025, type=float)
     parser.add_argument("--floor_resolution", default=17, type=int)
@@ -140,7 +172,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fit_geometry_center_l2", default=1e-2, type=float)
     parser.add_argument("--fit_geometry_max_log_radius_offset", default=0.7, type=float)
     parser.add_argument("--fit_geometry_max_center_offset", default=0.015, type=float)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.dynamics_backend = normalize_dynamics_backend(str(args.dynamics_backend))
+    return args
 
 
 def read_json(path: Path):
@@ -358,7 +392,8 @@ def graph_edges(
         num_contact_patches=4,
         broad_phase_margin=float(args.broad_phase_margin),
         broad_phase_mode="aabb",
-        patch_selection="spatial",
+        patch_selection=str(args.stage2_patch_selection),
+        normal_mode=str(args.stage2_normal_mode),
     )
     graph = build_pairwise_contact_graph(
         bodies,
@@ -563,10 +598,11 @@ def make_stage2_dynamics(
         smooth_min_temperature=1e-2,
         inside_penalty=0.02,
         inside_sharpness=50.0,
+        normal_mode=str(args.stage2_normal_mode),
         num_contact_patches=4,
         broad_phase_margin=float(args.broad_phase_margin),
         broad_phase_mode="aabb",
-        patch_selection="spatial",
+        patch_selection=str(args.stage2_patch_selection),
         candidate_pair_mode="spatial_hash",
         spatial_hash_cell_size=float(args.spatial_hash_cell_size),
         contact_threshold=float(args.contact_threshold),
@@ -579,6 +615,8 @@ def make_stage2_dynamics(
         tangential_damping=float(args.stage2_tangential_damping),
         friction_softness=1e-6,
         friction_transition_velocity=float(args.stage2_friction_transition_velocity),
+        friction_model=str(args.stage2_friction_model),
+        friction_num_directions=int(args.stage2_friction_num_directions),
     )
     dynamics = MultiBodyGaussianImpedanceDynamics(
         bodies,
@@ -601,11 +639,167 @@ def make_stage2_dynamics(
     return dynamics, floor_state
 
 
+def _tensor_stat(value, *, op: str) -> float | None:
+    if value is None or not torch.is_tensor(value) or value.numel() == 0:
+        return None
+    tensor = value.detach()
+    if op == "max":
+        return float(torch.max(tensor).cpu().item())
+    if op == "mean":
+        return float(torch.mean(tensor.float()).cpu().item())
+    if op == "sum":
+        return float(torch.sum(tensor).cpu().item())
+    raise ValueError(f"Unsupported tensor stat op: {op}")
+
+
+def summarize_stage2_step_diagnostics(diagnostics: dict) -> dict:
+    """Compress one Stage2 substep's graph/friction diagnostics into JSON scalars."""
+
+    friction_terms = list(diagnostics.get("friction", []))
+    edge_gates = diagnostics.get("edge_gates", [])
+    lambda_terms = diagnostics.get("lambda", [])
+    contact_edges = 0
+    max_edge_gate = 0.0
+    max_lambda = 0.0
+    max_friction_force = 0.0
+    max_raw_friction = 0.0
+    max_cone_violation = 0.0
+    max_cone_ratio = 0.0
+    max_facet_budget = 0.0
+    max_facet_reconstruction_error = 0.0
+    mean_slip_terms = []
+    models = set()
+
+    for edge_gate in edge_gates:
+        gate_value = _tensor_stat(edge_gate, op="max")
+        if gate_value is not None:
+            max_edge_gate = max(max_edge_gate, gate_value)
+
+    for lambdas in lambda_terms:
+        lambda_value = _tensor_stat(lambdas, op="max")
+        if lambda_value is not None:
+            max_lambda = max(max_lambda, lambda_value)
+
+    for term in friction_terms:
+        models.add(str(term.get("friction_model", "")))
+        edge_gate_value = _tensor_stat(term.get("edge_gate"), op="max")
+        if edge_gate_value is not None and edge_gate_value > 0.0:
+            contact_edges += 1
+        for key, target in (
+            ("friction_force_norm", "max_friction_force"),
+            ("raw_friction_norm", "max_raw_friction"),
+            ("friction_cone_violation", "max_cone_violation"),
+            ("friction_force_to_cone_radius_ratio", "max_cone_ratio"),
+            ("friction_facet_budget", "max_facet_budget"),
+            ("friction_facet_reconstruction_error", "max_facet_reconstruction_error"),
+        ):
+            value = _tensor_stat(term.get(key), op="max")
+            if value is None:
+                continue
+            if target == "max_friction_force":
+                max_friction_force = max(max_friction_force, value)
+            elif target == "max_raw_friction":
+                max_raw_friction = max(max_raw_friction, value)
+            elif target == "max_cone_violation":
+                max_cone_violation = max(max_cone_violation, value)
+            elif target == "max_cone_ratio":
+                max_cone_ratio = max(max_cone_ratio, value)
+            elif target == "max_facet_budget":
+                max_facet_budget = max(max_facet_budget, value)
+            elif target == "max_facet_reconstruction_error":
+                max_facet_reconstruction_error = max(max_facet_reconstruction_error, value)
+        slip_mean = _tensor_stat(term.get("slip_speed"), op="mean")
+        if slip_mean is not None:
+            mean_slip_terms.append(slip_mean)
+
+    return {
+        "candidate_edges": int(len(diagnostics.get("candidate_edges", []))),
+        "active_edges": int(len(diagnostics.get("active_edges", []))),
+        "contact_edges_with_gate": int(contact_edges),
+        "max_edge_gate": float(max_edge_gate),
+        "max_lambda": float(max_lambda),
+        "max_friction_force": float(max_friction_force),
+        "max_raw_friction": float(max_raw_friction),
+        "max_friction_cone_violation": float(max_cone_violation),
+        "max_friction_force_to_cone_radius_ratio": float(max_cone_ratio),
+        "mean_slip_speed": float(np.mean(mean_slip_terms)) if mean_slip_terms else 0.0,
+        "max_friction_facet_budget": float(max_facet_budget),
+        "max_friction_facet_reconstruction_error": float(max_facet_reconstruction_error),
+        "friction_models": sorted(model for model in models if model),
+    }
+
+
+def aggregate_stage2_frame_diagnostics(substep_rows: list[dict]) -> dict:
+    if not substep_rows:
+        return {
+            "candidate_edges": 0,
+            "active_edges": 0,
+            "contact_edges_with_gate": 0,
+            "max_edge_gate": 0.0,
+            "max_lambda": 0.0,
+            "max_friction_force": 0.0,
+            "max_raw_friction": 0.0,
+            "max_friction_cone_violation": 0.0,
+            "max_friction_force_to_cone_radius_ratio": 0.0,
+            "mean_slip_speed": 0.0,
+            "max_friction_facet_budget": 0.0,
+            "max_friction_facet_reconstruction_error": 0.0,
+            "friction_models": [],
+        }
+    models = sorted({model for row in substep_rows for model in row.get("friction_models", [])})
+    return {
+        "candidate_edges": int(sum(row["candidate_edges"] for row in substep_rows)),
+        "active_edges": int(sum(row["active_edges"] for row in substep_rows)),
+        "contact_edges_with_gate": int(sum(row["contact_edges_with_gate"] for row in substep_rows)),
+        "max_edge_gate": float(max(row["max_edge_gate"] for row in substep_rows)),
+        "max_lambda": float(max(row["max_lambda"] for row in substep_rows)),
+        "max_friction_force": float(max(row["max_friction_force"] for row in substep_rows)),
+        "max_raw_friction": float(max(row["max_raw_friction"] for row in substep_rows)),
+        "max_friction_cone_violation": float(max(row["max_friction_cone_violation"] for row in substep_rows)),
+        "max_friction_force_to_cone_radius_ratio": float(
+            max(row["max_friction_force_to_cone_radius_ratio"] for row in substep_rows)
+        ),
+        "mean_slip_speed": float(np.mean([row["mean_slip_speed"] for row in substep_rows])),
+        "max_friction_facet_budget": float(max(row["max_friction_facet_budget"] for row in substep_rows)),
+        "max_friction_facet_reconstruction_error": float(
+            max(row["max_friction_facet_reconstruction_error"] for row in substep_rows)
+        ),
+        "friction_models": models,
+    }
+
+
+def aggregate_stage2_rollout_diagnostics(frame_rows: list[dict]) -> dict:
+    if not frame_rows:
+        return {}
+    models = sorted({model for row in frame_rows for model in row.get("friction_models", [])})
+    return {
+        "friction_models": models,
+        "frame_count": int(len(frame_rows)),
+        "total_candidate_edges": int(sum(row["candidate_edges"] for row in frame_rows)),
+        "total_active_edges": int(sum(row["active_edges"] for row in frame_rows)),
+        "total_contact_edges_with_gate": int(sum(row["contact_edges_with_gate"] for row in frame_rows)),
+        "max_edge_gate": float(max(row["max_edge_gate"] for row in frame_rows)),
+        "max_lambda": float(max(row["max_lambda"] for row in frame_rows)),
+        "max_friction_force": float(max(row["max_friction_force"] for row in frame_rows)),
+        "max_raw_friction": float(max(row["max_raw_friction"] for row in frame_rows)),
+        "max_friction_cone_violation": float(max(row["max_friction_cone_violation"] for row in frame_rows)),
+        "max_friction_force_to_cone_radius_ratio": float(
+            max(row["max_friction_force_to_cone_radius_ratio"] for row in frame_rows)
+        ),
+        "mean_slip_speed": float(np.mean([row["mean_slip_speed"] for row in frame_rows])),
+        "max_friction_facet_budget": float(max(row["max_friction_facet_budget"] for row in frame_rows)),
+        "max_friction_facet_reconstruction_error": float(
+            max(row["max_friction_facet_reconstruction_error"] for row in frame_rows)
+        ),
+        "frames": frame_rows,
+    }
+
+
 def step_states_stage2_impedance(
     states: list[SimState],
     dynamics: MultiBodyGaussianImpedanceDynamics,
     floor_state: RigidBodyState,
-) -> int:
+) -> tuple[int, dict]:
     rigid_states = [state.rigid() for state in states] + [floor_state]
     next_states, diagnostics = dynamics.step(rigid_states)
     for idx, next_state in enumerate(next_states[: len(states)]):
@@ -615,7 +809,7 @@ def step_states_stage2_impedance(
             linear_velocity=next_state.linear_velocity,
             angular_velocity=next_state.angular_velocity,
         )
-    return len(diagnostics["active_edges"])
+    return len(diagnostics["active_edges"]), summarize_stage2_step_diagnostics(diagnostics)
 
 
 def rollout(
@@ -660,7 +854,7 @@ def rollout(
     )
     stage2_dynamics = None
     floor_state = None
-    if args.dynamics_backend == "stage2_impedance":
+    if args.dynamics_backend == DYNAMICS_BACKEND_STAGE2_IMPEDANCE:
         stage2_dynamics, floor_state = make_stage2_dynamics(
             rollout_body,
             dice_count=dice_count,
@@ -679,6 +873,7 @@ def rollout(
     predicted_position_tensors = []
     predicted_quaternion_tensors = []
     active_counts = []
+    stage2_frame_diagnostics = []
     for frame_idx, source_frame in enumerate(source_states):
         predicted_position_tensors.append(torch.stack([state.position for state in states], dim=0))
         predicted_quaternion_tensors.append(torch.stack([state.quaternion_wxyz for state in states], dim=0))
@@ -690,12 +885,20 @@ def rollout(
             }
         )
         step_active = 0
+        stage2_substep_rows = []
         for _ in range(substeps):
-            if args.dynamics_backend == "stage2_impedance":
-                step_active += step_states_stage2_impedance(states, stage2_dynamics, floor_state)
+            if args.dynamics_backend == DYNAMICS_BACKEND_STAGE2_IMPEDANCE:
+                active_edges, substep_diagnostics = step_states_stage2_impedance(states, stage2_dynamics, floor_state)
+                step_active += active_edges
+                stage2_substep_rows.append(substep_diagnostics)
             else:
                 step_active += step_states(states, [rollout_body for _ in range(dice_count)], args=args, half_extent=half_extent, dt=dt)
         active_counts.append(step_active)
+        if args.dynamics_backend == DYNAMICS_BACKEND_STAGE2_IMPEDANCE:
+            frame_diagnostics = aggregate_stage2_frame_diagnostics(stage2_substep_rows)
+            frame_diagnostics["frame_index"] = int(source_frame.get("frame_index", frame_idx))
+            frame_diagnostics["time"] = float(source_frame.get("time", frame_idx * frame_dt))
+            stage2_frame_diagnostics.append(frame_diagnostics)
     pred_position_tensor = torch.stack(predicted_position_tensors, dim=0)
     pred_quaternion_tensor = torch.stack(predicted_quaternion_tensors, dim=0)
     gt_positions = np.asarray(
@@ -732,6 +935,8 @@ def rollout(
         "substeps": substeps,
         "dynamics_backend": str(args.dynamics_backend),
     }
+    if stage2_frame_diagnostics:
+        metrics["stage2_contact_diagnostics"] = aggregate_stage2_rollout_diagnostics(stage2_frame_diagnostics)
     if return_state_tensors:
         return predicted, metrics, {"positions": pred_position_tensor, "quaternions": pred_quaternion_tensor}
     if return_position_tensor:
@@ -1060,6 +1265,17 @@ def write_refined_params(
         "trajectory": str(trajectory.resolve()),
         "stage1_ply": str(stage1_ply.resolve()),
         "stage1_body": stage1_body,
+        "dynamics_backend": str(args.dynamics_backend),
+        "contact_settings": {
+            "friction_model": str(args.stage2_friction_model),
+            "friction_num_directions": int(args.stage2_friction_num_directions),
+            "patch_selection": str(args.stage2_patch_selection),
+            "normal_mode": str(args.stage2_normal_mode),
+            "dynamic_friction": float(args.pair_friction),
+            "static_friction": None if float(args.stage2_static_friction) <= 0.0 else float(args.stage2_static_friction),
+            "tangential_damping": float(args.stage2_tangential_damping),
+            "transition_velocity": float(args.stage2_friction_transition_velocity),
+        },
         "linear_velocity_delta": (
             None if linear_velocity_delta is None else linear_velocity_delta.detach().cpu().tolist()
         ),
@@ -1162,7 +1378,7 @@ def fit_stage2_physics(
     initial_physics_params: dict[str, torch.Tensor] | None = None,
     initial_geometry_params: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor] | None, dict]:
-    if args.dynamics_backend != "stage2_impedance":
+    if args.dynamics_backend != DYNAMICS_BACKEND_STAGE2_IMPEDANCE:
         raise ValueError("--fit_physics_iters requires --dynamics_backend stage2_impedance.")
     source_states = payload["states"]
     if args.max_frames > 0:
@@ -1620,6 +1836,8 @@ def main() -> None:
         },
         "dynamics_backend": str(args.dynamics_backend),
         "friction_cone": {
+            "model": str(args.stage2_friction_model),
+            "num_directions": int(args.stage2_friction_num_directions),
             "dynamic_friction": float(args.pair_friction),
             "static_friction": None if float(args.stage2_static_friction) <= 0.0 else float(args.stage2_static_friction),
             "tangential_damping": float(args.stage2_tangential_damping),

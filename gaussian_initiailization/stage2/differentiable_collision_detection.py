@@ -24,6 +24,7 @@ class CollisionEngineConfig:
     broad_phase_margin: float = 0.0
     broad_phase_mode: str = "sphere"
     patch_selection: str = "spatial"
+    normal_mode: str = "phi_soft"
 
 
 @dataclass(frozen=True)
@@ -113,8 +114,11 @@ class GaussianUnionContacts:
     primitives with a sigmoid-blended inside-object penalty so deep penetration
     is clamped to ≈ -inside_penalty instead of leaking back toward zero.
 
-    `surface_normals` is the analytic ∇ϕ_soft(p) / ‖∇ϕ_soft‖ per query point
-    (a softmax-weighted blend of per-primitive outward directions). The
+    `surface_normals` defaults to the analytic ∇ϕ_soft(p) / ‖∇ϕ_soft‖ per query
+    point (a softmax-weighted blend of per-primitive outward directions). The
+    SDF evaluator can alternatively use the sigmoid-blended signed-distance
+    gradient via `normal_mode="signed_distance"` or the autograd version via
+    `normal_mode="autograd"` for validation. The
     `collider_normal` field is the contact-weight-aggregated single normal used
     by downstream rigid-body dynamics. The name is kept for compatibility; use
     `contact_normal` in new code.
@@ -350,6 +354,7 @@ class DifferentiableCollisionEngine:
             smooth_min_temperature=cfg.smooth_min_temperature,
             inside_penalty=cfg.inside_penalty,
             inside_sharpness=cfg.inside_sharpness,
+            normal_mode=cfg.normal_mode,
         )
 
     def contacts(
@@ -360,6 +365,14 @@ class DifferentiableCollisionEngine:
         *,
         normal_hint: torch.Tensor | None = None,
     ) -> GaussianUnionContacts:
+        """Evaluate Gaussian contacts, optionally orienting normals to an environment hint.
+
+        `normal_hint` is intended for contacts against a known external
+        collider normal, such as a floor plane. Body-body contacts should use
+        :meth:`body_pair_contacts`, which relies on SDF gradient normals and
+        does not inject center-line normal hints.
+        """
+
         sdf = self.evaluate_sdf(query_points, gaussian_centers, gaussian_radii)
         return aggregate_gaussian_union_contacts(
             sdf,
@@ -428,8 +441,6 @@ class DifferentiableCollisionEngine:
             broad_phase_overlaps = torch.all((max_a + margin >= min_b) & (max_b + margin >= min_a), dim=-1)
         else:
             broad_phase_overlaps = sphere_overlaps
-        normal_b_to_a = center_delta / torch.clamp(center_distance.unsqueeze(-1), min=1e-12)
-        normal_a_to_b = -normal_b_to_a
 
         query_a = body_a.query_points_world(
             position_a,
@@ -452,8 +463,11 @@ class DifferentiableCollisionEngine:
             rotation_matrix=rotation_b_matrix,
         )
 
-        a_to_b = self.contacts(query_a, centers_b, body_b.radii, normal_hint=normal_b_to_a)
-        b_to_a = self.contacts(query_b, centers_a, body_a.radii, normal_hint=normal_a_to_b)
+        # Object-object contact normals must come from the Gaussian SDF
+        # gradient. A center-line hint can hide geometry errors and is only
+        # appropriate for external colliders with a known normal, e.g. floors.
+        a_to_b = self.contacts(query_a, centers_b, body_b.radii, normal_hint=None)
+        b_to_a = self.contacts(query_b, centers_a, body_a.radii, normal_hint=None)
         merged = merge_contact_patches(
             a_to_b,
             b_to_a,
@@ -496,6 +510,10 @@ def _orient_contact_normal(contact_normal: torch.Tensor, normal_hint: torch.Tens
     contact_normal = torch.where(normal_norm < 1e-8, hint, contact_normal / torch.clamp(normal_norm, min=1e-12))
     flip = torch.sum(contact_normal * hint, dim=-1, keepdim=True) < 0.0
     return torch.where(flip, -contact_normal, contact_normal)
+
+
+def _normalize_vectors(vectors: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+    return vectors / torch.clamp(torch.linalg.norm(vectors, dim=-1, keepdim=True), min=eps)
 
 
 def quat_wxyz_to_matrix(quaternion_wxyz: torch.Tensor) -> torch.Tensor:
@@ -778,6 +796,7 @@ def detect_gaussian_union_contacts(
     inside_sharpness: float = 50.0,
     num_contact_patches: int = 1,
     patch_selection: str = "spatial",
+    normal_mode: str = "phi_soft",
 ) -> GaussianUnionContacts:
     """ContactGaussian-WM differentiable union-of-spheres SDF (paper III-D-1).
 
@@ -797,6 +816,11 @@ def detect_gaussian_union_contacts(
        softmax used in the LSE. The sigmoid blend only rescales magnitude, not
        direction, so this is also (up to a positive scalar) ``∇ϕ`` itself
        (paper III-D-1).
+
+    `collider_normal` is a legacy name for `normal_hint`. Pass it only for
+    environment contacts with a physically known normal, such as floor queries.
+    Object-object contacts should leave it as ``None`` so normals remain pure
+    SDF-gradient normals.
     """
 
     sdf = evaluate_gaussian_union_sdf(
@@ -806,6 +830,7 @@ def detect_gaussian_union_contacts(
         smooth_min_temperature=smooth_min_temperature,
         inside_penalty=inside_penalty,
         inside_sharpness=inside_sharpness,
+        normal_mode=normal_mode,
     )
     return aggregate_gaussian_union_contacts(
         sdf,
@@ -824,6 +849,7 @@ def evaluate_gaussian_union_sdf(
     smooth_min_temperature: float = 2e-2,
     inside_penalty: float = 0.02,
     inside_sharpness: float = 50.0,
+    normal_mode: str = "phi_soft",
 ) -> GaussianUnionSDF:
     """Evaluate the ContactGaussian-WM spherical-Gaussian SDF at query points.
 
@@ -838,6 +864,8 @@ def evaluate_gaussian_union_sdf(
         raise ValueError("inside_penalty must be positive.")
     if inside_sharpness <= 0.0:
         raise ValueError("inside_sharpness must be positive.")
+    if normal_mode not in ("phi_soft", "signed_distance", "autograd"):
+        raise ValueError("normal_mode must be one of: phi_soft, signed_distance, autograd.")
 
     _, query_count = _split_query_shape(query_points)
     centers, radii, batch_shape, gaussian_count = _validate_gaussian_primitives(
@@ -849,6 +877,8 @@ def evaluate_gaussian_union_sdf(
         query_points,
         (*batch_shape, query_count, 3),
     )
+    if normal_mode == "autograd" and not points.requires_grad:
+        points = points.detach().clone().requires_grad_(True)
 
     offsets = points.unsqueeze(-2) - centers.unsqueeze(-3)
     center_distances = torch.linalg.norm(offsets, dim=-1)
@@ -864,11 +894,24 @@ def evaluate_gaussian_union_sdf(
     signed_distances = sigma_blend * phi_soft + (1.0 - sigma_blend) * (-inside_penalty)
 
     direction_per_prim = offsets / torch.clamp(center_distances.unsqueeze(-1), min=1e-9)
-    surface_normals = torch.sum(primitive_weights.unsqueeze(-1) * direction_per_prim, dim=-2)
-    surface_normals = surface_normals / torch.clamp(
-        torch.linalg.norm(surface_normals, dim=-1, keepdim=True),
-        min=1e-12,
-    )
+    phi_soft_gradient = torch.sum(primitive_weights.unsqueeze(-1) * direction_per_prim, dim=-2)
+    if normal_mode == "phi_soft":
+        surface_normals = _normalize_vectors(phi_soft_gradient)
+    elif normal_mode == "signed_distance":
+        blend_gradient_scale = sigma_blend + inside_sharpness * sigma_blend * (1.0 - sigma_blend) * (
+            phi_soft + inside_penalty
+        )
+        surface_normals = _normalize_vectors(blend_gradient_scale.unsqueeze(-1) * phi_soft_gradient)
+    else:
+        gradients = torch.autograd.grad(
+            signed_distances,
+            points,
+            grad_outputs=torch.ones_like(signed_distances),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        surface_normals = _normalize_vectors(gradients)
 
     return GaussianUnionSDF(
         query_points=points,
@@ -888,7 +931,7 @@ def _select_contact_patch_indices(
     patch_selection: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if patch_selection not in ("topk", "spatial"):
-        raise ValueError("patch_selection must be one of: topk, spatial.")
+        raise ValueError("_select_contact_patch_indices only supports discrete modes: topk, spatial.")
     if patch_selection == "topk" or patch_count <= 1:
         return torch.topk(contact_weights, k=patch_count, dim=-1)
 
@@ -919,6 +962,58 @@ def _gather_patch_vectors(values: torch.Tensor, indices: torch.Tensor) -> torch.
     return torch.gather(values, dim=1, index=indices.unsqueeze(-1).expand(indices.shape[0], indices.shape[1], values.shape[-1]))
 
 
+def _soft_contact_patch_values(
+    query_points: torch.Tensor,
+    contact_weights: torch.Tensor,
+    surface_normals: torch.Tensor,
+    penetrations: torch.Tensor,
+    signed_distances: torch.Tensor,
+    patch_count: int,
+) -> dict[str, torch.Tensor]:
+    """Pool all query samples into differentiable contact patches.
+
+    Unlike `topk` and `spatial`, this path does not pick discrete query
+    indices. For K > 1 it creates smooth bins along a data-dependent but
+    differentiable projection axis, then averages each bin with contact
+    weights. Patch gates remain in [0, 1] as assignment-weighted mean contact
+    probabilities.
+    """
+
+    if patch_count < 1:
+        raise ValueError("patch_count must be at least 1.")
+    batch_count, query_count, _ = query_points.shape
+    if patch_count == 1:
+        assignments = torch.ones((batch_count, query_count, 1), dtype=query_points.dtype, device=query_points.device)
+    else:
+        centered = query_points - torch.mean(query_points, dim=1, keepdim=True)
+        axis_energy = torch.mean(centered * centered, dim=1)
+        axis_weights = torch.softmax(axis_energy / torch.clamp(torch.mean(axis_energy, dim=-1, keepdim=True), min=1e-12), dim=-1)
+        scalar = torch.sum(centered * axis_weights.unsqueeze(1), dim=-1)
+        scalar_scale = torch.sqrt(torch.clamp(torch.mean(scalar * scalar, dim=-1, keepdim=True), min=1e-12))
+        scalar = scalar / scalar_scale
+        anchors = torch.linspace(-1.0, 1.0, patch_count, dtype=query_points.dtype, device=query_points.device)
+        bin_softness = torch.clamp(torch.as_tensor(2.0 / max(patch_count - 1, 1), dtype=query_points.dtype, device=query_points.device), min=1e-3)
+        logits = -((scalar.unsqueeze(-1) - anchors.reshape(1, 1, patch_count)) / bin_softness) ** 2
+        assignments = torch.softmax(logits, dim=-1)
+
+    mass = assignments * contact_weights.unsqueeze(-1)
+    mass_sum = torch.clamp(torch.sum(mass, dim=1), min=1e-12)
+    assignment_sum = torch.clamp(torch.sum(assignments, dim=1), min=1e-12)
+    patch_points = torch.sum(mass.unsqueeze(-1) * query_points.unsqueeze(-2), dim=1) / mass_sum.unsqueeze(-1)
+    patch_normals = torch.sum(mass.unsqueeze(-1) * surface_normals.unsqueeze(-2), dim=1) / mass_sum.unsqueeze(-1)
+    patch_normals = patch_normals / torch.clamp(torch.linalg.norm(patch_normals, dim=-1, keepdim=True), min=1e-12)
+    patch_penetrations = torch.sum(mass * penetrations.unsqueeze(-1), dim=1) / mass_sum
+    patch_signed_distances = torch.sum(mass * signed_distances.unsqueeze(-1), dim=1) / mass_sum
+    patch_weights = torch.sum(mass, dim=1) / assignment_sum
+    return {
+        "patch_points": patch_points,
+        "patch_normals": patch_normals,
+        "patch_weights": patch_weights,
+        "patch_penetrations": patch_penetrations,
+        "patch_signed_distances": patch_signed_distances,
+    }
+
+
 def merge_contact_patches(
     contacts_a: GaussianUnionContacts,
     contacts_b: GaussianUnionContacts,
@@ -930,6 +1025,8 @@ def merge_contact_patches(
 
     if num_contact_patches < 1:
         raise ValueError("num_contact_patches must be at least 1.")
+    if patch_selection not in ("topk", "spatial", "soft"):
+        raise ValueError("patch_selection must be one of: topk, spatial, soft.")
 
     points = torch.cat(
         (
@@ -967,6 +1064,24 @@ def merge_contact_patches(
         dim=1,
     )
     patch_count = min(int(num_contact_patches), int(weights.shape[-1]))
+    if patch_selection == "soft":
+        merged = _soft_contact_patch_values(
+            points,
+            weights,
+            normals,
+            penetrations,
+            signed_distances,
+            patch_count,
+        )
+        batch_shape = contacts_a.patch_points.shape[:-2]
+        return {
+            "patch_points": merged["patch_points"].reshape(*batch_shape, patch_count, 3),
+            "patch_normals": merged["patch_normals"].reshape(*batch_shape, patch_count, 3),
+            "patch_weights": merged["patch_weights"].reshape(*batch_shape, patch_count),
+            "patch_penetrations": merged["patch_penetrations"].reshape(*batch_shape, patch_count),
+            "patch_signed_distances": merged["patch_signed_distances"].reshape(*batch_shape, patch_count),
+        }
+
     patch_weights, patch_indices = _select_contact_patch_indices(
         points,
         weights,
@@ -995,15 +1110,19 @@ def aggregate_gaussian_union_contacts(
 
     `normal_hint` is optional. Pass an environment normal, such as a floor
     normal, only when downstream dynamics require a consistently oriented
-    contact normal. Inputs shaped `(B, Q, 3)` are aggregated independently per
-    batch item. `num_contact_patches` keeps the top-k strongest query contacts
-    for multi-contact dynamics while preserving the legacy single summary.
+    contact normal. Do not use it for object-object Gaussian contacts; those
+    should be oriented by the SDF gradient itself. Inputs shaped `(B, Q, 3)` are
+    aggregated independently per batch item. `num_contact_patches` keeps the
+    top-k strongest query contacts for multi-contact dynamics while preserving
+    the legacy single summary.
     """
 
     if softness <= 0.0:
         raise ValueError("softness must be positive.")
     if num_contact_patches < 1:
         raise ValueError("num_contact_patches must be at least 1.")
+    if patch_selection not in ("topk", "spatial", "soft"):
+        raise ValueError("patch_selection must be one of: topk, spatial, soft.")
 
     batch_shape, query_count = _split_query_shape(sdf.query_points)
     query_points = sdf.query_points.reshape(-1, query_count, 3)
@@ -1019,17 +1138,35 @@ def aggregate_gaussian_union_contacts(
     contact_normal = _orient_contact_normal(contact_normal, normal_hint)
 
     patch_count = min(int(num_contact_patches), int(query_count))
-    patch_weights, patch_indices = _select_contact_patch_indices(
-        query_points,
-        contact_weights,
-        patch_count,
-        patch_selection=patch_selection,
-    )
-    patch_points = _gather_patch_vectors(query_points, patch_indices)
-    patch_normals = _gather_patch_vectors(surface_normals, patch_indices)
-    patch_normals = _orient_contact_normal(patch_normals, normal_hint.unsqueeze(-2) if normal_hint is not None and normal_hint.ndim > 1 else normal_hint)
-    patch_penetrations = torch.gather(penetrations, dim=1, index=patch_indices)
-    patch_signed_distances = torch.gather(signed_distances, dim=1, index=patch_indices)
+    if patch_selection == "soft":
+        patch_values = _soft_contact_patch_values(
+            query_points,
+            contact_weights,
+            surface_normals,
+            penetrations,
+            signed_distances,
+            patch_count,
+        )
+        patch_points = patch_values["patch_points"]
+        patch_normals = _orient_contact_normal(
+            patch_values["patch_normals"],
+            normal_hint.unsqueeze(-2) if normal_hint is not None and normal_hint.ndim > 1 else normal_hint,
+        )
+        patch_weights = patch_values["patch_weights"]
+        patch_penetrations = patch_values["patch_penetrations"]
+        patch_signed_distances = patch_values["patch_signed_distances"]
+    else:
+        patch_weights, patch_indices = _select_contact_patch_indices(
+            query_points,
+            contact_weights,
+            patch_count,
+            patch_selection=patch_selection,
+        )
+        patch_points = _gather_patch_vectors(query_points, patch_indices)
+        patch_normals = _gather_patch_vectors(surface_normals, patch_indices)
+        patch_normals = _orient_contact_normal(patch_normals, normal_hint.unsqueeze(-2) if normal_hint is not None and normal_hint.ndim > 1 else normal_hint)
+        patch_penetrations = torch.gather(penetrations, dim=1, index=patch_indices)
+        patch_signed_distances = torch.gather(signed_distances, dim=1, index=patch_indices)
 
     return GaussianUnionContacts(
         query_points=sdf.query_points,
@@ -1048,6 +1185,64 @@ def aggregate_gaussian_union_contacts(
         patch_penetrations=patch_penetrations.reshape(*batch_shape, patch_count),
         patch_signed_distances=patch_signed_distances.reshape(*batch_shape, patch_count),
     )
+
+
+def compare_gaussian_union_normal_modes(
+    query_points: torch.Tensor,
+    gaussian_centers: torch.Tensor,
+    gaussian_radii: torch.Tensor,
+    *,
+    smooth_min_temperature: float = 2e-2,
+    inside_penalty: float = 0.02,
+    inside_sharpness: float = 50.0,
+) -> dict[str, torch.Tensor]:
+    """Compare analytic normal modes against autograd normals.
+
+    Returns normals and angular errors in degrees. This is intended as a
+    diagnostic for validating whether `normal_mode="signed_distance"` materially
+    differs from the default `normal_mode="phi_soft"` on a given proxy.
+    """
+
+    common_kwargs = {
+        "smooth_min_temperature": smooth_min_temperature,
+        "inside_penalty": inside_penalty,
+        "inside_sharpness": inside_sharpness,
+    }
+    phi = evaluate_gaussian_union_sdf(
+        query_points,
+        gaussian_centers,
+        gaussian_radii,
+        normal_mode="phi_soft",
+        **common_kwargs,
+    )
+    signed = evaluate_gaussian_union_sdf(
+        query_points,
+        gaussian_centers,
+        gaussian_radii,
+        normal_mode="signed_distance",
+        **common_kwargs,
+    )
+    autograd = evaluate_gaussian_union_sdf(
+        query_points,
+        gaussian_centers,
+        gaussian_radii,
+        normal_mode="autograd",
+        **common_kwargs,
+    )
+
+    def angle_deg(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        cosine = torch.sum(lhs * rhs, dim=-1)
+        cosine = torch.clamp(cosine, min=-1.0, max=1.0)
+        return torch.rad2deg(torch.acos(cosine))
+
+    return {
+        "phi_soft_normals": phi.surface_normals,
+        "signed_distance_normals": signed.surface_normals,
+        "autograd_normals": autograd.surface_normals,
+        "phi_soft_vs_autograd_deg": angle_deg(phi.surface_normals, autograd.surface_normals),
+        "signed_distance_vs_autograd_deg": angle_deg(signed.surface_normals, autograd.surface_normals),
+        "phi_soft_vs_signed_distance_deg": angle_deg(phi.surface_normals, signed.surface_normals),
+    }
 
 
 def load_gaussian_collision_primitives_from_ply(
