@@ -48,7 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussian_render_width", default=160, type=int)
     parser.add_argument("--gaussian_render_height", default=120, type=int)
     parser.add_argument("--gaussian_render_stride", default=4, type=int)
-    parser.add_argument("--gaussian_render_loss", default="l1", choices=("l1", "mse"))
+    parser.add_argument("--gaussian_render_loss", default="l1", choices=("l1", "mse", "l1_ssim"))
+    parser.add_argument("--gaussian_render_ssim_weight", default=0.2, type=float)
     parser.add_argument("--gaussian_render_white_background", action="store_true")
     parser.add_argument("--fit_geometry_radii", action="store_true")
     parser.add_argument("--fit_geometry_centers", action="store_true")
@@ -194,6 +195,8 @@ def variant_options(name: str, args: argparse.Namespace, *, friction_model: str 
             str(args.gaussian_render_stride),
             "--gaussian_render_loss",
             str(args.gaussian_render_loss),
+            "--gaussian_render_ssim_weight",
+            str(args.gaussian_render_ssim_weight),
         ]
         if bool(args.gaussian_render_white_background):
             options.append("--gaussian_render_white_background")
@@ -232,6 +235,8 @@ def variant_options(name: str, args: argparse.Namespace, *, friction_model: str 
             str(args.gaussian_render_stride),
             "--gaussian_render_loss",
             str(args.gaussian_render_loss),
+            "--gaussian_render_ssim_weight",
+            str(args.gaussian_render_ssim_weight),
         ]
         if bool(args.gaussian_render_white_background):
             options.append("--gaussian_render_white_background")
@@ -625,6 +630,7 @@ def main() -> None:
             "gaussian_render_height": int(args.gaussian_render_height),
             "gaussian_render_stride": int(args.gaussian_render_stride),
             "gaussian_render_loss": str(args.gaussian_render_loss),
+            "gaussian_render_ssim_weight": float(args.gaussian_render_ssim_weight),
             "gaussian_render_white_background": bool(args.gaussian_render_white_background),
             "fit_geometry_radii": bool(args.fit_geometry_radii),
             "fit_geometry_centers": bool(args.fit_geometry_centers),

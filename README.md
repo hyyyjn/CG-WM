@@ -127,6 +127,14 @@ projection approximation입니다. `--stage2_friction_model dual_cone`은 tangen
 plane facet 방향으로 raw friction을 부드럽게 분해한 뒤 `mu * lambda_n` budget
 안으로 제한하는 differentiable cone approximation입니다.
 `--stage2_friction_num_directions`로 facet 방향 수를 조절할 수 있습니다.
+RGB 기반 Stage 2 fitting을 켤 때 `--gaussian_render_loss l1_ssim`을 쓰면
+기본 L1 대신 L1와 SSIM 구조 loss를 함께 사용합니다.
+`--gaussian_render_ssim_weight`로 SSIM 항의 비중을 조절할 수 있습니다.
+RGB render loss는 학습 중인 전역 `radius_multiplier`를 렌더 Gaussian scale에도
+반영합니다. collision primitive를 `--max_primitives`로 downsample한 경우에도
+선택된 원본 PLY index를 보존해 per-primitive radius/center refinement를 해당
+render Gaussian에 scatter합니다. 저장된 index map이 없거나 shape이 맞지 않는
+경우에만 per-Gaussian render refinement가 diagnostics에 skipped로 기록됩니다.
 rollout summary의 `metrics.stage2_contact_diagnostics`에는 frame별/전체
 `max_friction_cone_violation`, `max_friction_force_to_cone_radius_ratio`,
 `max_friction_facet_budget`, `max_friction_facet_reconstruction_error`가 기록되어

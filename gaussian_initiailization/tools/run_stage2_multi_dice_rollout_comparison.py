@@ -121,7 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussian_render_width", default=160, type=int)
     parser.add_argument("--gaussian_render_height", default=120, type=int)
     parser.add_argument("--gaussian_render_stride", default=4, type=int)
-    parser.add_argument("--gaussian_render_loss", default="l1", choices=("l1", "mse"))
+    parser.add_argument("--gaussian_render_loss", default="l1", choices=("l1", "mse", "l1_ssim"))
+    parser.add_argument("--gaussian_render_ssim_weight", default=0.2, type=float)
     parser.add_argument("--gaussian_render_white_background", action="store_true")
     parser.add_argument(
         "--dynamics_backend",
@@ -267,10 +268,13 @@ def build_scaled_body(
         dtype=dtype,
         device=device,
     )
+    source_primitive_count = int(centers.shape[0])
+    selected_indices = None
     if max_primitives > 0 and centers.shape[0] > max_primitives:
         indices = torch.linspace(0, centers.shape[0] - 1, steps=max_primitives, device=device).round().long()
         centers = centers[indices]
         radii = radii[indices]
+        selected_indices = [int(value) for value in indices.detach().cpu().tolist()]
     bbox_min = torch.min(centers - radii.unsqueeze(-1), dim=0).values
     bbox_max = torch.max(centers + radii.unsqueeze(-1), dim=0).values
     scale = (float(half_extent) * 2.0) / float(torch.max(bbox_max - bbox_min).detach().cpu().item())
@@ -279,8 +283,10 @@ def build_scaled_body(
     body = GaussianCollisionBody(centers, radii, centers)
     return body, {
         "source_ply": str(stage1_ply.resolve()),
+        "source_primitive_count": int(source_primitive_count),
         "primitive_count": int(centers.shape[0]),
         "stage1_to_mujoco_scale": float(scale),
+        "collision_to_render_indices": selected_indices,
     }
 
 
@@ -1373,6 +1379,7 @@ def fit_stage2_physics(
     args: argparse.Namespace,
     *,
     stage1_to_mujoco_scale: float = 1.0,
+    collision_to_render_indices: list[int] | None = None,
     initial_linear_velocity_delta: torch.Tensor | None = None,
     initial_angular_velocity_delta: torch.Tensor | None = None,
     initial_physics_params: dict[str, torch.Tensor] | None = None,
@@ -1425,9 +1432,11 @@ def fit_stage2_physics(
                 white_background=bool(args.gaussian_render_white_background),
                 scale_multiplier=float(stage1_to_mujoco_scale),
                 loss=str(args.gaussian_render_loss),
+                ssim_weight=float(args.gaussian_render_ssim_weight),
             ),
             dtype=dtype,
             device=device,
+            collision_to_render_indices=collision_to_render_indices,
         )
     if initial_linear_velocity_delta is None:
         linear_velocity_delta = torch.zeros((dice_count, 3), dtype=dtype, device=device)
@@ -1515,6 +1524,10 @@ def fit_stage2_physics(
                 gaussian_rgb_loss, gaussian_rgb_diagnostics = gaussian_render_loss(
                     pred_states["positions"][gaussian_render_indices],
                     pred_states["quaternions"][gaussian_render_indices],
+                    physics_params=physics_params,
+                    geometry_params=geometry_params,
+                    max_log_radius_offset=float(args.fit_geometry_max_log_radius_offset),
+                    max_center_offset=float(args.fit_geometry_max_center_offset),
                 )
         position_loss = torch.mean((pred_positions - target_positions) ** 2)
         velocity_regularizer = float(args.fit_initial_velocity_l2) * (
@@ -1625,6 +1638,10 @@ def fit_stage2_physics(
                 "gaussian_render_stride": int(args.gaussian_render_stride),
                 "gaussian_render_loss": str(args.gaussian_render_loss),
                 "gaussian_render_scale_multiplier": float(stage1_to_mujoco_scale),
+                "gaussian_geometry_refinement_enabled": gaussian_render_loss is not None,
+                "collision_to_render_index_count": (
+                    0 if collision_to_render_indices is None else int(len(collision_to_render_indices))
+                ),
             },
         },
     )
@@ -1766,6 +1783,7 @@ def main() -> None:
             body,
             args,
             stage1_to_mujoco_scale=float(body_metadata["stage1_to_mujoco_scale"]),
+            collision_to_render_indices=body_metadata.get("collision_to_render_indices"),
             initial_linear_velocity_delta=linear_velocity_delta,
             initial_angular_velocity_delta=angular_velocity_delta,
             initial_physics_params=physics_params,
