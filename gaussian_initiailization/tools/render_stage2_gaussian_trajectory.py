@@ -17,6 +17,7 @@ for path in (str(REPO_ROOT), str(GS_ROOT)):
         sys.path.insert(0, path)
 
 from gaussian_initiailization.stage2.renderable_gaussian_asset import (  # noqa: E402
+    RenderableGaussianAsset,
     copy_asset_to_gaussian_model,
     instantiate_rigid_gaussian_scene,
     load_renderable_gaussian_asset,
@@ -51,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cam_fovy_deg", default=40.0, type=float)
     parser.add_argument("--white_background", action="store_true")
     parser.add_argument("--scale_multiplier", default=1.0, type=float)
+    parser.add_argument("--foreground_threshold", default=None, type=float)
+    parser.add_argument("--opacity_threshold", default=None, type=float)
+    parser.add_argument("--recenter_asset", action="store_true")
     parser.add_argument(
         "--auto_scale_to_trajectory_half_extent",
         action="store_true",
@@ -126,6 +130,59 @@ def frame_pose_tensors(frame: dict, *, device: str) -> tuple[torch.Tensor, torch
     return positions, quaternions
 
 
+def filter_asset(
+    asset: RenderableGaussianAsset,
+    *,
+    foreground_threshold: float | None,
+    opacity_threshold: float | None,
+    recenter: bool,
+) -> tuple[RenderableGaussianAsset, dict]:
+    mask = torch.ones((asset.num_gaussians,), dtype=torch.bool, device=asset.xyz.device)
+    if foreground_threshold is not None:
+        foreground_score = torch.sigmoid(asset.foreground_logit[:, 0])
+        mask &= foreground_score >= float(foreground_threshold)
+    if opacity_threshold is not None:
+        mask &= asset.activated_opacity[:, 0] >= float(opacity_threshold)
+    if not bool(mask.any()):
+        raise ValueError("Gaussian filtering removed every primitive.")
+
+    xyz = asset.xyz[mask]
+    bbox_min = torch.min(xyz, dim=0).values
+    bbox_max = torch.max(xyz, dim=0).values
+    center = 0.5 * (bbox_min + bbox_max)
+    if recenter:
+        xyz = xyz - center
+
+    filtered = RenderableGaussianAsset(
+        xyz=xyz,
+        features_dc=asset.features_dc[mask],
+        features_rest=asset.features_rest[mask],
+        opacity=asset.opacity[mask],
+        scaling=asset.scaling[mask],
+        rotation=asset.rotation[mask],
+        features_geo=asset.features_geo[mask],
+        foreground_logit=asset.foreground_logit[mask],
+        object_ids=asset.object_ids[mask],
+        sh_degree=asset.sh_degree,
+    )
+    info = {
+        "kept_gaussians": int(mask.sum().detach().cpu().item()),
+        "total_gaussians": int(asset.num_gaussians),
+        "bbox_min": [float(v) for v in bbox_min.detach().cpu().tolist()],
+        "bbox_max": [float(v) for v in bbox_max.detach().cpu().tolist()],
+        "bbox_center": [float(v) for v in center.detach().cpu().tolist()],
+        "recenter_asset": bool(recenter),
+    }
+    return filtered, info
+
+
+def infer_scale_from_asset(asset: RenderableGaussianAsset, *, half_extent: float) -> float:
+    bbox_min = torch.min(asset.xyz, dim=0).values
+    bbox_max = torch.max(asset.xyz, dim=0).values
+    diameter = torch.max(bbox_max - bbox_min)
+    return float((float(half_extent) * 2.0 / torch.clamp(diameter, min=1e-12)).detach().cpu().item())
+
+
 def infer_stage1_to_mujoco_scale(stage1_ply: Path, *, half_extent: float, device: str) -> float:
     centers, radii = load_gaussian_collision_primitives_from_ply(
         stage1_ply,
@@ -172,13 +229,15 @@ def main() -> None:
     payload = read_json(args.trajectory.resolve())
     frames = select_frames(payload, max_frames=int(args.max_frames), frame_stride=int(args.frame_stride))
     base_asset = load_renderable_gaussian_asset(args.stage1_ply.resolve(), device=device)
+    base_asset, filter_info = filter_asset(
+        base_asset,
+        foreground_threshold=args.foreground_threshold,
+        opacity_threshold=args.opacity_threshold,
+        recenter=bool(args.recenter_asset),
+    )
     scale_multiplier = float(args.scale_multiplier)
     if bool(args.auto_scale_to_trajectory_half_extent):
-        scale_multiplier *= infer_stage1_to_mujoco_scale(
-            args.stage1_ply.resolve(),
-            half_extent=float(payload.get("half_extent", 0.055)),
-            device=device,
-        )
+        scale_multiplier *= infer_scale_from_asset(base_asset, half_extent=float(payload.get("half_extent", 0.055)))
     camera = make_camera(args, device=device)
     bg_value = 1.0 if args.white_background else 0.0
     background = torch.full((3,), bg_value, dtype=torch.float32, device=device)
@@ -201,6 +260,7 @@ def main() -> None:
         "frames": frame_records,
         "num_frames": len(frame_records),
         "num_base_gaussians": int(base_asset.num_gaussians),
+        "filter": filter_info,
         "scale_multiplier": float(scale_multiplier),
         "requested_scale_multiplier": float(args.scale_multiplier),
         "auto_scale_to_trajectory_half_extent": bool(args.auto_scale_to_trajectory_half_extent),
