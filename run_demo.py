@@ -43,6 +43,7 @@ GEOM = {
     "box":      {"bmin": [-0.08, -0.08, -0.08], "bmax": [0.08, 0.08, 0.08], "cz": 0.08},
     "sphere":   {"bmin": [-0.09, -0.09, -0.09], "bmax": [0.09, 0.09, 0.09], "cz": 0.09},
     "cylinder": {"bmin": [-0.07, -0.07, -0.10], "bmax": [0.07, 0.07, 0.10], "cz": 0.10},
+    "cola_can": {"bmin": [-0.07, -0.07, -0.10], "bmax": [0.07, 0.07, 0.10], "cz": 0.10},
 }
 
 FALL_PARAMS = {
@@ -67,6 +68,13 @@ FALL_PARAMS = {
         spin_train="5.0",  spin_test="8.0",
         tilt_train="10.0", tilt_test="25.0",
     ),
+    "cola_can": dict(
+        drop_train="0.65", drop_test="0.85",
+        xy_train="0.08",   xy_test="0.18",
+        plan_train="0.9",  plan_test="1.2",
+        spin_train="10.0", spin_test="15.0",
+        tilt_train="45.0", tilt_test="70.0",
+    ),
 }
 
 
@@ -79,7 +87,7 @@ def main():
     p.add_argument("--output_root",          default=str(REPO / "demo_data"))
     p.add_argument("--model_root",           default=str(REPO / "demo_output"))
     p.add_argument("--scene_name",           default="sphere_demo")
-    p.add_argument("--object_type",          default="sphere", choices=["box", "sphere", "cylinder"])
+    p.add_argument("--object_type",          default="sphere", choices=["box", "sphere", "cylinder", "cola_can"])
     p.add_argument("--stage1_iters",         type=int, default=10000)
     p.add_argument("--stage2_fit_iters",     type=int, default=500)
     p.add_argument("--foreground_threshold", type=float, default=0.50)
@@ -92,6 +100,7 @@ def main():
     model_root   = Path(args.model_root)
     scene        = args.scene_name
     obj          = args.object_type
+    physics_shape = "cylinder" if obj == "cola_can" else obj
     geom         = GEOM.get(obj, GEOM["box"])
     fall         = FALL_PARAMS.get(obj, FALL_PARAMS["box"])
     cz           = geom["cz"]
@@ -102,8 +111,8 @@ def main():
     fit_output    = model_root / f"{scene}_stage2_fit"
     episode_root  = output_root / "stage2" / "fall_and_rebound" / "test" / scene / "episode_000"
 
-    radius_scale  = "0.8" if obj == "sphere" else "0.1"
-    tang_damp     = "5.0" if obj == "sphere" else "80.0"
+    radius_scale  = "0.8" if physics_shape == "sphere" else "0.1"
+    tang_damp     = "5.0" if physics_shape == "sphere" else "80.0"
 
     print("=== ContactGaussian-WM Demo ===")
     print(f"Dataset : {dataset_dir}")
@@ -165,7 +174,9 @@ def main():
         "mesh_path": "",
         "stage1_dataset_path": dataset_dir.as_posix(),
         "stage1_points_ply": ply_path.as_posix(),
-        "physics_shape": obj,
+        "object_type": obj,
+        "physics_shape": physics_shape,
+        "visual_model": "cola_can" if obj == "cola_can" else obj,
         "normalization": {
             "bbox_min": geom["bmin"],
             "bbox_max": geom["bmax"],
@@ -227,6 +238,7 @@ def main():
         "--max_tilt_deg_train", fall["tilt_train"],
         "--max_tilt_deg_test",  fall["tilt_test"],
         "--sphere_solref",      args.sphere_solref,
+        "--cylinder_friction",  "0.55 0.02 0.001",
     ])
 
     # ── STEP 6  Stage 2 fitting ─────────────────

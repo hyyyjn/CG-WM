@@ -28,6 +28,24 @@ def parse_args():
     parser.add_argument("--ground_size", default=4.0, type=float)
     parser.add_argument("--camera_distance", default=6.0, type=float)
     parser.add_argument("--camera_height", default=3.0, type=float)
+    parser.add_argument(
+        "--camera_target_z",
+        default=0.0,
+        type=float,
+        help="World z the camera aims at. Raise it (e.g. 0.7) so a close camera still frames the fall.",
+    )
+    parser.add_argument(
+        "--camera_target_x",
+        default=0.0,
+        type=float,
+        help="World x the camera aims at. Shift toward the settle point to recompose the frame.",
+    )
+    parser.add_argument(
+        "--camera_target_y",
+        default=0.0,
+        type=float,
+        help="World y the camera aims at (negative = toward the camera).",
+    )
     parser.add_argument("--drop_height_train", default=2.0, type=float)
     parser.add_argument("--drop_height_test", default=2.6, type=float)
     parser.add_argument("--xy_range_train", default=0.10, type=float)
@@ -56,9 +74,25 @@ def parse_args():
     parser.add_argument("--floor_rgba", default="0.92 0.92 0.92 1")
     parser.add_argument("--skybox_rgb", default="255,255,255")
     parser.add_argument("--sphere_solref", default="0.02 0.2", type=str)
+    parser.add_argument("--box_solref", default="", type=str)
+    parser.add_argument("--cylinder_solref", default="", type=str)
+    parser.add_argument("--floor_solref", default="", type=str)
     parser.add_argument("--sphere_friction", default="0.02 0.001 0.0001", type=str)
     parser.add_argument("--box_friction", default="0.35 0.01 0.001", type=str)
+    parser.add_argument("--cylinder_friction", default="0.55 0.02 0.001", type=str)
     parser.add_argument("--freejoint_damping", default=0.05, type=float)
+    parser.add_argument(
+        "--vertical_speed_train",
+        default=0.0,
+        type=float,
+        help="Optional initial downward z velocity magnitude for train episodes.",
+    )
+    parser.add_argument(
+        "--vertical_speed_test",
+        default=0.0,
+        type=float,
+        help="Optional initial downward z velocity magnitude for test episodes.",
+    )
     parser.add_argument(
         "--max_floor_penetration",
         default=0.03,
@@ -116,6 +150,22 @@ def parse_face_colors(face_colors_arg):
     return colors[:6]
 
 
+def cola_can_visual_xml(radius: float, half_height: float) -> str:
+    r = float(radius)
+    h = float(half_height)
+    stripe = max(r * 0.085, 0.004)
+    stripe_offset = r + stripe * 0.5
+    return f"""
+      <geom name="can_top_cap" type="cylinder" pos="0 0 {h + 0.001}" size="{r * 0.96} 0.002" rgba="0.86 0.86 0.82 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_bottom_cap" type="cylinder" pos="0 0 {-h - 0.001}" size="{r * 0.96} 0.002" rgba="0.74 0.74 0.70 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_front" type="box" pos="0 {-stripe_offset} 0.000" size="{r * 0.44} {stripe * 0.5} {h * 0.54}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_back" type="box" pos="0 {stripe_offset} 0.000" size="{r * 0.28} {stripe * 0.5} {h * 0.42}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_left" type="box" pos="{-stripe_offset} 0 0.030" size="{stripe * 0.5} {r * 0.24} {h * 0.30}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_right" type="box" pos="{stripe_offset} 0 -0.035" size="{stripe * 0.5} {r * 0.20} {h * 0.26}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_pull_tab" type="box" pos="0 {-r * 0.22} {h + 0.004}" size="{r * 0.22} {r * 0.065} 0.002" rgba="0.55 0.55 0.52 1" contype="0" conaffinity="0" density="0"/>
+    """.strip()
+
+
 def euler_xyz_to_quat(rx, ry, rz):
     cx, sx = math.cos(rx * 0.5), math.sin(rx * 0.5)
     cy, sy = math.cos(ry * 0.5), math.sin(ry * 0.5)
@@ -137,15 +187,43 @@ def build_mjcf(
     ground_size,
     camera_distance,
     camera_height,
+    camera_target_z,
+    camera_target_x,
+    camera_target_y,
     sphere_solref,
+    box_solref,
+    cylinder_solref,
+    floor_solref,
     sphere_friction,
     box_friction,
+    cylinder_friction,
     freejoint_damping,
     object_rgb1,
     object_rgb2,
     box_face_colors,
+    visual_model,
 ):
     hx, hy, hz = [float(v) for v in half_extents]
+    # General look-at from camera pos (0, -camera_distance, camera_height) to the
+    # target point. MuJoCo cameras look along -z_cam with xyaxes = right, up.
+    _px, _py, _pz = 0.0, -float(camera_distance), float(camera_height)
+    _fx = float(camera_target_x) - _px
+    _fy = float(camera_target_y) - _py
+    _fz = float(camera_target_z) - _pz
+    _fn = max((_fx * _fx + _fy * _fy + _fz * _fz) ** 0.5, 1e-9)
+    _fx, _fy, _fz = _fx / _fn, _fy / _fn, _fz / _fn
+    # right = forward x world_up; degenerate only if looking straight down.
+    _rx, _ry = _fy, -_fx
+    _rn = max((_rx * _rx + _ry * _ry) ** 0.5, 1e-9)
+    _rx, _ry = _rx / _rn, _ry / _rn
+    # up = right x forward
+    _ux = _ry * _fz
+    _uy = -_rx * _fz
+    _uz = _rx * _fy - _ry * _fx
+    camera_xyaxes = f"{_rx:.6f} {_ry:.6f} 0 {_ux:.6f} {_uy:.6f} {_uz:.6f}"
+    box_solref_attr = f' solref="{box_solref}"' if str(box_solref).strip() else ""
+    cylinder_solref_attr = f' solref="{cylinder_solref}"' if str(cylinder_solref).strip() else ""
+    floor_solref_attr = f' solref="{floor_solref}"' if str(floor_solref).strip() else ""
     if physics_shape == "sphere":
         radius = max(hx, hy, hz)
         geom_name = "sphere_geom"
@@ -154,6 +232,18 @@ def build_mjcf(
             f'<geom name="{geom_name}" type="sphere" size="{radius}" rgba="{object_rgba}" '
             f'density="1000" friction="{sphere_friction}" solref="{sphere_solref}"/>'
         )
+    elif physics_shape == "cylinder":
+        radius = max(hx, hy)
+        half_height = hz
+        geom_name = "cylinder_geom"
+        body_name = "cylinder"
+        body_rgba = "0.82 0.02 0.02 1" if visual_model == "cola_can" else object_rgba
+        extras = cola_can_visual_xml(radius, half_height) if visual_model == "cola_can" else ""
+        geom_xml = (
+            f'<geom name="{geom_name}" type="cylinder" size="{radius} {half_height}" rgba="{body_rgba}" '
+            f'density="1000" friction="{cylinder_friction}"{cylinder_solref_attr}/>\n'
+            f"      {extras}"
+        ).rstrip()
     else:
         geom_name = "box_geom"
         body_name = "box"
@@ -177,7 +267,7 @@ def build_mjcf(
         )
         geom_xml = (
             f'<geom name="{geom_name}" type="box" size="{hx} {hy} {hz}" rgba="0.14 0.14 0.16 1" '
-            f'density="1000" friction="{box_friction}"/>\n'
+            f'density="1000" friction="{box_friction}"{box_solref_attr}/>\n'
             f"      {face_geom_xml}"
         )
     return f"""
@@ -195,8 +285,8 @@ def build_mjcf(
   </asset>
   <worldbody>
     <light pos="0 0 6" dir="0 0 -1" directional="true"/>
-    <geom name="floor" type="plane" size="{ground_size} {ground_size} 0.1" material="matplane" rgba="{floor_rgba}"/>
-    <camera name="cam0" pos="0 -{camera_distance} {camera_height}" xyaxes="1 0 0 0 0.5 0.8660254"/>
+    <geom name="floor" type="plane" size="{ground_size} {ground_size} 0.1" material="matplane" rgba="{floor_rgba}"{floor_solref_attr}/>
+    <camera name="cam0" pos="0 -{camera_distance} {camera_height}" xyaxes="{camera_xyaxes}"/>
     <body name="{body_name}" pos="0 0 2">
       <joint name="root_free" type="free" damping="{freejoint_damping}"/>
       {geom_xml}
@@ -383,6 +473,7 @@ def main():
     object_manifest = read_json(object_manifest_path)
     half_extents = derive_half_extents(object_manifest)
     physics_shape = str(object_manifest.get("physics_shape", "box"))
+    visual_model = str(object_manifest.get("visual_model", object_manifest.get("object_type", physics_shape)))
 
     mjcf = build_mjcf(
         half_extents=half_extents,
@@ -394,13 +485,21 @@ def main():
         ground_size=args.ground_size,
         camera_distance=args.camera_distance,
         camera_height=args.camera_height,
+        camera_target_z=args.camera_target_z,
+        camera_target_x=args.camera_target_x,
+        camera_target_y=args.camera_target_y,
         sphere_solref=args.sphere_solref,
+        box_solref=args.box_solref,
+        cylinder_solref=args.cylinder_solref,
+        floor_solref=args.floor_solref,
         sphere_friction=args.sphere_friction,
         box_friction=args.box_friction,
+        cylinder_friction=args.cylinder_friction,
         freejoint_damping=args.freejoint_damping,
         object_rgb1=args.object_rgb1,
         object_rgb2=args.object_rgb2,
         box_face_colors=args.box_face_colors,
+        visual_model=visual_model,
     )
     model = mujoco.MjModel.from_xml_string(mjcf)
     object_geom_ids = [
@@ -427,12 +526,14 @@ def main():
             max_tilt_deg = float(args.max_tilt_deg_train)
             planar_speed = float(args.planar_speed_train)
             spin_speed = float(args.spin_speed_train)
+            vertical_speed = float(args.vertical_speed_train)
         else:
             xy_range = float(args.xy_range_test)
             drop_height = float(args.drop_height_test)
             max_tilt_deg = float(args.max_tilt_deg_test)
             planar_speed = float(args.planar_speed_test)
             spin_speed = float(args.spin_speed_test)
+            vertical_speed = float(args.vertical_speed_test)
 
         init_xy = rng.uniform(-xy_range, xy_range, size=2)
         init_pos = np.array([init_xy[0], init_xy[1], drop_height], dtype=np.float64)
@@ -444,7 +545,7 @@ def main():
             [
                 planar_mag * math.cos(heading),
                 planar_mag * math.sin(heading),
-                0.0,
+                -float(rng.uniform(0.65 * vertical_speed, vertical_speed)) if vertical_speed > 0.0 else 0.0,
             ],
             dtype=np.float64,
         )

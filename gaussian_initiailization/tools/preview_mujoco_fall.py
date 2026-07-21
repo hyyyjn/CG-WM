@@ -43,7 +43,13 @@ def parse_args():
     parser.add_argument("--sphere_solref", default="-1000 0")
     parser.add_argument("--sphere_friction", default="0.02 0.001 0.0001")
     parser.add_argument("--box_friction", default="0.35 0.01 0.001")
+    parser.add_argument("--cylinder_friction", default="0.55 0.02 0.001")
     parser.add_argument("--fps", default=30, type=int)
+    parser.add_argument("--free_camera", action="store_true", help="Use MuJoCo's interactive free camera instead of fixed cam0.")
+    parser.add_argument("--free_camera_distance", default=3.0, type=float)
+    parser.add_argument("--free_camera_azimuth", default=135.0, type=float)
+    parser.add_argument("--free_camera_elevation", default=-20.0, type=float)
+    parser.add_argument("--free_camera_lookat", default="0 0 0.5")
     parser.add_argument("--loop", action="store_true", help="Replay the episode continuously until the viewer is closed.")
     parser.add_argument(
         "--hold_after",
@@ -89,6 +95,29 @@ def parse_face_colors(face_colors_arg):
     return colors[:6]
 
 
+def parse_vec3(raw):
+    values = [float(value) for value in str(raw).replace(",", " ").split()]
+    if len(values) != 3:
+        raise ValueError(f"Expected a 3D vector like '0 0 0.5', got: {raw}")
+    return np.asarray(values, dtype=np.float64)
+
+
+def cola_can_visual_xml(radius: float, half_height: float) -> str:
+    r = float(radius)
+    h = float(half_height)
+    stripe = max(r * 0.085, 0.004)
+    stripe_offset = r + stripe * 0.5
+    return f"""
+      <geom name="can_top_cap" type="cylinder" pos="0 0 {h + 0.001}" size="{r * 0.96} 0.002" rgba="0.86 0.86 0.82 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_bottom_cap" type="cylinder" pos="0 0 {-h - 0.001}" size="{r * 0.96} 0.002" rgba="0.74 0.74 0.70 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_front" type="box" pos="0 {-stripe_offset} 0.000" size="{r * 0.44} {stripe * 0.5} {h * 0.54}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_back" type="box" pos="0 {stripe_offset} 0.000" size="{r * 0.28} {stripe * 0.5} {h * 0.42}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_left" type="box" pos="{-stripe_offset} 0 0.030" size="{stripe * 0.5} {r * 0.24} {h * 0.30}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_label_right" type="box" pos="{stripe_offset} 0 -0.035" size="{stripe * 0.5} {r * 0.20} {h * 0.26}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="can_pull_tab" type="box" pos="0 {-r * 0.22} {h + 0.004}" size="{r * 0.22} {r * 0.065} 0.002" rgba="0.55 0.55 0.52 1" contype="0" conaffinity="0" density="0"/>
+    """.strip()
+
+
 def build_mjcf(
     half_extents,
     physics_shape,
@@ -102,10 +131,12 @@ def build_mjcf(
     sphere_solref,
     sphere_friction,
     box_friction,
+    cylinder_friction,
     freejoint_damping,
     object_rgb1,
     object_rgb2,
     box_face_colors,
+    visual_model,
 ):
     hx, hy, hz = [float(v) for v in half_extents]
     if physics_shape == "sphere":
@@ -115,6 +146,17 @@ def build_mjcf(
             f'<geom name="sphere_geom" type="sphere" size="{radius}" rgba="{object_rgba}" '
             f'density="1000" friction="{sphere_friction}" solref="{sphere_solref}"/>'
         )
+    elif physics_shape == "cylinder":
+        radius = max(hx, hy)
+        half_height = hz
+        body_name = "cylinder"
+        body_rgba = "0.82 0.02 0.02 1" if visual_model == "cola_can" else object_rgba
+        extras = cola_can_visual_xml(radius, half_height) if visual_model == "cola_can" else ""
+        geom_xml = (
+            f'<geom name="cylinder_geom" type="cylinder" size="{radius} {half_height}" rgba="{body_rgba}" '
+            f'density="1000" friction="{cylinder_friction}"/>\n'
+            f"      {extras}"
+        ).rstrip()
     else:
         body_name = "box"
         face_colors = parse_face_colors(box_face_colors)
@@ -197,6 +239,7 @@ def main():
 
     half_extents = derive_half_extents(object_manifest)
     physics_shape = str(object_manifest.get("physics_shape", "box"))
+    visual_model = str(object_manifest.get("visual_model", object_manifest.get("object_type", physics_shape)))
     mjcf = build_mjcf(
         half_extents=half_extents,
         physics_shape=physics_shape,
@@ -210,10 +253,12 @@ def main():
         sphere_solref=args.sphere_solref,
         sphere_friction=args.sphere_friction,
         box_friction=args.box_friction,
+        cylinder_friction=args.cylinder_friction,
         freejoint_damping=args.freejoint_damping,
         object_rgb1=args.object_rgb1,
         object_rgb2=args.object_rgb2,
         box_face_colors=args.box_face_colors,
+        visual_model=visual_model,
     )
     model = mujoco.MjModel.from_xml_string(mjcf)
     data = mujoco.MjData(model)
@@ -229,8 +274,15 @@ def main():
     title = f"MuJoCo fall preview: {args.object_name} / {args.split} / episode_{args.episode_index:03d}"
 
     with mujoco.viewer.launch_passive(model, data, show_left_ui=True, show_right_ui=True) as viewer:
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-        viewer.cam.fixedcamid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "cam0")
+        if args.free_camera:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            viewer.cam.distance = float(args.free_camera_distance)
+            viewer.cam.azimuth = float(args.free_camera_azimuth)
+            viewer.cam.elevation = float(args.free_camera_elevation)
+            viewer.cam.lookat[:] = parse_vec3(args.free_camera_lookat)
+        else:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            viewer.cam.fixedcamid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "cam0")
         viewer.sync()
 
         while viewer.is_running():

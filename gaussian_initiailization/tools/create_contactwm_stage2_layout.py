@@ -86,6 +86,7 @@ def build_episode_manifest(object_asset, scenario_name, split_name, episode_inde
         "image_size": [int(args.image_width), int(args.image_height)],
         "physics_prior": object_asset.get("physics_prior", {}),
         "physics_shape": object_asset.get("physics_shape", "box"),
+        "visual_model": object_asset.get("visual_model", object_asset.get("object_type", object_asset.get("physics_shape", "box"))),
         "normalization": object_asset.get("normalization", {}),
         "action_type": SCENARIO_DEFAULTS[scenario_name]["action_type"],
         "motion_type": SCENARIO_DEFAULTS[scenario_name]["motion_type"],
@@ -123,6 +124,7 @@ def main():
             {
                 "object_name": asset["object_name"],
                 "physics_shape": asset.get("physics_shape", "box"),
+                "visual_model": asset.get("visual_model", asset.get("object_type", asset.get("physics_shape", "box"))),
                 "mesh_path": asset["mesh_path"],
                 "stage1_dataset_path": asset["stage1_dataset_path"],
                 "stage1_points_ply": asset["stage1_points_ply"],

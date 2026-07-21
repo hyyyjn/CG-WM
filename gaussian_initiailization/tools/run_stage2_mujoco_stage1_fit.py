@@ -22,6 +22,7 @@ from gaussian_initiailization.stage2.differentiable_collision_detection import (
     detect_gaussian_union_contacts,
     load_gaussian_collision_body_from_ply,
     make_floor_disk_query_points,
+    make_gaussian_proxy_query_points,
     transform_local_points,
 )
 from gaussian_initiailization.stage2.differentiable_complementarity_free_contact_dynamics import (
@@ -47,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_frames", default=160, type=int)
     parser.add_argument("--fit_iters", default=300, type=int)
     parser.add_argument("--lr", default=0.04, type=float)
+    parser.add_argument(
+        "--log_every",
+        default=0,
+        type=int,
+        help="Print position loss every N fit iterations (0 = off). Useful for convergence diagnosis.",
+    )
     parser.add_argument("--radius_scale", default=1.0, type=float)
     parser.add_argument("--object_id", default=None, type=int)
     parser.add_argument("--foreground_threshold", default=None, type=float)
@@ -109,6 +116,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query_radius_scale", default=1.10, type=float)
     parser.add_argument("--query_rings", default=5, type=int)
     parser.add_argument("--query_angles", default=32, type=int)
+    parser.add_argument(
+        "--query_mode",
+        default="floor_disk",
+        choices=("floor_disk", "body_surface"),
+        help=(
+            "floor_disk: environment-side XY disk query points under the object, "
+            "evaluated against the Gaussian union SDF (default, original behaviour). "
+            "body_surface: object-side query points sampled on the Gaussian primitives "
+            "(make_gaussian_proxy_query_points), evaluated against the floor plane."
+        ),
+    )
+    parser.add_argument(
+        "--body_query_dirs",
+        default=6,
+        type=int,
+        help="Directions per Gaussian for --query_mode body_surface (6 = axis dirs, else Fibonacci).",
+    )
+    parser.add_argument(
+        "--floor_friction_mode",
+        default="off",
+        choices=("off", "fixed", "learned"),
+        help=(
+            "Coulomb friction at the floor contact point (restitution dynamics only). "
+            "Slip uses ω×r with ω observed from the GT orientation sequence, so spin "
+            "converts into planar motion on rim bounces. 'learned' fits the coefficient."
+        ),
+    )
+    parser.add_argument(
+        "--floor_friction_init",
+        default=0.5,
+        type=float,
+        help="Initial (or fixed) friction coefficient for --floor_friction_mode.",
+    )
+    parser.add_argument(
+        "--init_restitution",
+        default=0.5,
+        type=float,
+        help="Initial restitution for --dynamics restitution. The contact loss landscape "
+             "has local minima, so this (with --floor_friction_init) picks the basin.",
+    )
+    parser.add_argument(
+        "--freeze_gravity",
+        action="store_true",
+        help="Keep gravity_z fixed at -9.81 instead of fitting it. Removes a compensation "
+             "degeneracy when friction/restitution are learned jointly.",
+    )
+    parser.add_argument(
+        "--substeps",
+        default=1,
+        type=int,
+        help="Integration substeps per frame (restitution dynamics). >1 integrates the "
+             "contact impulse finely instead of smearing it across a full 1/fps step.",
+    )
     parser.add_argument("--contact_softness", default=2e-3, type=float)
     parser.add_argument("--smooth_max_temperature", default=1e-2, type=float)
     parser.add_argument("--inside_penalty", default=0.02, type=float)
@@ -572,6 +632,107 @@ def _smooth_min_signed(values: torch.Tensor, temperature: float) -> torch.Tensor
     return -temperature * torch.logsumexp(-values / temperature, dim=-1)
 
 
+def angular_velocity_from_quaternions(quaternions: torch.Tensor, dt: float) -> torch.Tensor:
+    """World-frame angular velocity (T-1, 3) from unit quaternions wxyz (T, 4).
+
+    Finite-difference: dq = q_{t+1} ⊗ conj(q_t), ω = axis * angle / dt.
+    """
+    q0 = quaternions[:-1]
+    q1 = quaternions[1:]
+    w0, x0, y0, z0 = q0.unbind(-1)
+    w1, x1, y1, z1 = q1.unbind(-1)
+    dw = w1 * w0 + x1 * x0 + y1 * y0 + z1 * z0
+    dx = -w1 * x0 + x1 * w0 - y1 * z0 + z1 * y0
+    dy = -w1 * y0 + x1 * z0 + y1 * w0 - z1 * x0
+    dz = -w1 * z0 - x1 * y0 + y1 * x0 + z1 * w0
+    sign = torch.where(dw < 0.0, -torch.ones_like(dw), torch.ones_like(dw))
+    dw = dw * sign
+    vec = torch.stack((dx, dy, dz), dim=-1) * sign.unsqueeze(-1)
+    vec_norm = torch.linalg.norm(vec, dim=-1, keepdim=True).clamp(min=1e-12)
+    angle = 2.0 * torch.atan2(vec_norm.squeeze(-1), dw.clamp(min=-1.0, max=1.0))
+    return (vec / vec_norm) * (angle / float(dt)).unsqueeze(-1)
+
+
+def _floor_contact_response(
+    predicted_position: torch.Tensor,
+    predicted_velocity: torch.Tensor,
+    orientation: torch.Tensor | None,
+    omega: torch.Tensor | None,
+    *,
+    normal: torch.Tensor,
+    restitution: torch.Tensor,
+    local_centers: torch.Tensor,
+    radii: torch.Tensor,
+    floor_query_offsets_xy: torch.Tensor,
+    contact_softness: float,
+    smooth_max_temperature: float,
+    inside_penalty: float,
+    inside_sharpness: float,
+    query_mode: str,
+    local_query_points: torch.Tensor | None,
+    friction_coefficient: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One frictional floor-contact impulse. Returns (velocity, gate, penetration).
+
+    Friction is summed over every query point in contact (weighted by its own
+    contact weight), and each point's slip carries its own ω×r_i lever, so a
+    tilted rim contact produces the correct net tangential impulse and the spin
+    it induces — not a single averaged-point approximation.
+    """
+    if query_mode == "body_surface":
+        query_points = oriented_centers(local_query_points, predicted_position, orientation)
+        signed_distances = query_points[:, 2]
+        penetrations = F.softplus(-signed_distances / contact_softness) * contact_softness
+        contact_weights = torch.sigmoid(-signed_distances / contact_softness)
+    else:
+        query_points = torch.cat(
+            (
+                predicted_position[:2].unsqueeze(0) + floor_query_offsets_xy,
+                torch.zeros((floor_query_offsets_xy.shape[0], 1), dtype=predicted_position.dtype, device=predicted_position.device),
+            ),
+            dim=-1,
+        )
+        gaussian_centers = oriented_centers(local_centers, predicted_position, orientation)
+        contacts = detect_gaussian_union_contacts(
+            query_points,
+            gaussian_centers,
+            radii,
+            normal,
+            softness=contact_softness,
+            smooth_min_temperature=smooth_max_temperature,
+            inside_penalty=inside_penalty,
+            inside_sharpness=inside_sharpness,
+        )
+        penetrations = contacts.penetrations
+        contact_weights = contacts.contact_weights
+
+    contact_gate = smooth_weighted_max(contact_weights, smooth_max_temperature)
+    penetration_depth = smooth_weighted_max(penetrations, smooth_max_temperature)
+    normal_velocity = torch.sum(predicted_velocity * normal)
+    closing_speed = torch.nn.functional.softplus(-normal_velocity / contact_softness) * contact_softness
+    normal_impulse = contact_gate * (1.0 + restitution) * closing_speed
+    velocity = predicted_velocity + normal_impulse * normal
+
+    if friction_coefficient is not None:
+        levers = query_points - predicted_position.unsqueeze(0)
+        if omega is not None:
+            slip = velocity.unsqueeze(0) + torch.linalg.cross(omega.unsqueeze(0).expand_as(levers), levers)
+        else:
+            slip = velocity.unsqueeze(0).expand_as(levers)
+        slip_tangent = slip - (slip @ normal).unsqueeze(-1) * normal
+        slip_norm = torch.sqrt(torch.sum(slip_tangent * slip_tangent, dim=-1) + 1e-12)
+        # Per-point Coulomb cap, distributing the (already aggregated) normal
+        # impulse across contacting points by their weight share.
+        weight_sum = torch.clamp(contact_weights.sum(), min=1e-9)
+        per_point_normal = normal_impulse * contact_weights / weight_sum
+        per_point_friction = torch.minimum(friction_coefficient * per_point_normal, slip_norm)
+        friction_delta = torch.sum(
+            (per_point_friction / slip_norm).unsqueeze(-1) * slip_tangent, dim=0
+        )
+        velocity = velocity - friction_delta
+    return velocity, contact_gate, penetration_depth
+
+
 def simulate(
     initial_position: torch.Tensor,
     initial_velocity: torch.Tensor,
@@ -589,13 +750,23 @@ def simulate(
     inside_penalty: float = 0.02,
     inside_sharpness: float = 50.0,
     floor_tangential_damping: float = 0.0,
+    query_mode: str = "floor_disk",
+    local_query_points: torch.Tensor | None = None,
+    friction_coefficient: torch.Tensor | None = None,
+    angular_velocity_sequence: torch.Tensor | None = None,
+    substeps: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Legacy reflection+slop dynamics (kept for --dynamics restitution)."""
+    if query_mode == "body_surface" and local_query_points is None:
+        raise ValueError("query_mode='body_surface' requires local_query_points.")
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
+    normal = collider.normal.to(dtype=initial_position.dtype, device=initial_position.device)
     position = initial_position
     velocity = initial_velocity
     positions = [position]
     contact_gates = []
+    n_sub = max(1, int(substeps))
+    dt_sub = dt / n_sub
     gravity = torch.stack(
         (
             torch.zeros((), dtype=initial_position.dtype, device=initial_position.device),
@@ -605,47 +776,47 @@ def simulate(
     )
 
     for step_idx in range(steps - 1):
-        predicted_velocity = velocity + gravity * dt
-        predicted_position = position + predicted_velocity * dt
-
-        floor_points = torch.cat(
-            (
-                predicted_position[:2].unsqueeze(0) + floor_query_offsets_xy,
-                torch.zeros((floor_query_offsets_xy.shape[0], 1), dtype=predicted_position.dtype, device=predicted_position.device),
-            ),
-            dim=-1,
-        )
         orientation = None if orientation_sequence is None else orientation_sequence[min(step_idx + 1, orientation_sequence.shape[0] - 1)]
-        gaussian_centers = oriented_centers(local_centers, predicted_position, orientation)
-        contacts = detect_gaussian_union_contacts(
-            floor_points,
-            gaussian_centers,
-            radii,
-            collider.normal.to(dtype=predicted_position.dtype, device=predicted_position.device),
-            softness=contact_softness,
-            smooth_min_temperature=smooth_max_temperature,
-            inside_penalty=inside_penalty,
-            inside_sharpness=inside_sharpness,
+        omega = (
+            angular_velocity_sequence[min(step_idx, angular_velocity_sequence.shape[0] - 1)]
+            if angular_velocity_sequence is not None and angular_velocity_sequence.shape[0] > 0
+            else None
         )
-        penetration_depth = smooth_weighted_max(contacts.penetrations, smooth_max_temperature)
-        contact_gate = smooth_weighted_max(contacts.contact_weights, smooth_max_temperature)
-        # Floor contact should push along the plane normal.  The Gaussian SDF
-        # surface normal can be tilted on round objects and would inject
-        # horizontal velocity during a floor bounce.
-        normal = collider.normal.to(dtype=predicted_position.dtype, device=predicted_position.device)
-        normal_velocity = torch.sum(predicted_velocity * normal)
-        closing_speed = torch.nn.functional.softplus(-normal_velocity / contact_softness) * contact_softness
-        velocity = predicted_velocity + contact_gate * (1.0 + restitution) * closing_speed * normal
-        if floor_tangential_damping > 0.0:
-            tangent_velocity = velocity - torch.sum(velocity * normal) * normal
-            damping_fraction = 1.0 - torch.exp(
-                torch.as_tensor(-float(floor_tangential_damping) * dt, dtype=velocity.dtype, device=velocity.device)
+        step_gate = None
+        # Split each frame into substeps so the contact impulse is integrated
+        # finely instead of being smeared across a full 1/fps step.
+        for _ in range(n_sub):
+            predicted_velocity = velocity + gravity * dt_sub
+            predicted_position = position + predicted_velocity * dt_sub
+            velocity, contact_gate, penetration_depth = _floor_contact_response(
+                predicted_position,
+                predicted_velocity,
+                orientation,
+                omega,
+                normal=normal,
+                restitution=restitution,
+                local_centers=local_centers,
+                radii=radii,
+                floor_query_offsets_xy=floor_query_offsets_xy,
+                contact_softness=contact_softness,
+                smooth_max_temperature=smooth_max_temperature,
+                inside_penalty=inside_penalty,
+                inside_sharpness=inside_sharpness,
+                query_mode=query_mode,
+                local_query_points=local_query_points,
+                friction_coefficient=friction_coefficient,
             )
-            velocity = velocity - contact_gate * damping_fraction * tangent_velocity
-        position = predicted_position + contact_gate * (penetration_depth + 1e-4) * normal
+            if floor_tangential_damping > 0.0:
+                tangent_velocity = velocity - torch.sum(velocity * normal) * normal
+                damping_fraction = 1.0 - torch.exp(
+                    torch.as_tensor(-float(floor_tangential_damping) * dt_sub, dtype=velocity.dtype, device=velocity.device)
+                )
+                velocity = velocity - contact_gate * damping_fraction * tangent_velocity
+            position = predicted_position + contact_gate * (penetration_depth + 1e-4) * normal
+            step_gate = contact_gate if step_gate is None else torch.maximum(step_gate, contact_gate)
 
         positions.append(position)
-        contact_gates.append(contact_gate)
+        contact_gates.append(step_gate)
 
     if contact_gates:
         gates = torch.stack(contact_gates)
@@ -673,6 +844,8 @@ def simulate_impedance(
     inside_penalty: float,
     inside_sharpness: float,
     floor_tangential_damping: float = 0.0,
+    query_mode: str = "floor_disk",
+    local_query_points: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paper III-D-2 impedance contact dynamics rolled out over ``steps`` frames.
 
@@ -680,6 +853,8 @@ def simulate_impedance(
     produced via ``torch.exp(log_K)`` in the fit loop) — no extra SoftPlus is
     applied here. Single contact pair, frictionless.
     """
+    if query_mode == "body_surface" and local_query_points is None:
+        raise ValueError("query_mode='body_surface' requires local_query_points.")
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
     K = stiffness
     D = damping
@@ -698,30 +873,36 @@ def simulate_impedance(
     for step_idx in range(steps - 1):
         b = velocity + dt * gravity
 
-        floor_points = torch.cat(
-            (
-                position[:2].unsqueeze(0) + floor_query_offsets_xy,
-                torch.zeros(
-                    (floor_query_offsets_xy.shape[0], 1),
-                    dtype=position.dtype,
-                    device=position.device,
-                ),
-            ),
-            dim=-1,
-        )
         orientation = None if orientation_sequence is None else orientation_sequence[min(step_idx, orientation_sequence.shape[0] - 1)]
-        gaussian_centers = oriented_centers(local_centers, position, orientation)
-        contacts = detect_gaussian_union_contacts(
-            floor_points,
-            gaussian_centers,
-            radii,
-            collider.normal.to(dtype=position.dtype, device=position.device),
-            softness=contact_softness,
-            smooth_min_temperature=smooth_min_temperature,
-            inside_penalty=inside_penalty,
-            inside_sharpness=inside_sharpness,
-        )
-        phi_agg = _smooth_min_signed(contacts.signed_distances, smooth_min_temperature)
+        if query_mode == "body_surface":
+            # Object-side queries: surface points on the Gaussian primitives,
+            # transformed to world, evaluated against the floor plane z=0.
+            world_query_points = oriented_centers(local_query_points, position, orientation)
+            phi_agg = _smooth_min_signed(world_query_points[:, 2], smooth_min_temperature)
+        else:
+            floor_points = torch.cat(
+                (
+                    position[:2].unsqueeze(0) + floor_query_offsets_xy,
+                    torch.zeros(
+                        (floor_query_offsets_xy.shape[0], 1),
+                        dtype=position.dtype,
+                        device=position.device,
+                    ),
+                ),
+                dim=-1,
+            )
+            gaussian_centers = oriented_centers(local_centers, position, orientation)
+            contacts = detect_gaussian_union_contacts(
+                floor_points,
+                gaussian_centers,
+                radii,
+                collider.normal.to(dtype=position.dtype, device=position.device),
+                softness=contact_softness,
+                smooth_min_temperature=smooth_min_temperature,
+                inside_penalty=inside_penalty,
+                inside_sharpness=inside_sharpness,
+            )
+            phi_agg = _smooth_min_signed(contacts.signed_distances, smooth_min_temperature)
         # Floor contact should push along the plane normal.  The Gaussian SDF
         # normal is still useful for object/object contact, but for a static
         # floor it leaks vertical impulse into XY motion on round proxies.
@@ -837,6 +1018,7 @@ def fit_stage2(
     pairwise_body_b: tuple[torch.Tensor, torch.Tensor] | None = None,
     stage1_metadata: dict | None = None,
     pairwise_body_b_metadata: dict | None = None,
+    local_query_points: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, dict]:
     device = torch.device(args.device)
     target_positions = target_positions.to(device=device)
@@ -848,9 +1030,14 @@ def fit_stage2(
     local_centers = local_centers.to(device=device)
     radii = radii.to(device=device)
     floor_query_offsets_xy = floor_query_offsets_xy.to(device=device)
+    if local_query_points is not None:
+        local_query_points = local_query_points.to(device=device)
     dt = infer_dt(times.detach().cpu())
 
     dynamics_mode = str(args.dynamics)
+    query_mode = str(args.query_mode)
+    if query_mode == "body_surface" and dynamics_mode == "pairwise_impedance":
+        raise ValueError("--query_mode body_surface is not supported with --dynamics pairwise_impedance.")
     use_impedance = dynamics_mode == "impedance"
     use_pairwise = dynamics_mode == "pairwise_impedance"
     initial_position = target_positions[0].detach()
@@ -898,14 +1085,34 @@ def fit_stage2(
             learnable.insert(0, initial_velocity)
         raw_restitution = None
     else:
-        raw_restitution = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=device))
+        init_e = min(max(float(getattr(args, "init_restitution", 0.5)), 1e-4), 1.0 - 1e-4)
+        raw_restitution = torch.nn.Parameter(
+            torch.tensor(float(np.log(init_e / (1.0 - init_e))), dtype=torch.float32, device=device)
+        )
         log_K = None
         log_D = None
         stiffness = None
         damping = None
-        learnable = [gravity_z, raw_restitution]
+        learnable = [raw_restitution] if bool(getattr(args, "freeze_gravity", False)) else [gravity_z, raw_restitution]
         if not bool(args.freeze_initial_velocity):
             learnable.insert(0, initial_velocity)
+
+    friction_mode = str(getattr(args, "floor_friction_mode", "off"))
+    raw_friction = None
+    if friction_mode != "off":
+        if dynamics_mode != "restitution":
+            raise ValueError("--floor_friction_mode currently supports --dynamics restitution only.")
+        friction_init = max(float(args.floor_friction_init), 1e-4)
+        raw_friction_init = float(np.log(np.expm1(friction_init)))
+        raw_friction = torch.tensor(raw_friction_init, dtype=torch.float32, device=device)
+        if friction_mode == "learned":
+            raw_friction = torch.nn.Parameter(raw_friction)
+            learnable.append(raw_friction)
+    angular_velocity_sequence = (
+        angular_velocity_from_quaternions(target_quaternions, dt)
+        if friction_mode != "off" and target_quaternions is not None
+        else None
+    )
 
     optimizer = torch.optim.Adam(learnable, lr=float(args.lr))
 
@@ -969,9 +1176,14 @@ def fit_stage2(
                 inside_penalty=float(args.inside_penalty),
                 inside_sharpness=float(args.inside_sharpness),
                 floor_tangential_damping=float(args.floor_tangential_damping),
+                query_mode=query_mode,
+                local_query_points=local_query_points,
             )
             return predicted_positions, None, gates
         restitution = torch.sigmoid(raw_restitution if grad else raw_restitution.detach())
+        friction_coefficient = None
+        if raw_friction is not None:
+            friction_coefficient = F.softplus(raw_friction if grad else raw_friction.detach())
         predicted_positions, gates = simulate(
             initial_position,
             initial_velocity if grad else initial_velocity.detach(),
@@ -988,11 +1200,18 @@ def fit_stage2(
             inside_penalty=float(args.inside_penalty),
             inside_sharpness=float(args.inside_sharpness),
             floor_tangential_damping=float(args.floor_tangential_damping),
+            query_mode=query_mode,
+            local_query_points=local_query_points,
+            friction_coefficient=friction_coefficient,
+            angular_velocity_sequence=angular_velocity_sequence,
+            substeps=int(args.substeps),
         )
         return predicted_positions, None, gates
 
     initial_loss = None
     final_loss = None
+    best_loss = None
+    best_state = None
     for iteration in range(max(1, int(args.fit_iters))):
         optimizer.zero_grad(set_to_none=True)
         predicted, predicted_quaternions, gates = run(grad=True)
@@ -1016,7 +1235,19 @@ def fit_stage2(
         if iteration == 0:
             initial_loss = float(position_loss.detach().cpu().item())
         final_loss = float(position_loss.detach().cpu().item())
+        # Loss can oscillate when restitution/friction are learned jointly; keep
+        # the best parameters seen instead of whatever the last iteration left.
+        if best_loss is None or final_loss < best_loss:
+            best_loss = final_loss
+            best_state = [p.detach().clone() for p in learnable]
+        log_every = int(getattr(args, "log_every", 0) or 0)
+        if log_every > 0 and (iteration % log_every == 0 or iteration == int(args.fit_iters) - 1):
+            print(f"iter {iteration:4d}  position_loss {final_loss:.6f}", flush=True)
 
+    if best_state is not None:
+        with torch.no_grad():
+            for param, best in zip(learnable, best_state):
+                param.copy_(best)
     predicted, predicted_quaternions, gates = run(grad=False)
     contact_indices = torch.nonzero(gates.detach().cpu() > 0.5).flatten()
     first_contact_frame = int(contact_indices[0].item() + 1) if contact_indices.numel() else None
@@ -1025,6 +1256,12 @@ def fit_stage2(
         "dt": dt,
         "frames": int(target_positions.shape[0]),
         "dynamics": dynamics_mode,
+        "query_mode": query_mode,
+        "num_query_points": (
+            int(local_query_points.shape[0])
+            if query_mode == "body_surface" and local_query_points is not None
+            else int(floor_query_offsets_xy.shape[0])
+        ),
         "num_primitives_a": int(local_centers.shape[0]),
         "radius_scale": float(args.radius_scale),
         "object_id": args.object_id,
@@ -1067,6 +1304,10 @@ def fit_stage2(
         diagnostics["learned_damping"] = float(torch.exp(log_D.detach()).cpu().item())
     else:
         diagnostics["learned_restitution"] = float(torch.sigmoid(raw_restitution.detach()).cpu().item())
+        diagnostics["floor_friction_mode"] = friction_mode
+        diagnostics["substeps"] = int(args.substeps)
+        if raw_friction is not None:
+            diagnostics["learned_friction"] = float(F.softplus(raw_friction.detach()).cpu().item())
     predicted_quaternions_cpu = predicted_quaternions.detach().cpu() if predicted_quaternions is not None else None
     return predicted.detach().cpu(), predicted_quaternions_cpu, gates.detach().cpu(), diagnostics
 
@@ -1113,6 +1354,19 @@ def draw_follow_view(
         draw.line(front + [front[0]], fill=outline, width=3)
         draw.line([front[0], back[0], back[1], front[1]], fill=outline, width=2)
 
+    def draw_can(draw: ImageDraw.ImageDraw, center_x: int, center_y: int, width_px: int, height_px: int, *, body, stripe, cap, outline):
+        left = center_x - width_px // 2
+        right = center_x + width_px // 2
+        top = center_y - height_px // 2
+        bottom = center_y + height_px // 2
+        cap_h = max(5, height_px // 8)
+        draw.rectangle((left, top, right, bottom), fill=body, outline=outline)
+        draw.ellipse((left, top - cap_h // 2, right, top + cap_h), fill=cap, outline=outline)
+        draw.ellipse((left, bottom - cap_h, right, bottom + cap_h // 2), fill=(165, 165, 158), outline=outline)
+        draw.rectangle((center_x - width_px // 5, top + cap_h, center_x + width_px // 5, bottom - cap_h), fill=stripe)
+        draw.line((left + 4, center_y, right - 4, center_y), fill=(245, 245, 238), width=2)
+        draw.rectangle((center_x - 5, top - 1, center_x + 8, top + 3), fill=(105, 105, 100))
+
     for idx, (target, pred) in enumerate(zip(target_positions, predicted_positions)):
         frame = Image.new("RGB", (width, height), (248, 247, 241))
         draw = ImageDraw.Draw(frame)
@@ -1150,6 +1404,30 @@ def draw_follow_view(
                 outline=(30, 30, 30),
             )
             draw.line((center_x - 90, target_y + 26, center_x - 24, target_y + 26), fill=(25, 82, 130), width=1)
+        elif object_shape == "cylinder":
+            draw_can(
+                draw,
+                center_x - 56,
+                target_y,
+                42,
+                70,
+                body=(78, 150, 219),
+                stripe=(232, 240, 250),
+                cap=(190, 205, 214),
+                outline=(25, 82, 130),
+            )
+            draw_can(
+                draw,
+                center_x + 48,
+                pred_y,
+                30,
+                48,
+                body=gate_color,
+                stripe=(255, 250, 240),
+                cap=(210, 210, 202),
+                outline=(30, 30, 30),
+            )
+            draw.line((center_x - 84, target_y + 38, center_x - 28, target_y + 38), fill=(25, 82, 130), width=1)
         else:
             draw.ellipse(
                 (center_x - radius_px, target_y - radius_px, center_x + radius_px, target_y + radius_px),
@@ -1253,6 +1531,13 @@ def main() -> None:
         dtype=torch.float32,
         device=torch.device(args.device),
     )
+    local_query_points = None
+    if str(args.query_mode) == "body_surface":
+        local_query_points = make_gaussian_proxy_query_points(
+            local_centers,
+            radii,
+            directions_per_gaussian=int(args.body_query_dirs),
+        )
     predicted_positions, predicted_quaternions, contact_gates, diagnostics = fit_stage2(
         target_positions_cpu,
         target_quaternions_cpu,
@@ -1266,6 +1551,7 @@ def main() -> None:
         pairwise_body_b=pairwise_body_b,
         stage1_metadata=stage1_metadata,
         pairwise_body_b_metadata=pairwise_body_b_metadata,
+        local_query_points=local_query_points,
     )
 
     trajectory_states = []

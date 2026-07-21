@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--object_type",
         default="box",
-        choices=["box", "sphere", "cylinder", "dice"],
+        choices=["box", "sphere", "cylinder", "dice", "cola_can"],
         help="Simple object primitive to render.",
     )
     parser.add_argument("--train_views", default=24, type=int, help="Number of train views on the orbit.")
@@ -168,6 +168,25 @@ def dice_geom_xml(half_extent: float) -> str:
     """.strip()
 
 
+def cola_can_geom_xml(radius: float = 0.07, half_height: float = 0.10) -> str:
+    r = float(radius)
+    h = float(half_height)
+    stripe = 0.006
+    stripe_offset = r + stripe * 0.5
+    top_z = h + 0.001
+    bottom_z = -h - 0.001
+    return f"""
+          <geom name="target_geom" type="cylinder" size="{r} {h}" rgba="0.82 0.02 0.02 1"/>
+          <geom name="target_top_cap" type="cylinder" pos="0 0 {top_z}" size="{r * 0.96} 0.002" rgba="0.86 0.86 0.82 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_bottom_cap" type="cylinder" pos="0 0 {bottom_z}" size="{r * 0.96} 0.002" rgba="0.74 0.74 0.70 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_label_front" type="box" pos="0 {-stripe_offset} 0.000" size="{r * 0.44} {stripe * 0.5} {h * 0.54}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_label_back" type="box" pos="0 {stripe_offset} 0.000" size="{r * 0.28} {stripe * 0.5} {h * 0.42}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_label_left" type="box" pos="{-stripe_offset} 0 0.030" size="{stripe * 0.5} {r * 0.24} {h * 0.30}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_label_right" type="box" pos="{stripe_offset} 0 -0.035" size="{stripe * 0.5} {r * 0.20} {h * 0.26}" rgba="1 1 1 1" contype="0" conaffinity="0" density="0"/>
+          <geom name="target_pull_tab" type="box" pos="0 {-r * 0.22} {h + 0.004}" size="{r * 0.22} {r * 0.065} 0.002" rgba="0.55 0.55 0.52 1" contype="0" conaffinity="0" density="0"/>
+    """.strip()
+
+
 def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]:
     if object_type == "box":
         geom_xml = colored_box_geom_xml(0.08, box_face_colors)
@@ -207,6 +226,17 @@ def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]
         <body name="target_body" pos="0 0 0.10">
           <freejoint/>
           <geom name="target_geom" type="cylinder" size="0.07 0.10" rgba="0.2 0.75 0.4 1"/>
+        </body>
+            """.strip(),
+            0.10,
+        )
+    if object_type == "cola_can":
+        geom_xml = cola_can_geom_xml(0.07, 0.10)
+        return (
+            f"""
+        <body name="target_body" pos="0 0 0.10">
+          <freejoint/>
+          {geom_xml}
         </body>
             """.strip(),
             0.10,

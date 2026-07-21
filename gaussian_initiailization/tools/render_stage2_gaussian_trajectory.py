@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cam_distance", default=1.12, type=float)
     parser.add_argument("--cam_height", default=0.66, type=float)
     parser.add_argument("--cam_fovy_deg", default=40.0, type=float)
+    parser.add_argument("--cam_target", default="0,0,0", type=str)
+    parser.add_argument("--follow_object", action="store_true")
+    parser.add_argument("--follow_target_offset", default="0,0,0", type=str)
+    parser.add_argument("--orbit_camera", action="store_true")
+    parser.add_argument("--orbit_start_deg", default=0.0, type=float)
+    parser.add_argument("--orbit_degrees", default=360.0, type=float)
     parser.add_argument("--white_background", action="store_true")
     parser.add_argument("--scale_multiplier", default=1.0, type=float)
     parser.add_argument("--foreground_threshold", default=None, type=float)
@@ -88,6 +94,56 @@ def mujoco_cam0_c2w_fov(cam_distance: float, cam_height: float, fovy_deg: float,
     return c2w, fovx, fovy
 
 
+def parse_vec3(raw: str) -> np.ndarray:
+    values = [float(value.strip()) for value in str(raw).replace(" ", ",").split(",") if value.strip()]
+    if len(values) != 3:
+        raise ValueError(f"Expected a 3D vector like '0,0,0', got: {raw}")
+    return np.array(values, dtype=np.float32)
+
+
+def look_at_c2w(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    z_cam = eye - target
+    z_norm = np.linalg.norm(z_cam)
+    if z_norm < 1e-8:
+        raise ValueError("Camera eye and target must not be identical.")
+    z_cam = z_cam / z_norm
+    x_cam = np.cross(world_up, z_cam)
+    if np.linalg.norm(x_cam) < 1e-8:
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        x_cam = np.cross(world_up, z_cam)
+    x_cam = x_cam / max(np.linalg.norm(x_cam), 1e-8)
+    y_cam = np.cross(z_cam, x_cam)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = np.stack([x_cam, y_cam, z_cam], axis=1).astype(np.float32)
+    c2w[:3, 3] = eye.astype(np.float32)
+    return c2w
+
+
+def orbit_camera_c2w_fov(
+    cam_distance: float,
+    cam_height: float,
+    fovy_deg: float,
+    width: int,
+    height: int,
+    target: np.ndarray,
+    yaw_deg: float,
+):
+    yaw = math.radians(float(yaw_deg))
+    eye = target + np.array(
+        [
+            float(cam_distance) * math.sin(yaw),
+            -float(cam_distance) * math.cos(yaw),
+            float(cam_height),
+        ],
+        dtype=np.float32,
+    )
+    c2w = look_at_c2w(eye, target)
+    fovy = math.radians(float(fovy_deg))
+    fovx = 2.0 * math.atan(math.tan(fovy * 0.5) * float(width) / float(height))
+    return c2w, fovx, fovy
+
+
 def c2w_to_3dgs_rt(c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     c2w_3dgs = np.array(c2w, dtype=np.float32, copy=True)
     c2w_3dgs[:3, 1:3] *= -1.0
@@ -95,14 +151,43 @@ def c2w_to_3dgs_rt(c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.transpose(w2c[:3, :3]).astype(np.float32), w2c[:3, 3].astype(np.float32)
 
 
-def make_camera(args: argparse.Namespace, *, device: str) -> MiniCam:
-    c2w, fovx, fovy = mujoco_cam0_c2w_fov(
-        float(args.cam_distance),
-        float(args.cam_height),
-        float(args.cam_fovy_deg),
-        int(args.image_width),
-        int(args.image_height),
-    )
+def frame_camera_target(frame: dict) -> np.ndarray:
+    if "predicted_position" in frame or "target_position" in frame or "position" in frame:
+        return np.array(frame.get("predicted_position", frame.get("target_position", frame.get("position"))), dtype=np.float32)
+    dice = frame.get("dice", [])
+    if dice:
+        positions = np.array([die["position"] for die in dice], dtype=np.float32)
+        return np.mean(positions, axis=0)
+    raise ValueError("trajectory frame is missing dice or object states.")
+
+
+def make_camera(
+    args: argparse.Namespace,
+    *,
+    device: str,
+    yaw_deg: float | None = None,
+    target: np.ndarray | None = None,
+) -> MiniCam:
+    if yaw_deg is None:
+        c2w, fovx, fovy = mujoco_cam0_c2w_fov(
+            float(args.cam_distance),
+            float(args.cam_height),
+            float(args.cam_fovy_deg),
+            int(args.image_width),
+            int(args.image_height),
+        )
+    else:
+        if target is None:
+            target = parse_vec3(args.cam_target)
+        c2w, fovx, fovy = orbit_camera_c2w_fov(
+            float(args.cam_distance),
+            float(args.cam_height),
+            float(args.cam_fovy_deg),
+            int(args.image_width),
+            int(args.image_height),
+            target,
+            yaw_deg,
+        )
     R, T = c2w_to_3dgs_rt(c2w)
     world_view = torch.tensor(getWorld2View2(R, T), dtype=torch.float32).T.to(device)
     proj = getProjectionMatrix(znear=0.01, zfar=200.0, fovX=fovx, fovY=fovy).T.to(device)
@@ -123,11 +208,22 @@ def select_frames(payload: dict, *, max_frames: int, frame_stride: int) -> list[
 
 def frame_pose_tensors(frame: dict, *, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     dice = frame.get("dice", [])
-    if not dice:
-        raise ValueError("trajectory frame is missing dice states.")
-    positions = torch.tensor([die["position"] for die in dice], dtype=torch.float32, device=device)
-    quaternions = torch.tensor([die["quaternion_wxyz"] for die in dice], dtype=torch.float32, device=device)
-    return positions, quaternions
+    if dice:
+        positions = torch.tensor([die["position"] for die in dice], dtype=torch.float32, device=device)
+        quaternions = torch.tensor([die["quaternion_wxyz"] for die in dice], dtype=torch.float32, device=device)
+        return positions, quaternions
+
+    if "predicted_position" in frame or "target_position" in frame or "position" in frame:
+        position = frame.get("predicted_position", frame.get("target_position", frame.get("position")))
+        quaternion = frame.get(
+            "predicted_quaternion_wxyz",
+            frame.get("target_quaternion_wxyz", frame.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0])),
+        )
+        positions = torch.tensor([position], dtype=torch.float32, device=device)
+        quaternions = torch.tensor([quaternion], dtype=torch.float32, device=device)
+        return positions, quaternions
+
+    raise ValueError("trajectory frame is missing dice or object states.")
 
 
 def filter_asset(
@@ -243,13 +339,21 @@ def main() -> None:
     background = torch.full((3,), bg_value, dtype=torch.float32, device=device)
     rendered_frames = []
     frame_records = []
+    denom = max(1, len(frames) - 1)
     for local_idx, frame in enumerate(frames):
+        yaw_deg = None
+        if bool(args.orbit_camera):
+            yaw_deg = float(args.orbit_start_deg) + float(args.orbit_degrees) * float(local_idx) / float(denom)
+            target = None
+            if bool(args.follow_object):
+                target = frame_camera_target(frame) + parse_vec3(args.follow_target_offset)
+            camera = make_camera(args, device=device, yaw_deg=yaw_deg, target=target)
         image = render_frame(base_asset, frame, camera, background, scale_multiplier)
         frame_index = int(frame.get("frame_index", local_idx))
         path = rgb_dir / f"{frame_index:06d}.png"
         Image.fromarray(image).save(path)
         rendered_frames.append(image)
-        frame_records.append({"frame_index": frame_index, "path": str(path)})
+        frame_records.append({"frame_index": frame_index, "path": str(path), "camera_yaw_deg": yaw_deg})
     gif_path = output_dir / "stage2_gaussian_trajectory.gif"
     imageio.mimsave(gif_path, rendered_frames, fps=max(1, int(args.fps)))
     manifest = {
@@ -264,6 +368,15 @@ def main() -> None:
         "scale_multiplier": float(scale_multiplier),
         "requested_scale_multiplier": float(args.scale_multiplier),
         "auto_scale_to_trajectory_half_extent": bool(args.auto_scale_to_trajectory_half_extent),
+        "camera": {
+            "orbit_camera": bool(args.orbit_camera),
+            "orbit_start_deg": float(args.orbit_start_deg),
+            "orbit_degrees": float(args.orbit_degrees),
+            "cam_target": [float(v) for v in parse_vec3(args.cam_target).tolist()],
+            "cam_distance": float(args.cam_distance),
+            "cam_height": float(args.cam_height),
+            "cam_fovy_deg": float(args.cam_fovy_deg),
+        },
     }
     write_json(output_dir / "stage2_gaussian_trajectory_manifest.json", manifest)
     print(json.dumps(manifest, indent=2))
