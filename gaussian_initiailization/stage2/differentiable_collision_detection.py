@@ -24,6 +24,11 @@ class CollisionEngineConfig:
     broad_phase_margin: float = 0.0
     broad_phase_mode: str = "sphere"
     patch_selection: str = "spatial"
+    body_query_scheme: str = "axis6"
+    body_query_directions: int = 6
+    floor_query_radius_scale: float = 1.1
+    floor_query_rings: int = 5
+    floor_query_angles: int = 32
 
 
 @dataclass(frozen=True)
@@ -239,12 +244,14 @@ class GaussianCollisionBody:
     local_centers: torch.Tensor
     radii: torch.Tensor
     local_query_points: torch.Tensor | None = None
+    source_indices: torch.Tensor | None = None
 
     def to(self, *, dtype=None, device=None) -> "GaussianCollisionBody":
         return GaussianCollisionBody(
             self.local_centers.to(dtype=dtype, device=device),
             self.radii.to(dtype=dtype, device=device),
             None if self.local_query_points is None else self.local_query_points.to(dtype=dtype, device=device),
+            None if self.source_indices is None else self.source_indices.to(device=device),
         )
 
     def world_centers(
@@ -323,6 +330,73 @@ class GaussianCollisionBody:
             radii = radii.unsqueeze(0)
         radii = radii.unsqueeze(-1)
         return torch.min(centers - radii, dim=-2).values, torch.max(centers + radii, dim=-2).values
+
+
+def make_pairwise_body_query_points(
+    body: GaussianCollisionBody,
+    position: torch.Tensor,
+    target_centers_world: torch.Tensor,
+    target_radii: torch.Tensor,
+    *,
+    scheme: str = "axis6",
+    directions_per_gaussian: int = 6,
+    quaternion_wxyz: torch.Tensor | None = None,
+    rotation_matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Generate source-body surface queries for a Gaussian body pair.
+
+    ``axis6`` and ``fibonacci`` sample directions in the source body's local
+    frame. ``analytic`` emits one world-space support point per source sphere,
+    directed toward the closest target sphere under the exact sphere distance.
+    """
+
+    if scheme not in ("axis6", "fibonacci", "analytic"):
+        raise ValueError("scheme must be one of: axis6, fibonacci, analytic.")
+    if target_centers_world.ndim != 2 or target_centers_world.shape[-1] != 3:
+        raise ValueError("target_centers_world must have shape (G, 3).")
+    if target_radii.ndim != 1 or target_radii.shape[0] != target_centers_world.shape[0]:
+        raise ValueError("target_radii must have shape (G,).")
+
+    if scheme != "analytic":
+        if scheme == "axis6" and body.local_query_points is not None:
+            local_queries = body.local_query_points
+        else:
+            directions = 6 if scheme == "axis6" else max(int(directions_per_gaussian), 4)
+            local_queries = make_gaussian_proxy_query_points(
+                body.local_centers.to(dtype=position.dtype, device=position.device),
+                body.radii.to(dtype=position.dtype, device=position.device),
+                directions_per_gaussian=directions,
+            )
+        return transform_local_points(
+            local_queries.to(dtype=position.dtype, device=position.device),
+            position,
+            quaternion_wxyz=quaternion_wxyz,
+            rotation_matrix=rotation_matrix,
+        )
+
+    source_centers = body.world_centers(
+        position,
+        quaternion_wxyz=quaternion_wxyz,
+        rotation_matrix=rotation_matrix,
+    )
+    source_radii = body.radii.to(dtype=source_centers.dtype, device=source_centers.device)
+    target_centers = target_centers_world.to(dtype=source_centers.dtype, device=source_centers.device)
+    target_radii = target_radii.to(dtype=source_centers.dtype, device=source_centers.device)
+    offsets = target_centers.unsqueeze(0) - source_centers.unsqueeze(1)
+    center_distances = torch.linalg.norm(offsets, dim=-1)
+    target_surface_distances = center_distances - target_radii.unsqueeze(0)
+    closest_indices = torch.argmin(target_surface_distances, dim=-1)
+    source_indices = torch.arange(source_centers.shape[0], device=source_centers.device)
+    directions = offsets[source_indices, closest_indices]
+    direction_norm = torch.linalg.norm(directions, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(directions)
+    fallback[:, 0] = 1.0
+    directions = torch.where(
+        direction_norm > 1e-12,
+        directions / torch.clamp(direction_norm, min=1e-12),
+        fallback,
+    )
+    return source_centers + source_radii.unsqueeze(-1) * directions
 
 
 class DifferentiableCollisionEngine:
@@ -431,16 +505,6 @@ class DifferentiableCollisionEngine:
         normal_b_to_a = center_delta / torch.clamp(center_distance.unsqueeze(-1), min=1e-12)
         normal_a_to_b = -normal_b_to_a
 
-        query_a = body_a.query_points_world(
-            position_a,
-            quaternion_wxyz=quaternion_a_wxyz,
-            rotation_matrix=rotation_a_matrix,
-        )
-        query_b = body_b.query_points_world(
-            position_b,
-            quaternion_wxyz=quaternion_b_wxyz,
-            rotation_matrix=rotation_b_matrix,
-        )
         centers_a = body_a.world_centers(
             position_a,
             quaternion_wxyz=quaternion_a_wxyz,
@@ -448,6 +512,71 @@ class DifferentiableCollisionEngine:
         )
         centers_b = body_b.world_centers(
             position_b,
+            quaternion_wxyz=quaternion_b_wxyz,
+            rotation_matrix=rotation_b_matrix,
+        )
+        if self.config.body_query_scheme == "floor_disk":
+            if self.config.floor_query_rings < 0 or self.config.floor_query_angles < 1:
+                raise ValueError("floor query rings must be non-negative and angles must be positive.")
+            floor_height = torch.max(
+                centers_b[..., 2] + body_b.radii.to(dtype=centers_b.dtype, device=centers_b.device)
+            )
+            disk_radius = radius_a * float(self.config.floor_query_radius_scale)
+            offsets = [torch.zeros(2, dtype=position_a.dtype, device=position_a.device)]
+            for ring in range(1, int(self.config.floor_query_rings) + 1):
+                ring_radius = disk_radius * (float(ring) / float(self.config.floor_query_rings))
+                angles = torch.arange(
+                    int(self.config.floor_query_angles), dtype=position_a.dtype, device=position_a.device
+                ) * (2.0 * torch.pi / float(self.config.floor_query_angles))
+                offsets.extend(torch.stack((ring_radius * torch.cos(angles), ring_radius * torch.sin(angles)), dim=-1))
+            offsets_xy = torch.stack(offsets, dim=0)
+            # The disk follows A in XY but stays on the static body's upper surface.
+            floor_queries = torch.cat(
+                (
+                    center_a[..., :2].reshape(1, 2) + offsets_xy,
+                    floor_height.reshape(1, 1).expand(offsets_xy.shape[0], 1),
+                ),
+                dim=-1,
+            )
+            b_to_a = self.contacts(floor_queries, centers_a, body_a.radii, normal_hint=normal_a_to_b)
+            patch_weights = torch.where(
+                broad_phase_overlaps.unsqueeze(-1),
+                b_to_a.patch_weights,
+                torch.zeros_like(b_to_a.patch_weights),
+            )
+            patch_penetrations = torch.where(
+                broad_phase_overlaps.unsqueeze(-1),
+                b_to_a.patch_penetrations,
+                torch.zeros_like(b_to_a.patch_penetrations),
+            )
+            return BodyPairContacts(
+                a_to_b=b_to_a,
+                b_to_a=b_to_a,
+                patch_points=b_to_a.patch_points,
+                patch_normals=-b_to_a.patch_normals,
+                patch_weights=patch_weights,
+                patch_penetrations=patch_penetrations,
+                patch_signed_distances=b_to_a.patch_signed_distances,
+                broad_phase_overlaps=broad_phase_overlaps,
+                broad_phase_mode=self.config.broad_phase_mode,
+            )
+        query_a = make_pairwise_body_query_points(
+            body_a,
+            position_a,
+            centers_b,
+            body_b.radii,
+            scheme=self.config.body_query_scheme,
+            directions_per_gaussian=self.config.body_query_directions,
+            quaternion_wxyz=quaternion_a_wxyz,
+            rotation_matrix=rotation_a_matrix,
+        )
+        query_b = make_pairwise_body_query_points(
+            body_b,
+            position_b,
+            centers_a,
+            body_a.radii,
+            scheme=self.config.body_query_scheme,
+            directions_per_gaussian=self.config.body_query_directions,
             quaternion_wxyz=quaternion_b_wxyz,
             rotation_matrix=rotation_b_matrix,
         )
@@ -1050,10 +1179,58 @@ def aggregate_gaussian_union_contacts(
     )
 
 
+def _spherical_scales_from_log_channels(
+    log_scales: np.ndarray,
+    *,
+    reduction: str,
+    isotropic_tolerance: float,
+) -> np.ndarray:
+    scales = np.exp(log_scales)
+    if reduction == "strict":
+        spread = np.max(scales, axis=-1) - np.min(scales, axis=-1)
+        relative_spread = spread / np.maximum(np.mean(scales, axis=-1), 1e-12)
+        if np.any(relative_spread > float(isotropic_tolerance)):
+            raise ValueError(
+                "Stage-I PLY contains anisotropic scales but strict spherical loading was requested. "
+                "Use scale_reduction='mean' or 'max' for a legacy 3DGS checkpoint."
+            )
+        return np.mean(scales, axis=-1)
+    if reduction == "mean":
+        return np.mean(scales, axis=-1)
+    if reduction == "max":
+        return np.max(scales, axis=-1)
+    raise ValueError(f"Unsupported spherical scale reduction: {reduction!r}")
+
+
+def _collision_radii_from_log_channels(
+    log_scales: np.ndarray,
+    *,
+    radius_scale: float,
+    radius_convention: str,
+    scale_reduction: str,
+    isotropic_tolerance: float,
+) -> np.ndarray:
+    spherical_scales = _spherical_scales_from_log_channels(
+        log_scales,
+        reduction=scale_reduction,
+        isotropic_tolerance=isotropic_tolerance,
+    )
+    if radius_convention == "paper_r2s":
+        convention_multiplier = 2.0
+    elif radius_convention == "legacy_r_equals_s":
+        convention_multiplier = 1.0
+    else:
+        raise ValueError(f"Unsupported Gaussian radius convention: {radius_convention!r}")
+    return spherical_scales * convention_multiplier * float(radius_scale)
+
+
 def load_gaussian_collision_primitives_from_ply(
     path: str | Path,
     *,
     radius_scale: float = 1.0,
+    radius_convention: str = "paper_r2s",
+    scale_reduction: str = "mean",
+    isotropic_tolerance: float = 1e-4,
     min_radius: float = 1e-4,
     recenter: bool = True,
     dtype=torch.float32,
@@ -1062,9 +1239,9 @@ def load_gaussian_collision_primitives_from_ply(
     """Load spherical collision primitives from a Stage 1 3DGS PLY.
 
     Stage 1 stores Gaussian centers as `x/y/z` and log-scales as `scale_*`.
-    For collision smoke tests we use the mean exp-scale as each primitive's
-    radius. This keeps the loader lightweight while matching the paper's
-    spherical-Gaussian collision abstraction.
+    The paper convention is ``r = 2s``. Legacy ``r = s`` PLY consumers can use
+    ``radius_convention="legacy_r_equals_s"``. Anisotropic legacy 3DGS channels
+    may be reduced with ``mean`` or ``max``; ``strict`` rejects them.
     """
 
     try:
@@ -1087,7 +1264,13 @@ def load_gaussian_collision_primitives_from_ply(
     )
     if scale_names:
         log_scales = np.stack([vertices[name] for name in scale_names], axis=-1).astype(np.float32)
-        radii_np = np.exp(log_scales).mean(axis=-1) * float(radius_scale)
+        radii_np = _collision_radii_from_log_channels(
+            log_scales,
+            radius_scale=radius_scale,
+            radius_convention=radius_convention,
+            scale_reduction=scale_reduction,
+            isotropic_tolerance=isotropic_tolerance,
+        )
     else:
         radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
     radii_np = np.maximum(radii_np, float(min_radius))
@@ -1106,6 +1289,9 @@ def load_gaussian_collision_body_from_ply(
     path: str | Path,
     *,
     radius_scale: float = 1.0,
+    radius_convention: str = "paper_r2s",
+    scale_reduction: str = "mean",
+    isotropic_tolerance: float = 1e-4,
     min_radius: float = 1e-4,
     recenter: bool = False,
     object_id: int | None = None,
@@ -1191,7 +1377,13 @@ def load_gaussian_collision_body_from_ply(
     )
     if scale_names:
         log_scales = np.stack([vertices[name] for name in scale_names], axis=-1).astype(np.float32)[selected]
-        radii_np = np.exp(log_scales).mean(axis=-1) * float(radius_scale)
+        radii_np = _collision_radii_from_log_channels(
+            log_scales,
+            radius_scale=radius_scale,
+            radius_convention=radius_convention,
+            scale_reduction=scale_reduction,
+            isotropic_tolerance=isotropic_tolerance,
+        )
     else:
         radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
     radii_np = np.maximum(radii_np, float(min_radius))
@@ -1214,7 +1406,8 @@ def load_gaussian_collision_body_from_ply(
     centers = torch.as_tensor(centers_np, dtype=dtype, device=device)
     radii = torch.as_tensor(radii_np, dtype=dtype, device=device)
     query_points = centers if use_centers_as_queries else None
-    return GaussianCollisionBody(centers, radii, query_points)
+    source_indices = torch.as_tensor(selected, dtype=torch.long, device=device)
+    return GaussianCollisionBody(centers, radii, query_points, source_indices)
 
 
 def load_gaussian_points_from_ply(

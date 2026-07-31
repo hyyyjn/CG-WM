@@ -132,7 +132,7 @@ def main():
             "--stage1_ply", str(ply_path),
             "--output_dir", str(fit_output),
             "--max_frames", "120",
-            "--fit_iters", "200",
+            "--fit_iters", "20",
             "--lr", "0.05",
             "--device", "cpu",
             "--gif_fps", "24",
@@ -151,6 +151,37 @@ def main():
             print("[smoke] stderr:")
             print(result.stderr)
         print("[smoke] returncode:", result.returncode)
+        result.check_returncode()
+
+        summary_path = fit_output / "fit_summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"Fit did not produce {summary_path}.")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        final_loss = float(summary["final_position_loss"])
+        rmse_squared = float(summary["position_rmse"]) ** 2
+        if not np.isclose(final_loss, rmse_squared, rtol=1e-5, atol=1e-10):
+            raise AssertionError(
+                "Restored fit metrics are inconsistent: "
+                f"final_position_loss={final_loss}, position_rmse^2={rmse_squared}."
+            )
+        if not np.isclose(
+            final_loss,
+            float(summary["best_position_loss"]),
+            rtol=1e-5,
+            atol=1e-10,
+        ):
+            raise AssertionError(
+                "Restored parameters do not reproduce best_position_loss: "
+                f"final={final_loss}, best={summary['best_position_loss']}."
+            )
+        print(
+            "[smoke] best-state metrics:",
+            {
+                "best_iteration": summary["best_iteration"],
+                "final_position_loss": final_loss,
+                "position_rmse_squared": rmse_squared,
+            },
+        )
 
 
 if __name__ == "__main__":

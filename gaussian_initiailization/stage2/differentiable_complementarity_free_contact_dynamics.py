@@ -246,6 +246,7 @@ class PairwiseImpedanceDynamicsConfig:
     gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
     dynamic_a: bool = True
     dynamic_b: bool = True
+    kinematic_b: bool = False
     contact_softness: float = 1e-3
     smooth_min_temperature: float = 1e-2
     inside_penalty: float = 0.02
@@ -254,6 +255,11 @@ class PairwiseImpedanceDynamicsConfig:
     broad_phase_margin: float = 0.02
     broad_phase_mode: str = "sphere"
     patch_selection: str = "spatial"
+    body_query_scheme: str = "axis6"
+    body_query_directions: int = 6
+    floor_query_radius_scale: float = 1.1
+    floor_query_rings: int = 5
+    floor_query_angles: int = 32
     linear_damping: float = 0.0
     angular_damping: float = 0.0
     friction_coefficient: float = 0.0
@@ -261,6 +267,8 @@ class PairwiseImpedanceDynamicsConfig:
     tangential_damping: float = 0.0
     friction_softness: float = 1e-6
     friction_transition_velocity: float = 1e-3
+    contact_model: str = "dual_cone"
+    dual_cone_directions: int = 4
 
 
 @dataclass(frozen=True)
@@ -271,6 +279,7 @@ class MultiBodyImpedanceDynamicsConfig:
     masses: tuple[float, ...] | None = None
     inertia_diags: tuple[tuple[float, float, float], ...] | None = None
     dynamic_flags: tuple[bool, ...] | None = None
+    kinematic_flags: tuple[bool, ...] | None = None
     gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
     contact_softness: float = 1e-3
     smooth_min_temperature: float = 1e-2
@@ -290,6 +299,8 @@ class MultiBodyImpedanceDynamicsConfig:
     tangential_damping: float = 0.0
     friction_softness: float = 1e-6
     friction_transition_velocity: float = 1e-3
+    contact_model: str = "dual_cone"
+    dual_cone_directions: int = 4
 
 
 class GaussianUnionFloorContactDynamics:
@@ -394,6 +405,34 @@ def _cross(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return torch.cross(lhs, rhs, dim=-1)
 
 
+def _quat_rotate_wxyz(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    quaternion = _normalize_quaternion(quaternion)
+    scalar = quaternion[..., :1]
+    imaginary = quaternion[..., 1:]
+    twice_cross = 2.0 * _cross(imaginary, vector)
+    return vector + scalar * twice_cross + _cross(imaginary, twice_cross)
+
+
+def _body_inertia_angular_acceleration(
+    torque_world: torch.Tensor,
+    angular_velocity_world: torch.Tensor,
+    quaternion_wxyz: torch.Tensor,
+    inertia_diag_body: torch.Tensor,
+) -> torch.Tensor:
+    """Euler rigid-body equation for a body-frame diagonal inertia tensor."""
+    inverse_quaternion = torch.cat(
+        (quaternion_wxyz[..., :1], -quaternion_wxyz[..., 1:]), dim=-1
+    )
+    torque_body = _quat_rotate_wxyz(inverse_quaternion, torque_world)
+    omega_body = _quat_rotate_wxyz(inverse_quaternion, angular_velocity_world)
+    angular_momentum_body = inertia_diag_body * omega_body
+    coriolis_body = _cross(omega_body, angular_momentum_body)
+    acceleration_body = _safe_inverse_vec(inertia_diag_body) * (
+        torque_body - coriolis_body
+    )
+    return _quat_rotate_wxyz(quaternion_wxyz, acceleration_body)
+
+
 def _safe_inverse_vec(values: torch.Tensor) -> torch.Tensor:
     return 1.0 / torch.clamp(values, min=1e-12)
 
@@ -408,7 +447,12 @@ def _inertia_angular_delta(
     if not dynamic:
         return torch.zeros_like(torque)
     if inertia_matrix is None:
-        inertia = _as_vec3(inertia_diag, dtype=torque.dtype, device=torque.device)
+        if isinstance(inertia_diag, torch.Tensor):
+            inertia = inertia_diag.to(dtype=torque.dtype, device=torque.device)
+            if inertia.shape != (3,):
+                raise ValueError(f"inertia_diag must have shape (3,), got {tuple(inertia.shape)}.")
+        else:
+            inertia = _as_vec3(inertia_diag, dtype=torque.dtype, device=torque.device)
         return _safe_inverse_vec(inertia) * torque
 
     matrix = torch.as_tensor(inertia_matrix, dtype=torque.dtype, device=torque.device)
@@ -498,12 +542,18 @@ class PairwiseGaussianBodyImpedanceDynamics:
         *,
         stiffness: torch.Tensor,
         damping: torch.Tensor,
+        friction_coefficient: torch.Tensor | None = None,
+        mass_a: torch.Tensor | None = None,
+        inertia_diag_a: torch.Tensor | None = None,
         config: Optional[PairwiseImpedanceDynamicsConfig] = None,
     ):
         self.body_a = body_a
         self.body_b = body_b
         self.stiffness = stiffness
         self.damping = damping
+        self.friction_coefficient = friction_coefficient
+        self.mass_a = mass_a
+        self.inertia_diag_a = inertia_diag_a
         self.config = config or PairwiseImpedanceDynamicsConfig()
         self.collision_engine = DifferentiableCollisionEngine(
             CollisionEngineConfig(
@@ -515,10 +565,24 @@ class PairwiseGaussianBodyImpedanceDynamics:
                 broad_phase_margin=self.config.broad_phase_margin,
                 broad_phase_mode=self.config.broad_phase_mode,
                 patch_selection=self.config.patch_selection,
+                body_query_scheme=self.config.body_query_scheme,
+                body_query_directions=self.config.body_query_directions,
+                floor_query_radius_scale=self.config.floor_query_radius_scale,
+                floor_query_rings=self.config.floor_query_rings,
+                floor_query_angles=self.config.floor_query_angles,
             )
         )
 
-    def _predict_free(self, state: RigidBodyState, *, mass: float, dynamic: bool) -> RigidBodyState:
+    def _predict_free(
+        self,
+        state: RigidBodyState,
+        *,
+        mass: float,
+        dynamic: bool,
+        external_force: torch.Tensor | None = None,
+        external_torque: torch.Tensor | None = None,
+        kinematic: bool = False,
+    ) -> RigidBodyState:
         cfg = self.config
         if cfg.dt <= 0.0:
             raise ValueError("dt must be positive.")
@@ -527,11 +591,45 @@ class PairwiseGaussianBodyImpedanceDynamics:
 
         gravity = _as_vec3(cfg.gravity, dtype=state.position.dtype, device=state.position.device)
         if dynamic:
-            linear_velocity = state.linear_velocity + cfg.dt * gravity
+            effective_mass = (
+                torch.as_tensor(float(mass), dtype=state.position.dtype, device=state.position.device)
+                if self.mass_a is None
+                else F.softplus(self.mass_a).to(dtype=state.position.dtype, device=state.position.device)
+            )
+            force = (
+                torch.zeros_like(state.position)
+                if external_force is None
+                else external_force.to(dtype=state.position.dtype, device=state.position.device)
+            )
+            torque = (
+                torch.zeros_like(state.position)
+                if external_torque is None
+                else external_torque.to(dtype=state.position.dtype, device=state.position.device)
+            )
+            linear_velocity = state.linear_velocity + cfg.dt * (
+                gravity + force / torch.clamp(effective_mass, min=1e-9)
+            )
             linear_velocity = linear_velocity * max(0.0, 1.0 - float(cfg.linear_damping) * cfg.dt)
-            angular_velocity = state.angular_velocity * max(0.0, 1.0 - float(cfg.angular_damping) * cfg.dt)
+            effective_inertia = (
+                torch.as_tensor(cfg.inertia_diag_a, dtype=state.position.dtype, device=state.position.device)
+                if self.inertia_diag_a is None
+                else F.softplus(self.inertia_diag_a).to(dtype=state.position.dtype, device=state.position.device)
+            )
+            angular_acceleration = _body_inertia_angular_acceleration(
+                torque,
+                state.angular_velocity,
+                state.quaternion_wxyz,
+                effective_inertia,
+            )
+            angular_velocity = state.angular_velocity + cfg.dt * angular_acceleration
+            angular_velocity = angular_velocity * max(0.0, 1.0 - float(cfg.angular_damping) * cfg.dt)
             position = state.position + cfg.dt * linear_velocity
             quaternion = _integrate_quaternion_wxyz(state.quaternion_wxyz, angular_velocity, cfg.dt)
+        elif kinematic:
+            linear_velocity = state.linear_velocity
+            angular_velocity = state.angular_velocity
+            position = state.position
+            quaternion = _normalize_quaternion(state.quaternion_wxyz)
         else:
             linear_velocity = torch.zeros_like(state.linear_velocity)
             angular_velocity = torch.zeros_like(state.angular_velocity)
@@ -570,33 +668,89 @@ class PairwiseGaussianBodyImpedanceDynamics:
 
         K = F.softplus(self.stiffness).to(dtype=dtype, device=device)
         D = F.softplus(self.damping).to(dtype=dtype, device=device)
-        lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
-        lambdas = weights * lambda_raw
-        normal_forces = lambdas.unsqueeze(-1) * normals
-        friction_forces, friction_diagnostics = _friction_cone_forces(
-            tangential_velocity,
-            weights,
-            lambdas,
-            tangential_damping=torch.as_tensor(float(cfg.tangential_damping), dtype=dtype, device=device),
-            dynamic_mu=torch.as_tensor(float(cfg.friction_coefficient), dtype=dtype, device=device),
-            static_mu=(
-                None
-                if cfg.static_friction_coefficient is None
-                else torch.as_tensor(float(cfg.static_friction_coefficient), dtype=dtype, device=device)
-            ),
-            friction_softness=float(cfg.friction_softness),
-            transition_velocity=float(cfg.friction_transition_velocity),
+        mu = (
+            torch.as_tensor(float(cfg.friction_coefficient), dtype=dtype, device=device)
+            if self.friction_coefficient is None
+            else F.softplus(self.friction_coefficient).to(dtype=dtype, device=device)
         )
-        forces = normal_forces + friction_forces
+        if cfg.contact_model == "dual_cone":
+            num_directions = int(cfg.dual_cone_directions)
+            if num_directions < 2:
+                raise ValueError("dual_cone_directions must be at least 2.")
+            angles = torch.arange(num_directions, dtype=dtype, device=device)
+            angles = angles * (2.0 * torch.pi / float(num_directions))
+            tangent_directions = (
+                torch.cos(angles).reshape(1, -1, 1) * tangent_1.unsqueeze(-2)
+                + torch.sin(angles).reshape(1, -1, 1) * tangent_2.unsqueeze(-2)
+            )
+            # Appendix C: each row of J~ is J^n - mu J^d.  Applying
+            # J~^T lambda therefore produces normal and frictional force in
+            # one closed-form term rather than projecting a separate force.
+            dual_faces = normals.unsqueeze(-2) - mu * tangent_directions
+            dual_velocity = torch.sum(
+                relative_velocity.unsqueeze(-2) * dual_faces, dim=-1
+            )
+            dual_phi = phi.unsqueeze(-1).expand_as(dual_velocity)
+            lambda_raw = F.softplus(
+                -K * (cfg.dt * dual_velocity + dual_phi) - D * dual_velocity
+            )
+            facet_lambdas = weights.unsqueeze(-1) * lambda_raw
+            forces = torch.sum(facet_lambdas.unsqueeze(-1) * dual_faces, dim=-2)
+            normal_forces = (
+                torch.sum(facet_lambdas, dim=-1).unsqueeze(-1) * normals
+            )
+            friction_forces = forces - normal_forces
+            lambdas = torch.sum(facet_lambdas, dim=-1)
+            friction_diagnostics = {
+                "dual_cone_faces": dual_faces,
+                "dual_cone_velocity": dual_velocity,
+                "dual_cone_lambda": facet_lambdas,
+                "effective_friction_coefficient": mu,
+            }
+        elif cfg.contact_model == "projected":
+            lambda_raw = F.softplus(
+                -K * (cfg.dt * normal_velocity + phi) - D * normal_velocity
+            )
+            lambdas = weights * lambda_raw
+            normal_forces = lambdas.unsqueeze(-1) * normals
+            friction_forces, friction_diagnostics = _friction_cone_forces(
+                tangential_velocity,
+                weights,
+                lambdas,
+                tangential_damping=torch.as_tensor(float(cfg.tangential_damping), dtype=dtype, device=device),
+                dynamic_mu=mu,
+                static_mu=(
+                    None
+                    if cfg.static_friction_coefficient is None
+                    else torch.as_tensor(float(cfg.static_friction_coefficient), dtype=dtype, device=device)
+                ),
+                friction_softness=float(cfg.friction_softness),
+                transition_velocity=float(cfg.friction_transition_velocity),
+            )
+            forces = normal_forces + friction_forces
+        else:
+            raise ValueError(
+                f"Unknown contact_model {cfg.contact_model!r}; expected 'dual_cone' or 'projected'."
+            )
         total_force = torch.sum(forces, dim=-2)
         torque_a = torch.sum(_cross(r_a, forces), dim=-2)
         torque_b = torch.sum(_cross(r_b, -forces), dim=-2)
 
-        inv_mass_a = 0.0 if not cfg.dynamic_a else 1.0 / float(cfg.mass_a)
+        effective_mass_a = (
+            torch.as_tensor(float(cfg.mass_a), dtype=dtype, device=device)
+            if self.mass_a is None
+            else F.softplus(self.mass_a).to(dtype=dtype, device=device)
+        )
+        effective_inertia_a = (
+            cfg.inertia_diag_a
+            if self.inertia_diag_a is None
+            else F.softplus(self.inertia_diag_a).to(dtype=dtype, device=device)
+        )
+        inv_mass_a = 0.0 if not cfg.dynamic_a else 1.0 / torch.clamp(effective_mass_a, min=1e-9)
         inv_mass_b = 0.0 if not cfg.dynamic_b else 1.0 / float(cfg.mass_b)
         angular_delta_a = _inertia_angular_delta(
             torque_a,
-            inertia_diag=cfg.inertia_diag_a,
+            inertia_diag=effective_inertia_a,
             inertia_matrix=cfg.inertia_matrix_a,
             dynamic=cfg.dynamic_a,
         )
@@ -623,6 +777,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
             "contacts": contacts,
             "lambda": lambdas,
             "lambda_raw": lambda_raw,
+            "contact_model": cfg.contact_model,
             "normal_velocity": normal_velocity,
             "tangent_basis_1": tangent_1,
             "tangent_basis_2": tangent_2,
@@ -643,12 +798,34 @@ class PairwiseGaussianBodyImpedanceDynamics:
             "inertia_matrix_a": None if cfg.inertia_matrix_a is None else torch.as_tensor(cfg.inertia_matrix_a, dtype=dtype, device=device),
             "inertia_matrix_b": None if cfg.inertia_matrix_b is None else torch.as_tensor(cfg.inertia_matrix_b, dtype=dtype, device=device),
             "broad_phase_overlaps": contacts.broad_phase_overlaps,
+            "effective_mass_a": effective_mass_a,
+            "effective_inertia_diag_a": torch.as_tensor(
+                effective_inertia_a, dtype=dtype, device=device
+            ),
         }
         return next_a, next_b, diagnostics
 
-    def step(self, state_a: RigidBodyState, state_b: RigidBodyState) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
-        predicted_a = self._predict_free(state_a, mass=self.config.mass_a, dynamic=self.config.dynamic_a)
-        predicted_b = self._predict_free(state_b, mass=self.config.mass_b, dynamic=self.config.dynamic_b)
+    def step(
+        self,
+        state_a: RigidBodyState,
+        state_b: RigidBodyState,
+        *,
+        external_force_a: torch.Tensor | None = None,
+        external_torque_a: torch.Tensor | None = None,
+    ) -> tuple[RigidBodyState, RigidBodyState, dict[str, torch.Tensor]]:
+        predicted_a = self._predict_free(
+            state_a,
+            mass=self.config.mass_a,
+            dynamic=self.config.dynamic_a,
+            external_force=external_force_a,
+            external_torque=external_torque_a,
+        )
+        predicted_b = self._predict_free(
+            state_b,
+            mass=self.config.mass_b,
+            dynamic=self.config.dynamic_b,
+            kinematic=self.config.kinematic_b,
+        )
         contacts = self.collision_engine.body_pair_contacts(
             self.body_a,
             predicted_a.position,
@@ -719,11 +896,22 @@ class MultiBodyGaussianImpedanceDynamics:
             )
         return tuple(bool(flag) for flag in self.config.dynamic_flags)
 
+    def _kinematic_flags(self) -> tuple[bool, ...]:
+        if self.config.kinematic_flags is None:
+            return tuple(False for _ in self.bodies)
+        if len(self.config.kinematic_flags) != len(self.bodies):
+            raise ValueError(
+                f"kinematic_flags must have length {len(self.bodies)}, "
+                f"got {len(self.config.kinematic_flags)}."
+            )
+        return tuple(bool(flag) for flag in self.config.kinematic_flags)
+
     def _predict_free(
         self,
         states: Iterable[RigidBodyState],
         masses: tuple[float, ...],
         dynamic_flags: tuple[bool, ...],
+        kinematic_flags: tuple[bool, ...],
     ) -> tuple[RigidBodyState, ...]:
         cfg = self.config
         states = tuple(states)
@@ -732,7 +920,9 @@ class MultiBodyGaussianImpedanceDynamics:
         if cfg.dt <= 0.0:
             raise ValueError("dt must be positive.")
         predicted = []
-        for state, mass, dynamic in zip(states, masses, dynamic_flags):
+        for state, mass, dynamic, kinematic in zip(
+            states, masses, dynamic_flags, kinematic_flags
+        ):
             if mass <= 0.0 and dynamic:
                 raise ValueError("dynamic bodies require positive mass.")
             gravity = _as_vec3(cfg.gravity, dtype=state.position.dtype, device=state.position.device)
@@ -742,6 +932,11 @@ class MultiBodyGaussianImpedanceDynamics:
                 angular_velocity = state.angular_velocity * max(0.0, 1.0 - float(cfg.angular_damping) * cfg.dt)
                 position = state.position + cfg.dt * linear_velocity
                 quaternion = _integrate_quaternion_wxyz(state.quaternion_wxyz, angular_velocity, cfg.dt)
+            elif kinematic:
+                linear_velocity = state.linear_velocity
+                angular_velocity = state.angular_velocity
+                position = state.position
+                quaternion = _normalize_quaternion(state.quaternion_wxyz)
             else:
                 linear_velocity = torch.zeros_like(state.linear_velocity)
                 angular_velocity = torch.zeros_like(state.angular_velocity)
@@ -757,7 +952,10 @@ class MultiBodyGaussianImpedanceDynamics:
         masses = self._masses()
         inertia_diags = self._inertia_diags()
         dynamic_flags = self._dynamic_flags()
-        predicted = self._predict_free(states, masses, dynamic_flags)
+        kinematic_flags = self._kinematic_flags()
+        if any(dynamic and kinematic for dynamic, kinematic in zip(dynamic_flags, kinematic_flags)):
+            raise ValueError("A body cannot be both dynamic and kinematic.")
+        predicted = self._predict_free(states, masses, dynamic_flags, kinematic_flags)
         names = self.names or tuple(f"body_{idx}" for idx in range(len(self.bodies)))
         graph = build_pairwise_contact_graph(
             self.bodies,
@@ -832,20 +1030,58 @@ class MultiBodyGaussianImpedanceDynamics:
             tangent_velocity_1 = torch.sum(relative_velocity * tangent_1, dim=-1)
             tangent_velocity_2 = torch.sum(relative_velocity * tangent_2, dim=-1)
             tangential_velocity = tangent_velocity_1.unsqueeze(-1) * tangent_1 + tangent_velocity_2.unsqueeze(-1) * tangent_2
-            lambda_raw = F.softplus(-K * (cfg.dt * normal_velocity + phi) - D * normal_velocity)
-            lambdas = weights * lambda_raw
-            normal_forces = lambdas.unsqueeze(-1) * normals
-            friction, friction_diagnostics = _friction_cone_forces(
-                tangential_velocity,
-                weights,
-                lambdas,
-                tangential_damping=tangential_damping,
-                dynamic_mu=mu,
-                static_mu=static_mu,
-                friction_softness=float(cfg.friction_softness),
-                transition_velocity=float(cfg.friction_transition_velocity),
-            )
-            patch_forces = normal_forces + friction
+            if cfg.contact_model == "dual_cone":
+                num_directions = int(cfg.dual_cone_directions)
+                if num_directions < 2:
+                    raise ValueError("dual_cone_directions must be at least 2.")
+                angles = torch.arange(num_directions, dtype=dtype, device=device)
+                angles = angles * (2.0 * torch.pi / float(num_directions))
+                tangent_directions = (
+                    torch.cos(angles).reshape(1, -1, 1) * tangent_1.unsqueeze(-2)
+                    + torch.sin(angles).reshape(1, -1, 1) * tangent_2.unsqueeze(-2)
+                )
+                dual_faces = normals.unsqueeze(-2) - mu * tangent_directions
+                dual_velocity = torch.sum(
+                    relative_velocity.unsqueeze(-2) * dual_faces, dim=-1
+                )
+                lambda_raw = F.softplus(
+                    -K * (cfg.dt * dual_velocity + phi.unsqueeze(-1))
+                    - D * dual_velocity
+                )
+                facet_lambdas = weights.unsqueeze(-1) * lambda_raw
+                patch_forces = torch.sum(
+                    facet_lambdas.unsqueeze(-1) * dual_faces, dim=-2
+                )
+                lambdas = torch.sum(facet_lambdas, dim=-1)
+                normal_forces = lambdas.unsqueeze(-1) * normals
+                friction = patch_forces - normal_forces
+                friction_diagnostics = {
+                    "dual_cone_faces": dual_faces,
+                    "dual_cone_velocity": dual_velocity,
+                    "dual_cone_lambda": facet_lambdas,
+                    "effective_friction_coefficient": mu,
+                }
+            elif cfg.contact_model == "projected":
+                lambda_raw = F.softplus(
+                    -K * (cfg.dt * normal_velocity + phi) - D * normal_velocity
+                )
+                lambdas = weights * lambda_raw
+                normal_forces = lambdas.unsqueeze(-1) * normals
+                friction, friction_diagnostics = _friction_cone_forces(
+                    tangential_velocity,
+                    weights,
+                    lambdas,
+                    tangential_damping=tangential_damping,
+                    dynamic_mu=mu,
+                    static_mu=static_mu,
+                    friction_softness=float(cfg.friction_softness),
+                    transition_velocity=float(cfg.friction_transition_velocity),
+                )
+                patch_forces = normal_forces + friction
+            else:
+                raise ValueError(
+                    f"Unknown contact_model {cfg.contact_model!r}; expected 'dual_cone' or 'projected'."
+                )
             total_force_on_i = torch.sum(patch_forces, dim=-2)
             torque_on_i = torch.sum(_cross(r_i, patch_forces), dim=-2)
             torque_on_j = torch.sum(_cross(r_j, -patch_forces), dim=-2)

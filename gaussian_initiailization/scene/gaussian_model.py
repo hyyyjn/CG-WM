@@ -45,6 +45,16 @@ class GaussianModel:
     def _get_isotropic_scaling(self):
         return self._expand_isotropic_scaling(self.scaling_activation(self._scaling))
 
+    def _canonicalize_spherical_parameters(self):
+        """Store the effective SG-GS geometry as isotropic scales and identity rotations."""
+        if self._scaling.numel() > 0:
+            scale = self.scaling_activation(self._scaling).mean(dim=1, keepdim=True)
+            log_scale = self.scaling_inverse_activation(torch.clamp(scale, min=1e-12)).repeat(1, 3)
+            self._scaling = nn.Parameter(log_scale.detach().requires_grad_(True))
+        if self._rotation.numel() > 0:
+            rotation = self._identity_rotation(self._rotation.shape[0], self._rotation.device)
+            self._rotation = nn.Parameter(rotation, requires_grad=False)
+
     def setup_functions(self):
         # edit this
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -202,6 +212,7 @@ class GaussianModel:
         if self._object_ids.numel() == 0:
             self._object_ids = torch.zeros((self._xyz.shape[0],), dtype=torch.int32, device=self._xyz.device)
 
+        self._canonicalize_spherical_parameters()
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -304,7 +315,7 @@ class GaussianModel:
         self._foreground_logit = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
         self._object_ids = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.int32, device="cuda")
         self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._rotation = nn.Parameter(rots, requires_grad=False)
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
@@ -326,7 +337,9 @@ class GaussianModel:
             {'params': [self._foreground_logit], 'lr': training_args.feature_lr, "name": "f_fg"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            # Keep the group for densification/checkpoint compatibility, but
+            # freeze spherical-Gaussian rotation exactly.
+            {'params': [self._rotation], 'lr': 0.0, "name": "rotation"},
         ]
 
         def build_optimizer(param_groups):
@@ -437,7 +450,7 @@ class GaussianModel:
             }
 
     def geometry_parameters(self):
-        return [self._xyz, self._scaling, self._rotation, self._features_geo, self._foreground_logit]
+        return [self._xyz, self._scaling, self._features_geo, self._foreground_logit]
 
     def appearance_parameters(self):
         return [self._features_dc, self._features_rest, self._opacity]
@@ -448,6 +461,7 @@ class GaussianModel:
     def set_parameter_requires_grad(self, geometry_enabled, appearance_enabled, exposure_enabled):
         for param in self.geometry_parameters():
             param.requires_grad_(geometry_enabled)
+        self._rotation.requires_grad_(False)
         for param in self.appearance_parameters():
             param.requires_grad_(appearance_enabled)
         for param in self.exposure_parameters():
@@ -482,8 +496,10 @@ class GaussianModel:
         foreground_logit = self._foreground_logit.detach().cpu().numpy()
         object_ids = self._object_ids.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        # Persist the effective spherical representation, not stale anisotropic
+        # checkpoint channels that are ignored by the SG-GS renderer.
+        scale = torch.log(torch.clamp(self.get_scaling, min=1e-12)).detach().cpu().numpy()
+        rotation = self.get_rotation.detach().cpu().numpy()
 
         dtype_full = []
         for attribute in self.construct_list_of_attributes():
@@ -494,6 +510,20 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        metadata_path = os.path.splitext(path)[0] + ".spherical.json"
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(
+                {
+                    "representation": "isotropic_spherical_gaussian",
+                    "ply_scale_semantics": "gaussian_standard_deviation_s",
+                    "collision_radius_formula": "r=2s",
+                    "scale_channels_equal": True,
+                    "rotation": "identity_frozen",
+                    "version": 1,
+                },
+                metadata_file,
+                indent=2,
+            )
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -572,7 +602,11 @@ class GaussianModel:
         self._object_ids = torch.tensor(object_ids, dtype=torch.int32, device="cuda")
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._rotation = nn.Parameter(
+            torch.tensor(rots, dtype=torch.float, device="cuda"),
+            requires_grad=False,
+        )
+        self._canonicalize_spherical_parameters()
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -623,6 +657,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._rotation.requires_grad_(False)
         self._object_ids = self._object_ids[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
@@ -673,6 +708,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._rotation.requires_grad_(False)
         self._object_ids = torch.cat((self._object_ids, new_object_ids.to(self._object_ids.device, dtype=self._object_ids.dtype)))
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))

@@ -18,3 +18,4 @@ dependencies:
     - submodules/fused-ssim
     - opencv-python
     - joblib
+    - kornia==0.6.12

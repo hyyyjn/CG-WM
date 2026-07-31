@@ -27,6 +27,7 @@ from gaussian_renderer import GaussianModel  # noqa: E402
 from gaussian_renderer import render as gs_render  # noqa: E402
 from scene.cameras import MiniCam  # noqa: E402
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2  # noqa: E402
+from utils.loss_utils import ssim  # noqa: E402
 
 
 class PipelineParams:
@@ -45,7 +46,15 @@ class GaussianRenderLossConfig:
     cam_fovy_deg: float = 40.0
     white_background: bool = False
     scale_multiplier: float = 1.0
+    collision_radius_to_gaussian_scale: float = 0.5
     loss: str = "l1"
+    ssim_weight: float = 0.2
+    loftr_weight: float = 0.1
+    loftr_pretrained: str = "outdoor"
+    loftr_confidence_threshold: float = 0.2
+    loftr_max_matches: int = 1024
+    loftr_min_matches: int = 8
+    loftr_patch_radius: int = 2
 
 
 def mujoco_cam0_c2w_fov(cam_distance: float, cam_height: float, fovy_deg: float, width: int, height: int):
@@ -113,6 +122,68 @@ def load_rgb_sequence(
     return torch.stack(frames, dim=0)
 
 
+def load_mask_sequence(
+    mask_dir: Path,
+    frame_indices: list[int],
+    *,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    frames = []
+    for frame_index in frame_indices:
+        path = mask_dir / f"{int(frame_index):06d}.png"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing mask supervision frame: {path}")
+        image = Image.open(path).convert("L").resize((int(width), int(height)), Image.Resampling.NEAREST)
+        frames.append(torch.as_tensor(np.asarray(image, dtype=np.float32) / 255.0, dtype=dtype, device=device))
+    return torch.stack(frames, dim=0).unsqueeze(1)
+
+
+def gaussian_image_loss(
+    rendered: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    config: GaussianRenderLossConfig,
+    masks: torch.Tensor | None = None,
+    background: torch.Tensor | None = None,
+    loftr_loss=None,
+) -> tuple[torch.Tensor, dict]:
+    if masks is not None:
+        if background is None:
+            raise ValueError("masked image loss requires a background color")
+        bg = background.reshape(1, 3, 1, 1)
+        rendered = rendered * masks + bg * (1.0 - masks)
+        targets = targets * masks + bg * (1.0 - masks)
+    l1_loss = F.l1_loss(rendered, targets)
+    ssim_loss = 1.0 - ssim(rendered, targets)
+    if config.loss == "mse":
+        loss = F.mse_loss(rendered, targets)
+    elif config.loss == "l1":
+        loss = l1_loss
+    elif config.loss == "l1_ssim":
+        weight = min(max(float(config.ssim_weight), 0.0), 1.0)
+        loss = (1.0 - weight) * l1_loss + weight * ssim_loss
+    elif config.loss == "l1_loftr":
+        if loftr_loss is None:
+            raise ValueError("l1_loftr requires an initialized LoFTR loss module.")
+        feature_loss, feature_diagnostics = loftr_loss(rendered, targets, masks=masks)
+        loss = l1_loss + float(config.loftr_weight) * feature_loss
+    else:
+        raise ValueError(f"Unsupported Gaussian render loss: {config.loss!r}")
+    diagnostics = {
+        "gaussian_render_loss": float(loss.detach().cpu().item()),
+        "gaussian_render_l1": float(l1_loss.detach().cpu().item()),
+        "gaussian_render_ssim": float((1.0 - ssim_loss).detach().cpu().item()),
+        "gaussian_render_masked": masks is not None,
+    }
+    if config.loss == "l1_loftr":
+        diagnostics.update(feature_diagnostics)
+        diagnostics["loftr_weight"] = float(config.loftr_weight)
+    return loss, diagnostics
+
+
 class Stage2GaussianRenderLoss:
     """Render Stage 2 rigid poses and compare them to RGB supervision frames."""
 
@@ -123,6 +194,8 @@ class Stage2GaussianRenderLoss:
         gt_rgb_dir: Path,
         frame_indices: list[int],
         config: GaussianRenderLossConfig,
+        gaussian_indices: list[int] | None = None,
+        gt_mask_dir: Path | None = None,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cuda",
     ) -> None:
@@ -134,6 +207,10 @@ class Stage2GaussianRenderLoss:
         self.config = config
         self.device = device
         self.base_asset = load_renderable_gaussian_asset(stage1_ply, dtype=dtype, device=device)
+        if gaussian_indices is not None:
+            self.base_asset = self.base_asset.index_select(
+                torch.as_tensor(gaussian_indices, dtype=torch.long, device=device)
+            )
         self.camera = make_mujoco_cam0_minicam(config, device=device)
         bg_value = 1.0 if bool(config.white_background) else 0.0
         self.background = torch.full((3,), bg_value, dtype=dtype, device=device)
@@ -145,10 +222,54 @@ class Stage2GaussianRenderLoss:
             dtype=dtype,
             device=device,
         )
+        self.masks = (
+            None
+            if gt_mask_dir is None
+            else load_mask_sequence(
+                gt_mask_dir,
+                frame_indices,
+                width=int(config.image_width),
+                height=int(config.image_height),
+                dtype=dtype,
+                device=device,
+            )
+        )
+        self.loftr_loss = None
+        if config.loss == "l1_loftr":
+            from gaussian_initiailization.stage2.differentiable_loftr_loss import (
+                LoFTRCorrespondenceLoss,
+            )
+            self.loftr_loss = LoFTRCorrespondenceLoss(
+                pretrained=str(config.loftr_pretrained),
+                confidence_threshold=float(config.loftr_confidence_threshold),
+                max_matches=int(config.loftr_max_matches),
+                min_matches=int(config.loftr_min_matches),
+                patch_radius=int(config.loftr_patch_radius),
+            ).to(device)
 
-    def render_frame(self, positions: torch.Tensor, quaternions_wxyz: torch.Tensor) -> torch.Tensor:
+    def render_frame(
+        self,
+        positions: torch.Tensor,
+        quaternions_wxyz: torch.Tensor,
+        *,
+        geometry_centers: torch.Tensor | None = None,
+        geometry_radii: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if positions.ndim == 1:
+            positions = positions.reshape(1, 3)
+        if quaternions_wxyz.ndim == 1:
+            quaternions_wxyz = quaternions_wxyz.reshape(1, 4)
+        asset = self.base_asset
+        if geometry_centers is not None or geometry_radii is not None:
+            if geometry_centers is None or geometry_radii is None:
+                raise ValueError("geometry_centers and geometry_radii must be provided together")
+            asset = asset.with_spherical_geometry(
+                geometry_centers,
+                geometry_radii,
+                radius_to_scale=float(self.config.collision_radius_to_gaussian_scale),
+            )
         scene_asset = instantiate_rigid_gaussian_scene(
-            self.base_asset,
+            asset,
             positions,
             quaternions_wxyz,
             scale_multiplier=float(self.config.scale_multiplier),
@@ -157,27 +278,88 @@ class Stage2GaussianRenderLoss:
         copy_asset_to_gaussian_model(scene_asset, gaussians)
         return gs_render(self.camera, gaussians, PipelineParams(), self.background, separate_sh=False)["render"]
 
-    def render_sequence(self, positions: torch.Tensor, quaternions_wxyz: torch.Tensor) -> torch.Tensor:
+    def render_sequence(
+        self,
+        positions: torch.Tensor,
+        quaternions_wxyz: torch.Tensor,
+        *,
+        geometry_centers: torch.Tensor | None = None,
+        geometry_radii: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         frames = [
-            self.render_frame(positions[idx], quaternions_wxyz[idx])
+            self.render_frame(
+                positions[idx],
+                quaternions_wxyz[idx],
+                geometry_centers=geometry_centers,
+                geometry_radii=geometry_radii,
+            )
             for idx in range(int(positions.shape[0]))
         ]
         return torch.stack(frames, dim=0)
 
-    def __call__(self, positions: torch.Tensor, quaternions_wxyz: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        rendered = self.render_sequence(positions, quaternions_wxyz)
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        quaternions_wxyz: torch.Tensor,
+        *,
+        geometry_centers: torch.Tensor | None = None,
+        geometry_radii: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        rendered = self.render_sequence(
+            positions,
+            quaternions_wxyz,
+            geometry_centers=geometry_centers,
+            geometry_radii=geometry_radii,
+        )
         targets = self.targets[: rendered.shape[0]]
-        if self.config.loss == "mse":
-            loss = F.mse_loss(rendered, targets)
-        elif self.config.loss == "l1":
-            loss = F.l1_loss(rendered, targets)
-        else:
-            raise ValueError(f"Unsupported Gaussian render loss: {self.config.loss!r}")
+        masks = None if self.masks is None else self.masks[: rendered.shape[0]]
+        loss, image_diagnostics = gaussian_image_loss(
+            rendered,
+            targets,
+            config=self.config,
+            masks=masks,
+            background=self.background,
+            loftr_loss=self.loftr_loss,
+        )
         diagnostics = {
-            "gaussian_render_loss": float(loss.detach().cpu().item()),
+            **image_diagnostics,
             "gaussian_render_frames": int(rendered.shape[0]),
             "gaussian_render_width": int(self.config.image_width),
             "gaussian_render_height": int(self.config.image_height),
             "gaussian_render_scale_multiplier": float(self.config.scale_multiplier),
         }
         return loss, diagnostics
+
+
+class MultiViewStage2GaussianRenderLoss:
+    """Average image supervision from multiple calibrated fixed-camera views."""
+
+    def __init__(self, views: list[Stage2GaussianRenderLoss]) -> None:
+        if not views:
+            raise ValueError("at least one Gaussian render-loss view is required")
+        self.views = views
+
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        quaternions_wxyz: torch.Tensor,
+        *,
+        geometry_centers: torch.Tensor | None = None,
+        geometry_radii: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        losses, view_diagnostics = [], []
+        for view in self.views:
+            loss, diagnostics = view(
+                positions,
+                quaternions_wxyz,
+                geometry_centers=geometry_centers,
+                geometry_radii=geometry_radii,
+            )
+            losses.append(loss)
+            view_diagnostics.append(diagnostics)
+        loss = torch.stack(losses).mean()
+        return loss, {
+            "gaussian_render_loss": float(loss.detach().cpu().item()),
+            "gaussian_render_num_views": len(self.views),
+            "gaussian_render_views": view_diagnostics,
+        }

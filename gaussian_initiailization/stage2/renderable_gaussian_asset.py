@@ -49,6 +49,53 @@ class RenderableGaussianAsset:
     def num_gaussians(self) -> int:
         return int(self.xyz.shape[0])
 
+    def index_select(self, indices: torch.Tensor) -> "RenderableGaussianAsset":
+        indices = indices.to(dtype=torch.long, device=self.xyz.device)
+        return RenderableGaussianAsset(
+            xyz=self.xyz[indices],
+            features_dc=self.features_dc[indices],
+            features_rest=self.features_rest[indices],
+            opacity=self.opacity[indices],
+            scaling=self.scaling[indices],
+            rotation=self.rotation[indices],
+            features_geo=self.features_geo[indices],
+            foreground_logit=self.foreground_logit[indices],
+            object_ids=self.object_ids[indices],
+            sh_degree=self.sh_degree,
+        )
+
+    def with_spherical_geometry(
+        self,
+        centers: torch.Tensor,
+        collision_radii: torch.Tensor,
+        *,
+        radius_to_scale: float = 0.5,
+    ) -> "RenderableGaussianAsset":
+        """Replace geometry using paper spherical primitives.
+
+        ContactGaussian-WM defines collision radius ``r = 2s`` for Gaussian
+        scale ``s``. ``radius_to_scale=1`` reproduces legacy checkpoints where
+        collision radius and renderer scale were treated as equal.
+        """
+        if centers.shape != self.xyz.shape or collision_radii.shape != (self.num_gaussians,):
+            raise ValueError("geometry override must match the selected renderable Gaussian count")
+        gaussian_scales = collision_radii * float(radius_to_scale)
+        log_scales = torch.log(torch.clamp(gaussian_scales, min=1e-8)).unsqueeze(-1).expand(-1, 3)
+        identity = torch.zeros_like(self.rotation)
+        identity[:, 0] = 1.0
+        return RenderableGaussianAsset(
+            xyz=centers,
+            features_dc=self.features_dc,
+            features_rest=self.features_rest,
+            opacity=self.opacity,
+            scaling=log_scales,
+            rotation=identity,
+            features_geo=self.features_geo,
+            foreground_logit=self.foreground_logit,
+            object_ids=self.object_ids,
+            sh_degree=self.sh_degree,
+        )
+
     @property
     def activated_scaling(self) -> torch.Tensor:
         return torch.exp(self.scaling)
