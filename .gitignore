@@ -9,6 +9,9 @@ demo_output/
 # Multi-dice / smoke test outputs (regenerate via test.md)
 actual_*/
 
+# Stage data/results live under output/ after the module reorg (not tracked)
+output/
+
 __pycache__/
 *.pyc
 *.pyo

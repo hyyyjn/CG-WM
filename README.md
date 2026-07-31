@@ -6,6 +6,15 @@ ContactGaussian-WM 논문 아이디어를 바탕으로 Stage 1 Gaussian scene in
 
 `gaussian_initiailization/` 폴더명에는 기존 저장소의 오타(`initiailization`)가 그대로 남아 있습니다.
 
+## 실험 결과물 위치
+
+MuJoCo 데이터셋과 Stage 2 결과물은 저장소 루트의 `output/` 아래에 모읍니다 (git 미추적).
+
+```text
+output/actual_cola_can_*_data/     MuJoCo GT 에피소드 (rgb/, masks/, state/trajectory.json)
+output/actual_cola_can_*_output/   Stage 2 fit 결과, 렌더, 비교 GIF
+```
+
 ## 구현 범위
 
 ### Stage 1: Gaussian Initialization

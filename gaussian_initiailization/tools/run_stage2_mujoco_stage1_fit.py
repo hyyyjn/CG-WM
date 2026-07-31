@@ -119,19 +119,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query_mode",
         default="floor_disk",
-        choices=("floor_disk", "body_surface"),
+        choices=("floor_disk", "body_surface", "body_lowest_k"),
         help=(
             "floor_disk: environment-side XY disk query points under the object, "
             "evaluated against the Gaussian union SDF (default, original behaviour). "
             "body_surface: object-side query points sampled on the Gaussian primitives "
-            "(make_gaussian_proxy_query_points), evaluated against the floor plane."
+            "(make_gaussian_proxy_query_points), evaluated against the floor plane. "
+            "body_lowest_k: same object-side sampling as body_surface, but each step "
+            "keeps only the K lowest (deepest) points as the contact patch, so friction "
+            "is summed over the real contact set instead of the whole body surface."
         ),
     )
     parser.add_argument(
         "--body_query_dirs",
         default=6,
         type=int,
-        help="Directions per Gaussian for --query_mode body_surface (6 = axis dirs, else Fibonacci).",
+        help="Directions per Gaussian for --query_mode body_surface/body_lowest_k (6 = axis dirs, else Fibonacci).",
+    )
+    parser.add_argument(
+        "--body_lowest_k",
+        default=32,
+        type=int,
+        help=(
+            "Number of lowest body-surface query points kept as the contact patch for "
+            "--query_mode body_lowest_k. Smaller = tighter patch, weaker aggregate friction."
+        ),
+    )
+    parser.add_argument(
+        "--body_query_scheme",
+        default="axis6",
+        choices=("axis6", "fibonacci", "analytic"),
+        help=(
+            "How object-side query points are sampled per Gaussian primitive. "
+            "axis6: 6 local axis directions (original). "
+            "fibonacci: --body_query_dirs directions on a Fibonacci lattice (denser, more uniform). "
+            "analytic: the exact lowest point of each sphere in world frame (c_world - r*n). "
+            "axis6/fibonacci sample in the LOCAL frame, so the sampled points rotate with the body "
+            "and miss the true lowest point by up to r*(1-cos t) when tilted; analytic is exact for "
+            "spherical primitives at any orientation and needs only one point per primitive."
+        ),
     )
     parser.add_argument(
         "--floor_friction_mode",
@@ -653,6 +679,24 @@ def angular_velocity_from_quaternions(quaternions: torch.Tensor, dt: float) -> t
     return (vec / vec_norm) * (angle / float(dt)).unsqueeze(-1)
 
 
+def _resolve_num_query_points(
+    query_mode: str,
+    body_query_scheme: str,
+    body_lowest_k: int,
+    local_query_points: torch.Tensor | None,
+    num_primitives: int,
+    num_floor_offsets: int,
+) -> int:
+    """Query points actually used per step (the contact patch size)."""
+    if query_mode not in ("body_surface", "body_lowest_k"):
+        return int(num_floor_offsets)
+    # analytic builds one point per primitive on the fly; the others precompute a pool.
+    pool = int(num_primitives) if body_query_scheme == "analytic" else int(local_query_points.shape[0])
+    if query_mode == "body_lowest_k":
+        return min(int(body_lowest_k), pool)
+    return pool
+
+
 def _floor_contact_response(
     predicted_position: torch.Tensor,
     predicted_velocity: torch.Tensor,
@@ -671,6 +715,8 @@ def _floor_contact_response(
     query_mode: str,
     local_query_points: torch.Tensor | None,
     friction_coefficient: torch.Tensor | None,
+    body_lowest_k: int = 0,
+    body_query_scheme: str = "axis6",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One frictional floor-contact impulse. Returns (velocity, gate, penetration).
 
@@ -678,10 +724,30 @@ def _floor_contact_response(
     contact weight), and each point's slip carries its own ω×r_i lever, so a
     tilted rim contact produces the correct net tangential impulse and the spin
     it induces — not a single averaged-point approximation.
+
+    ``body_lowest_k`` mode keeps only the K lowest world-z query points as the
+    contact patch each step. body_surface sums friction over every primitive's
+    surface samples (1080 pts), which over-broadens the contact patch and
+    over-damps the induced planar motion; restricting to the real lowest points
+    keeps the aggregate Coulomb friction physical.
     """
-    if query_mode == "body_surface":
-        query_points = oriented_centers(local_query_points, predicted_position, orientation)
+    if query_mode in ("body_surface", "body_lowest_k"):
+        if body_query_scheme == "analytic":
+            # A sphere's lowest point against a plane is c_world - r*n regardless of
+            # body orientation. Local-frame direction sampling rotates with the body
+            # and therefore misses it; this is exact and needs one point per primitive.
+            centers_world = oriented_centers(local_centers, predicted_position, orientation)
+            query_points = centers_world - radii.unsqueeze(-1) * normal.unsqueeze(0)
+        else:
+            query_points = oriented_centers(local_query_points, predicted_position, orientation)
         signed_distances = query_points[:, 2]
+        if query_mode == "body_lowest_k":
+            k = min(int(body_lowest_k), int(signed_distances.shape[0]))
+            if k > 0:
+                # Lowest = smallest signed z = deepest into / closest to the floor.
+                _, keep_idx = torch.topk(signed_distances, k, largest=False)
+                query_points = query_points[keep_idx]
+                signed_distances = signed_distances[keep_idx]
         penetrations = F.softplus(-signed_distances / contact_softness) * contact_softness
         contact_weights = torch.sigmoid(-signed_distances / contact_softness)
     else:
@@ -755,10 +821,16 @@ def simulate(
     friction_coefficient: torch.Tensor | None = None,
     angular_velocity_sequence: torch.Tensor | None = None,
     substeps: int = 1,
+    body_lowest_k: int = 0,
+    body_query_scheme: str = "axis6",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Legacy reflection+slop dynamics (kept for --dynamics restitution)."""
-    if query_mode == "body_surface" and local_query_points is None:
-        raise ValueError("query_mode='body_surface' requires local_query_points.")
+    if (
+        query_mode in ("body_surface", "body_lowest_k")
+        and body_query_scheme != "analytic"
+        and local_query_points is None
+    ):
+        raise ValueError(f"query_mode='{query_mode}' requires local_query_points.")
     collider = PlaneCollider.floor(dtype=initial_position.dtype, device=initial_position.device)
     normal = collider.normal.to(dtype=initial_position.dtype, device=initial_position.device)
     position = initial_position
@@ -805,6 +877,8 @@ def simulate(
                 query_mode=query_mode,
                 local_query_points=local_query_points,
                 friction_coefficient=friction_coefficient,
+                body_lowest_k=body_lowest_k,
+                body_query_scheme=body_query_scheme,
             )
             if floor_tangential_damping > 0.0:
                 tangent_velocity = velocity - torch.sum(velocity * normal) * normal
@@ -1036,8 +1110,8 @@ def fit_stage2(
 
     dynamics_mode = str(args.dynamics)
     query_mode = str(args.query_mode)
-    if query_mode == "body_surface" and dynamics_mode == "pairwise_impedance":
-        raise ValueError("--query_mode body_surface is not supported with --dynamics pairwise_impedance.")
+    if query_mode in ("body_surface", "body_lowest_k") and dynamics_mode == "pairwise_impedance":
+        raise ValueError(f"--query_mode {query_mode} is not supported with --dynamics pairwise_impedance.")
     use_impedance = dynamics_mode == "impedance"
     use_pairwise = dynamics_mode == "pairwise_impedance"
     initial_position = target_positions[0].detach()
@@ -1205,6 +1279,8 @@ def fit_stage2(
             friction_coefficient=friction_coefficient,
             angular_velocity_sequence=angular_velocity_sequence,
             substeps=int(args.substeps),
+            body_lowest_k=int(getattr(args, "body_lowest_k", 0)),
+            body_query_scheme=str(getattr(args, "body_query_scheme", "axis6")),
         )
         return predicted_positions, None, gates
 
@@ -1257,10 +1333,21 @@ def fit_stage2(
         "frames": int(target_positions.shape[0]),
         "dynamics": dynamics_mode,
         "query_mode": query_mode,
-        "num_query_points": (
-            int(local_query_points.shape[0])
-            if query_mode == "body_surface" and local_query_points is not None
-            else int(floor_query_offsets_xy.shape[0])
+        "num_query_points": _resolve_num_query_points(
+            query_mode,
+            str(getattr(args, "body_query_scheme", "axis6")),
+            int(getattr(args, "body_lowest_k", 0)),
+            local_query_points,
+            int(local_centers.shape[0]),
+            int(floor_query_offsets_xy.shape[0]),
+        ),
+        "body_lowest_k": (
+            int(getattr(args, "body_lowest_k", 0)) if query_mode == "body_lowest_k" else None
+        ),
+        "body_query_scheme": (
+            str(getattr(args, "body_query_scheme", "axis6"))
+            if query_mode in ("body_surface", "body_lowest_k")
+            else None
         ),
         "num_primitives_a": int(local_centers.shape[0]),
         "radius_scale": float(args.radius_scale),
@@ -1532,12 +1619,20 @@ def main() -> None:
         device=torch.device(args.device),
     )
     local_query_points = None
-    if str(args.query_mode) == "body_surface":
-        local_query_points = make_gaussian_proxy_query_points(
-            local_centers,
-            radii,
-            directions_per_gaussian=int(args.body_query_dirs),
-        )
+    if str(args.query_mode) in ("body_surface", "body_lowest_k"):
+        scheme = str(args.body_query_scheme)
+        if scheme == "analytic":
+            # Query points depend on world orientation, so they are built per step
+            # inside _floor_contact_response rather than precomputed in local frame.
+            local_query_points = None
+        else:
+            # axis6 -> the 6 axis directions; fibonacci -> --body_query_dirs directions.
+            dirs = 6 if scheme == "axis6" else max(int(args.body_query_dirs), 4)
+            local_query_points = make_gaussian_proxy_query_points(
+                local_centers,
+                radii,
+                directions_per_gaussian=dirs,
+            )
     predicted_positions, predicted_quaternions, contact_gates, diagnostics = fit_stage2(
         target_positions_cpu,
         target_quaternions_cpu,
@@ -1563,9 +1658,18 @@ def main() -> None:
             "predicted_position": predicted_positions[idx].tolist(),
             "contact_gate": float(contact_gates[idx - 1].item()) if idx > 0 and idx - 1 < contact_gates.numel() else 0.0,
         }
-        if predicted_quaternions is not None:
+        if target_quaternions_cpu is not None:
+            # Restitution dynamics does not predict orientation; it reads omega
+            # from the GT quaternion sequence. Persist the GT orientation so the
+            # trajectory renderer tumbles the object consistently across query
+            # modes (orientation is the controlled variable — only the predicted
+            # position differs between modes).
             state_payload["target_quaternion_wxyz"] = target_quaternions_cpu[idx].tolist()
-            state_payload["predicted_quaternion_wxyz"] = predicted_quaternions[idx].tolist()
+            state_payload["predicted_quaternion_wxyz"] = (
+                predicted_quaternions[idx].tolist()
+                if predicted_quaternions is not None
+                else target_quaternions_cpu[idx].tolist()
+            )
         trajectory_states.append(state_payload)
 
     trajectory = {
