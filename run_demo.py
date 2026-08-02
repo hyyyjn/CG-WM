@@ -20,7 +20,8 @@ from pathlib import Path
 # ──────────────────────────────────────────────
 
 REPO = Path(__file__).parent
-SCRIPTS = REPO
+STAGE1 = REPO / "stage1"
+TOOLS = REPO / "tools"
 
 
 def run(cmd: list, **kwargs):
@@ -122,7 +123,7 @@ def main():
 
     # ── STEP 1  multi-view dataset ──────────────
     print("\n[STEP 1] Generating MuJoCo synthetic dataset...")
-    py(SCRIPTS / "generate_mujoco_synthetic_dataset.py", [
+    py(STAGE1 / "generate_mujoco_synthetic_dataset.py", [
         "--output_root", str(output_root),
         "--scene_name",  scene,
         "--object_type", obj,
@@ -136,7 +137,7 @@ def main():
     # ── STEP 2  Stage 1 training ────────────────
     if not args.skip_stage1:
         print(f"\n[STEP 2] Stage 1 Gaussian training ({args.stage1_iters} iters)...")
-        py(SCRIPTS / "train.py", [
+        py(STAGE1 / "train.py", [
             "--source_path",            str(dataset_dir),
             "--model_path",             str(model_dir),
             "--iterations",             str(args.stage1_iters),
@@ -196,7 +197,7 @@ def main():
 
     print("\n[STEP 3b] Auditing Stage 1 PLY (warn-only)...")
     try:
-        py(SCRIPTS / "tools" / "audit_stage1_ply.py", [
+        py(TOOLS / "audit_stage1_ply.py", [
             "--stage1_ply",           str(ply_path),
             "--object_asset",         str(asset_json),
             "--foreground_threshold", str(args.foreground_threshold),
@@ -207,7 +208,7 @@ def main():
 
     # ── STEP 4  Stage 2 layout ──────────────────
     print("\n[STEP 4] Creating Stage 2 dataset layout...")
-    py(SCRIPTS / "tools" / "create_contactwm_stage2_layout.py", [
+    py(TOOLS / "create_contactwm_stage2_layout.py", [
         "--dataset_root",      str(output_root),
         "--object_asset",      str(asset_json),
         "--scenario",          "fall_and_rebound",
@@ -220,7 +221,7 @@ def main():
 
     # ── STEP 5  fall trajectories ───────────────
     print("\n[STEP 5] Generating MuJoCo fall trajectories...")
-    py(SCRIPTS / "tools" / "generate_mujoco_fall_dataset.py", [
+    py(TOOLS / "generate_mujoco_fall_dataset.py", [
         "--dataset_root",       str(output_root),
         "--object_name",        scene,
         "--split",              "all",
@@ -243,7 +244,7 @@ def main():
 
     # ── STEP 6  Stage 2 fitting ─────────────────
     print("\n[STEP 6] Fitting Stage 2 contact dynamics...")
-    py(SCRIPTS / "tools" / "run_stage2_mujoco_stage1_fit.py", [
+    py(TOOLS / "run_stage2_mujoco_stage1_fit.py", [
         "--episode_root",              str(episode_root),
         "--stage1_model_path",         str(model_dir),
         "--output_dir",                str(fit_output),
@@ -264,7 +265,7 @@ def main():
     # ── STEP 7  GT GIF ──────────────────────────
     print("\n[STEP 7] Exporting GT episode GIF...")
     gt_gif = fit_output / "gt_episode.gif"
-    py(SCRIPTS / "tools" / "export_episode_gif.py", [
+    py(TOOLS / "export_episode_gif.py", [
         "--rgb_dir",      str(episode_root / "rgb"),
         "--output_gif",   str(gt_gif),
         "--fps",          "20",
@@ -274,7 +275,7 @@ def main():
     # ── STEP 8  comparison GIF ──────────────────
     print("\n[STEP 8] Rendering GT vs 3DGS comparison GIF...")
     comparison_gif = fit_output / "comparison_gt_vs_3dgs.gif"
-    py(SCRIPTS / "tools" / "render_trajectory_comparison.py", [
+    py(TOOLS / "render_trajectory_comparison.py", [
         "--episode_root",          str(episode_root),
         "--predicted_trajectory",  str(fit_output / "predicted_trajectory.json"),
         "--stage1_model_path",     str(model_dir),

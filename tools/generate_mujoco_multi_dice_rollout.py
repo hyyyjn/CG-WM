@@ -15,8 +15,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate an actual MuJoCo multi-dice rollout.")
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--dice_count", default=5, type=int)
+    parser.add_argument(
+        "--scenario",
+        default="random_roll",
+        choices=("random_roll", "head_on_collision"),
+        help="Initial-state preset. head_on_collision is a deterministic two-cube collision on the floor.",
+    )
     parser.add_argument("--frames", default=180, type=int)
     parser.add_argument("--fps", default=30, type=int)
+    parser.add_argument(
+        "--playback_fps",
+        default=None,
+        type=int,
+        help="GIF playback rate. Defaults to --fps; use a lower value for slow-motion playback.",
+    )
     parser.add_argument("--width", default=960, type=int)
     parser.add_argument("--height", default=540, type=int)
     parser.add_argument("--timestep", default=0.002, type=float)
@@ -135,8 +147,19 @@ def build_mjcf(dice_count: int, half: float, timestep: float, width: int, height
 """.strip()
 
 
-def set_initial_state(model, data, rng: np.random.Generator, dice_count: int) -> list[dict]:
+def set_initial_state(
+    model,
+    data,
+    rng: np.random.Generator,
+    dice_count: int,
+    *,
+    scenario: str,
+    half_extent: float,
+) -> list[dict]:
     import mujoco
+
+    if scenario == "head_on_collision" and dice_count != 2:
+        raise ValueError("head_on_collision requires exactly --dice_count 2.")
 
     starts = np.linspace(-0.50, 0.50, dice_count)
     initial_states = []
@@ -144,36 +167,36 @@ def set_initial_state(model, data, rng: np.random.Generator, dice_count: int) ->
         joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"die_{idx:02d}_free")
         qpos_adr = model.jnt_qposadr[joint_id]
         qvel_adr = model.jnt_dofadr[joint_id]
-        x = starts[idx] + rng.uniform(-0.025, 0.025)
-        y = -0.48 + rng.uniform(-0.035, 0.035)
-        target_x = rng.uniform(-0.10, 0.10)
-        target_y = rng.uniform(0.38, 0.58)
-        travel = np.array([target_x - x, target_y - y], dtype=np.float64)
-        travel_norm = max(float(np.linalg.norm(travel)), 1e-6)
-        travel_dir = travel / travel_norm
-        speed = rng.uniform(1.55, 2.15)
-        pos = np.array(
-            [
-                x,
-                y,
-                0.62 + 0.075 * idx + rng.uniform(-0.018, 0.018),
-            ],
-            dtype=np.float64,
-        )
-        quat = euler_xyz_to_quat(
-            rng.uniform(-math.pi, math.pi),
-            rng.uniform(-math.pi, math.pi),
-            rng.uniform(-math.pi, math.pi),
-        )
-        linvel = np.array(
-            [
-                speed * travel_dir[0],
-                speed * travel_dir[1],
-                rng.uniform(0.05, 0.28),
-            ],
-            dtype=np.float64,
-        )
-        angvel = rng.uniform(-34.0, 34.0, size=3).astype(np.float64)
+        if scenario == "head_on_collision":
+            # Resting on the plane: this gives a legible, repeatable collision
+            # rather than two independently thrown dice that may miss each other.
+            sign = 1.0 if idx == 0 else -1.0
+            pos = np.array([sign * 0.28, 0.0, half_extent + 0.001], dtype=np.float64)
+            quat = euler_xyz_to_quat(0.0, 0.0, 0.16 * sign)
+            linvel = np.array([-sign * 2.20, 0.0, 0.0], dtype=np.float64)
+            # A small opposing spin makes the rebound less sterile while keeping
+            # both cubes aligned enough for the contact to be clearly visible.
+            angvel = np.array([0.0, 0.0, -sign * 2.2], dtype=np.float64)
+        else:
+            x = starts[idx] + rng.uniform(-0.025, 0.025)
+            y = -0.48 + rng.uniform(-0.035, 0.035)
+            target_x = rng.uniform(-0.10, 0.10)
+            target_y = rng.uniform(0.38, 0.58)
+            travel = np.array([target_x - x, target_y - y], dtype=np.float64)
+            travel_norm = max(float(np.linalg.norm(travel)), 1e-6)
+            travel_dir = travel / travel_norm
+            speed = rng.uniform(1.55, 2.15)
+            pos = np.array([x, y, 0.62 + 0.075 * idx + rng.uniform(-0.018, 0.018)], dtype=np.float64)
+            quat = euler_xyz_to_quat(
+                rng.uniform(-math.pi, math.pi),
+                rng.uniform(-math.pi, math.pi),
+                rng.uniform(-math.pi, math.pi),
+            )
+            linvel = np.array(
+                [speed * travel_dir[0], speed * travel_dir[1], rng.uniform(0.05, 0.28)],
+                dtype=np.float64,
+            )
+            angvel = rng.uniform(-34.0, 34.0, size=3).astype(np.float64)
         data.qpos[qpos_adr : qpos_adr + 3] = pos
         data.qpos[qpos_adr + 3 : qpos_adr + 7] = quat
         data.qvel[qvel_adr : qvel_adr + 3] = linvel
@@ -333,6 +356,9 @@ def main() -> None:
     import mujoco
 
     dice_count = max(1, min(int(args.dice_count), 8))
+    playback_fps = int(args.playback_fps or args.fps)
+    if playback_fps <= 0:
+        raise ValueError("--playback_fps must be positive.")
     half = 0.055
     output_dir = args.output_dir.resolve()
     rgb_dir = output_dir / "rgb"
@@ -347,7 +373,9 @@ def main() -> None:
     )
     data = mujoco.MjData(model)
     rng = np.random.default_rng(int(args.seed))
-    initial_states = set_initial_state(model, data, rng, dice_count)
+    initial_states = set_initial_state(
+        model, data, rng, dice_count, scenario=args.scenario, half_extent=half
+    )
     geom_ids_by_die = die_geom_ids(model, dice_count)
     renderer = None if args.skip_render else mujoco.Renderer(model, height=int(args.height), width=int(args.width))
     steps_per_frame = max(1, int(round(1.0 / (float(args.fps) * float(args.timestep)))))
@@ -355,15 +383,23 @@ def main() -> None:
     states = []
     gif_frames = []
     for frame_idx in range(int(args.frames)):
+        contacts_in_frame: dict[tuple[int, int], dict] = {}
         for _ in range(steps_per_frame):
             mujoco.mj_step(model, data)
+            for contact in capture_contacts(model, data):
+                key = (int(contact["body_i"]), int(contact["body_j"]))
+                if key not in contacts_in_frame or float(contact["distance"]) < float(contacts_in_frame[key]["distance"]):
+                    contacts_in_frame[key] = contact
 
         stem = f"{frame_idx:06d}"
         frame_payload = {
             "frame_index": frame_idx,
             "time": float(data.time),
             "dice": capture_state(model, data, dice_count),
-            "mujoco_contacts": capture_contacts(model, data),
+            # A contact can begin and end between two video samples. Keep the
+            # closest contact seen during this frame's physics substeps so the
+            # trajectory is usable as dynamics/contact supervision.
+            "mujoco_contacts": [contacts_in_frame[key] for key in sorted(contacts_in_frame)],
         }
         states.append(frame_payload)
 
@@ -384,7 +420,7 @@ def main() -> None:
         save_masks(segmentation, geom_ids_by_die, masks_root, stem)
 
     gif_path = output_dir / "multi_dice_mujoco_gt.gif"
-    imageio.mimsave(gif_path, gif_frames, fps=int(args.fps))
+    imageio.mimsave(gif_path, gif_frames, fps=playback_fps)
     montage_path = output_dir / "multi_dice_mujoco_gt_montage.png"
     montage_count = min(12, len(gif_frames))
     montage_indices = np.linspace(0, len(gif_frames) - 1, montage_count).round().astype(int).tolist()
@@ -401,7 +437,9 @@ def main() -> None:
         {
             "generator": "generate_mujoco_multi_dice_rollout.py",
             "dice_count": dice_count,
+            "scenario": args.scenario,
             "fps": int(args.fps),
+            "playback_fps": playback_fps,
             "timestep": float(args.timestep),
             "half_extent": half,
             "initial_states": initial_states,
