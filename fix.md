@@ -101,7 +101,7 @@ z축은 쿼리 방식이 직접 작용하는 축이다. 바운스 정점은 floo
 
 ```bash
 # 1) GT 에피소드 생성
-python gaussian_initiailization/tools/generate_mujoco_fall_dataset.py \
+python  tools/generate_mujoco_fall_dataset.py \
   --dataset_root <DATA_ROOT> --object_name cola_can_dynamic --split train \
   --camera_distance 2.5 --camera_height 1.3 \
   --camera_target_x 0.72 --camera_target_y -0.62 --camera_target_z 0.32 \
@@ -110,7 +110,7 @@ python gaussian_initiailization/tools/generate_mujoco_fall_dataset.py \
   --cylinder_solref "0.01 0.2" --floor_solref "0.01 0.2" --seed 2
 
 # 2) Stage 2 fit (쿼리 모드만 바꿔 2회)
-python gaussian_initiailization/tools/run_stage2_mujoco_stage1_fit.py \
+python  tools/run_stage2_mujoco_stage1_fit.py \
   --episode_root <EPISODE> --stage1_ply <STAGE1_PLY> --output_dir <OUT> \
   --dynamics restitution --query_mode {floor_disk|body_surface} \
   --floor_friction_mode learned --floor_friction_init 0.10 --init_restitution 0.55 \
@@ -262,4 +262,4 @@ axis6/fib26/fib48/fib96은 통계적으로 구별 불가. (analytic만 base에�
 
 MuJoCo 데이터셋·Stage 2 결과물을 저장소 루트 `output/` 아래로 모으고 `.gitignore`에 추가.
 (top-level `stage1/`·`stage2/` 래퍼 폴더도 시도했으나 실익이 없어 되돌림 — 진입점은
-`gaussian_initiailization/tools/` 아래 기존 위치를 그대로 쓴다.)
+` tools/` 아래 기존 위치를 그대로 쓴다.)

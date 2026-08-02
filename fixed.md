@@ -6,7 +6,7 @@
 
 ## 변경 파일
 
-- `gaussian_initiailization/tools/render_stage2_gaussian_trajectory.py`
+- ` tools/render_stage2_gaussian_trajectory.py`
 
 ## 주요 변경 사항
 
@@ -25,7 +25,7 @@
 ## 사용 예시
 
 ```powershell
-python gaussian_initiailization/tools/render_stage2_gaussian_trajectory.py `
+python  tools/render_stage2_gaussian_trajectory.py `
   --stage1_ply actual_dice_stage1_output/professor_dice_asset_stage1_30000/point_cloud/iteration_30000/point_cloud.ply `
   --trajectory actual_multi_dice_stage2_rollout/impulse_baseline_60f/stage2_predicted_trajectory.json `
   --output_dir actual_multi_dice_gaussian_render/impulse_baseline_60f_3dgs_gtcam_scale135 `

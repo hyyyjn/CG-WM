@@ -29,7 +29,7 @@ Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting에 안정적으로 연�
 
 ### Stage 1 PLY audit 추가
 
-- `gaussian_initiailization/tools/audit_stage1_ply.py`를 추가했다.
+- ` tools/audit_stage1_ply.py`를 추가했다.
 - foreground Gaussian bbox가 manifest의 metric bbox와 어느 정도 맞는지 확인한다.
 - 낮은 iteration의 빠른 실험에서는 audit이 실패할 수 있으므로 `run_demo.ps1`에서는 현재 warn-only로 둔다.
 
@@ -73,7 +73,7 @@ Stage 1에서 만든 3DGS PLY를 Stage 2 물리 fitting에 안정적으로 연�
 
 ### 비교 렌더링 추가
 
-- `gaussian_initiailization/tools/render_trajectory_comparison.py`를 추가했다.
+- ` tools/render_trajectory_comparison.py`를 추가했다.
 - MuJoCo GT 영상과 Stage 2 predicted trajectory를 Stage 1 3DGS로 렌더링한 결과를 side-by-side GIF로 만든다.
 - camera convention과 target orientation 반영을 맞췄다.
 

@@ -55,7 +55,7 @@ ContactGaussian-WM 논문 아이디어를 바탕으로 Stage 1 Gaussian scene in
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/compare_query_modes.py \
+   tools/compare_query_modes.py \
   --episode_root <episode_root> \
   --stage1_ply <point_cloud.ply> \
   --output_root <comparison_output> \
@@ -162,7 +162,7 @@ Body B는 prescribed kinematic motion을 그대로 따르고 접촉 반력으로
 Articulated link는 `ArticulatedLink`와 `forward_kinematics`로 구성합니다.
 
 ```python
-from gaussian_initiailization.stage2.articulated_kinematics import (
+from stage2.articulated_kinematics import (
     ArticulatedLink,
     forward_kinematics,
     link_velocities_from_poses,
@@ -203,7 +203,7 @@ URDF/MJCF 모델과 기록된 joint trajectory는 다음 명령으로 Stage-2 li
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/prepare_articulated_trajectory.py \
+   tools/prepare_articulated_trajectory.py \
   --model <robot.urdf_or_mjcf.xml> \
   --joint_trajectory <joint_trajectory.json> \
   --output_dir <articulated_trajectory_output>
@@ -238,7 +238,7 @@ Joint trajectory는 아래 두 형식 중 하나를 사용할 수 있습니다.
 실험에 바로 사용할 수 있고, 여러 link는 8번의 `MultiBodyGaussianImpedanceDynamics`
 입력 state로 함께 사용할 수 있습니다.
 
-`gaussian_initiailization/` 폴더명에는 기존 저장소의 오타(`initiailization`)가 그대로 남아 있습니다.
+` ` 폴더명에는 기존 저장소의 오타(`initiailization`)가 그대로 남아 있습니다.
 
 ## 실험 결과물 위치
 
@@ -265,12 +265,12 @@ output/actual_cola_can_*_output/   Stage 2 fit 결과, 렌더, 비교 GIF
 주요 파일:
 
 ```text
-gaussian_initiailization/train.py
-gaussian_initiailization/render.py
-gaussian_initiailization/metrics.py
-gaussian_initiailization/export_physics_scene.py
-gaussian_initiailization/stage1_training_presets.json
-gaussian_initiailization/tools/run_stage1_training_schedule.py
+ stage1/train.py
+ stage1/render.py
+ stage1/metrics.py
+ stage1/export_physics_scene.py
+ stage1_training_presets.json
+ tools/run_stage1_training_schedule.py
 ```
 
 ### Stage 2: Differentiable Collision And Dynamics
@@ -290,14 +290,14 @@ gaussian_initiailization/tools/run_stage1_training_schedule.py
 주요 파일:
 
 ```text
-gaussian_initiailization/stage2/differentiable_collision_detection.py
-gaussian_initiailization/stage2/differentiable_contact_graph.py
-gaussian_initiailization/stage2/differentiable_complementarity_free_contact_dynamics.py
-gaussian_initiailization/stage2/renderable_gaussian_asset.py
-gaussian_initiailization/stage2/differentiable_gaussian_render_loss.py
-gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py
-gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py
-gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py
+ stage2/differentiable_collision_detection.py
+ stage2/differentiable_contact_graph.py
+ stage2/differentiable_complementarity_free_contact_dynamics.py
+ stage2/renderable_gaussian_asset.py
+ stage2/differentiable_gaussian_render_loss.py
+ tools/generate_mujoco_multi_dice_rollout.py
+ tools/run_stage2_multi_dice_rollout_comparison.py
+ tools/evaluate_multi_dice_stage2_variants.py
 ```
 
 ## 빠른 실행
@@ -307,7 +307,7 @@ gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py
 실제 학습을 돌리기 전에 어떤 명령이 실행되는지 확인합니다.
 
 ```bash
-python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+python  tools/run_stage1_training_schedule.py \
   --preset dice_smoke \
   --dry_run
 ```
@@ -315,7 +315,7 @@ python gaussian_initiailization/tools/run_stage1_training_schedule.py \
 ContactGaussian-WM 스타일 preset은 SAM feature가 필요합니다.
 
 ```bash
-python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+python  tools/run_stage1_training_schedule.py \
   --preset contactwm_smoke \
   --dry_run \
   --print_json
@@ -324,7 +324,7 @@ python gaussian_initiailization/tools/run_stage1_training_schedule.py \
 ### Stage 1 Smoke Schedule
 
 ```bash
-python gaussian_initiailization/tools/run_stage1_training_schedule.py \
+python  tools/run_stage1_training_schedule.py \
   --preset dice_smoke
 ```
 
@@ -333,7 +333,7 @@ python gaussian_initiailization/tools/run_stage1_training_schedule.py \
 ### Multi-Dice MuJoCo Dataset
 
 ```bash
-conda run -n mujoco python gaussian_initiailization/tools/generate_mujoco_multi_dice_rollout.py \
+conda run -n mujoco python  tools/generate_mujoco_multi_dice_rollout.py \
   --output_root actual_multi_dice_mujoco \
   --scene_name demo_codex \
   --num_dice 3 \
@@ -345,9 +345,9 @@ conda run -n mujoco python gaussian_initiailization/tools/generate_mujoco_multi_
 ### Stage 2 Rollout Comparison
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
+conda run -n gaussian_splatting python  tools/run_stage2_multi_dice_rollout_comparison.py \
   --trajectory actual_multi_dice_mujoco/demo_codex/trajectory.json \
-  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
+  --stage1_ply  output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
   --output_dir actual_stage2_comparison/demo_codex \
   --dynamics_backend stage2_impedance \
   --fit_iters 40 \
@@ -360,9 +360,9 @@ conda run -n gaussian_splatting python gaussian_initiailization/tools/run_stage2
 ### Stage 2 Variant Evaluation
 
 ```bash
-conda run -n gaussian_splatting python gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
+conda run -n gaussian_splatting python  tools/evaluate_multi_dice_stage2_variants.py \
   --trajectory actual_multi_dice_mujoco/demo_codex/trajectory.json \
-  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
+  --stage1_ply  output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
   --output_root actual_stage2_eval/demo_codex \
   --variants impulse stage2 velocity_fit physics_fit \
   --max_frames 100
@@ -379,13 +379,6 @@ multi_dice_stage2_variant_report.csv
 
 Stage 2 pose trajectory를 Gaussian renderer로 렌더링하고 RGB supervision loss를 걸 수 있는 hook이 구현되어 있습니다.
 
-```bash
-conda run -n gaussian_splatting python gaussian_initiailization/tools/render_stage2_gaussian_pose_smoke.py \
-  --stage1_ply gaussian_initiailization/output/<stage1_model>/point_cloud/iteration_30000/point_cloud.ply \
-  --output_path actual_stage2_render/pose_smoke.png \
-  --device cuda
-```
-
 주의: `diff-gaussian-rasterization` 기반 renderer는 CUDA가 필요합니다. CPU-only 환경에서는 renderer backward까지 검증할 수 없습니다.
 
 Single-body pairwise fitting에서도 trajectory, geometry, Gaussian RGB supervision을 하나의
@@ -393,7 +386,7 @@ objective로 사용할 수 있습니다.
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/run_stage2_mujoco_stage1_fit.py \
+   tools/run_stage2_mujoco_stage1_fit.py \
   --episode_root <episode_root> \
   --stage1_ply <point_cloud.ply> \
   --dynamics pairwise_impedance \
@@ -444,7 +437,7 @@ loss와 parameter prior만으로 best state를 선택합니다.
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/run_stage2_mujoco_stage1_fit.py \
+   tools/run_stage2_mujoco_stage1_fit.py \
   --episode_root <episode_root> \
   --stage1_ply <point_cloud.ply> \
   --dynamics pairwise_impedance \
@@ -504,30 +497,6 @@ config, episode manifest, Stage-I 및 환경 PLY 해시, `fit_summary.json`,
 ablation·holdout runner도 내부적으로 같은 fit entrypoint를 사용하므로 모든 하위 run에
 동일한 bundle이 생성됩니다.
 
-## 검증한 항목
-
-최근 smoke 기준으로 확인한 항목입니다.
-
-- Python syntax compile
-- Gaussian union SDF와 aggregate contact gradient
-- pairwise/multibody contact dynamics rollout
-- pairwise `axis6`/`fibonacci`/`analytic` body-query generation and gradient
-- friction cone projection gradient
-- geometry refinement parameter save/load
-- Stage 2 evaluator dry/smoke run
-- Stage 1 schedule dry run
-
-대표 검증 명령:
-
-```bash
-python -m py_compile \
-  gaussian_initiailization/stage2/differentiable_collision_detection.py \
-  gaussian_initiailization/stage2/differentiable_complementarity_free_contact_dynamics.py \
-  gaussian_initiailization/tools/run_stage2_multi_dice_rollout_comparison.py \
-  gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
-  gaussian_initiailization/tools/run_stage1_training_schedule.py
-```
-
 ## Query budget ablation
 
 Query scheme 비교에서 geometry resolution과 query 수의 효과가 섞이지 않도록 두 suite를
@@ -535,7 +504,7 @@ Query scheme 비교에서 geometry resolution과 query 수의 효과가 섞이�
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/run_query_budget_ablations.py \
+   tools/run_query_budget_ablations.py \
   --episode_root <episode_root> \
   --stage1_ply <point_cloud.ply> \
   --output_root <ablation_output>
@@ -556,7 +525,7 @@ conda run -n gaussian_splatting python \
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/run_multi_episode_holdout_comparison.py \
+   tools/run_multi_episode_holdout_comparison.py \
   --dataset_manifest <dataset_manifest.json> \
   --output_root <holdout_output>
 ```
@@ -575,7 +544,7 @@ metric은 `multi_episode_holdout_report.json`에 저장됩니다.
 
 ```bash
 conda run -n gaussian_splatting python \
-  gaussian_initiailization/tools/run_stage2_mujoco_stage1_fit.py \
+   tools/run_stage2_mujoco_stage1_fit.py \
   --episode_root <episode_root> \
   --stage1_ply <point_cloud.ply> \
   --prefit_initial_state \
@@ -600,12 +569,12 @@ conda run -n gaussian_splatting python \
 __pycache__/
 *.pyc
 actual_*/
-gaussian_initiailization/output/
-gaussian_initiailization/stage2/_outputs/
-gaussian_initiailization/sam_features_sam2/
-gaussian_initiailization/**/visual_hull/
-gaussian_initiailization/**/physics_export/
-gaussian_initiailization/**/build/
+ output/
+ stage2/_outputs/
+ sam_features_sam2/
+ **/visual_hull/
+ **/physics_export/
+ **/build/
 ```
 
 학습된 모델 checkpoint, 렌더 결과, MuJoCo rollout, evaluation report는 필요한 경우 별도 artifact storage에 보관하는 것을 권장합니다.
@@ -623,14 +592,12 @@ gaussian_initiailization/**/build/
 git switch -c contactgaussian-wm-stage1-stage2
 git add -u
 git add \
-  gaussian_initiailization/stage1_training_presets.json \
-  gaussian_initiailization/stage2/differentiable_gaussian_render_loss.py \
-  gaussian_initiailization/stage2/renderable_gaussian_asset.py \
-  gaussian_initiailization/tools/evaluate_multi_dice_stage2_variants.py \
-  gaussian_initiailization/tools/render_stage2_gaussian_pose_smoke.py \
-  gaussian_initiailization/tools/render_stage2_gaussian_trajectory.py \
-  gaussian_initiailization/tools/run_stage1_training_schedule.py \
-  gaussian_initiailization/tools/smoke_stage2_gaussian_render_loss_backward.py
+   stage1_training_presets.json \
+   stage2/differentiable_gaussian_render_loss.py \
+   stage2/renderable_gaussian_asset.py \
+   tools/evaluate_multi_dice_stage2_variants.py \
+   tools/render_stage2_gaussian_trajectory.py \
+   tools/run_stage1_training_schedule.py
 git commit -m "Implement ContactGaussian-WM stage1 stage2 prototype"
 git push -u origin contactgaussian-wm-stage1-stage2
 ```

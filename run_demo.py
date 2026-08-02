@@ -20,7 +20,7 @@ from pathlib import Path
 # ──────────────────────────────────────────────
 
 REPO = Path(__file__).parent
-SCRIPTS = REPO / "gaussian_initiailization"
+SCRIPTS = REPO
 
 
 def run(cmd: list, **kwargs):

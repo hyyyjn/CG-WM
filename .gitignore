@@ -17,20 +17,20 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-gaussian_initiailization/output/
-gaussian_initiailization/stage2/_outputs/
-gaussian_initiailization/sam_features_sam2/
-gaussian_initiailization/**/masked_colmap/
-gaussian_initiailization/**/visual_hull/
-gaussian_initiailization/**/physics_export/
-gaussian_initiailization/**/build/
-gaussian_initiailization/**/*.log
-gaussian_initiailization/**/*.jsonl
+output/
+stage2/_outputs/
+sam_features_sam2/
+**/masked_colmap/
+**/visual_hull/
+**/physics_export/
+**/build/
+**/*.log
+**/*.jsonl
 
-gaussian_initiailization/submodules/simple-knn/build/
-gaussian_initiailization/submodules/simple-knn/**/*.so
-gaussian_initiailization/submodules/diff-gaussian-rasterization/**/*.so
-gaussian_initiailization/submodules/fused-ssim/**/*.so
+submodules/simple-knn/build/
+submodules/simple-knn/**/*.so
+submodules/diff-gaussian-rasterization/**/*.so
+submodules/fused-ssim/**/*.so
 
-gaussian_initiailization/**/__pycache__/
-gaussian_initiailization/lpipsPyTorch/**/__pycache__/
+**/__pycache__/
+stage1/lpipsPyTorch/**/__pycache__/
