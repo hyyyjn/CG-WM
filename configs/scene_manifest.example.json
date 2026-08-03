@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "scene_id": "rigid_contact_000",
+  "bodies": [
+    {
+      "id": "object_00",
+      "role": "dynamic",
+      "render": {
+        "gaussian_ply": "../output/can_stage1_check_model_fixed/point_cloud/iteration_3000/point_cloud.ply",
+        "opacity_threshold": 0.05,
+        "recenter": true
+      },
+      "collision": {
+        "type": "gaussian_union",
+        "radius_convention": "paper_r2s",
+        "max_primitives": 512
+      },
+      "physics": {
+        "mass": {"mode": "learned", "initial": 0.35},
+        "inertia": {"mode": "learned", "initial_diagonal": [0.001, 0.001, 0.001]}
+      },
+      "initialization": {
+        "state_json": "initial_state.example.json"
+      }
+    }
+  ],
+  "environment": [
+    {
+      "id": "surface_00",
+      "role": "static",
+      "render": {
+        "gaussian_ply": "../output/floor_stage1_model/render_floor_grid/point_cloud.ply"
+      },
+      "collision": {
+        "type": "plane",
+        "normal": [0.0, 0.0, 1.0],
+        "height": 0.0
+      }
+    }
+  ],
+  "observations": {
+    "rgb_dir": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/rgb",
+    "instance_mask_dir": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/masks",
+    "fps": 30
+  },
+  "contact_pairs": [
+    {
+      "body_a": "object_00",
+      "body_b": "surface_00",
+      "model": "dual_cone",
+      "friction": {"mode": "learned", "initial": 0.4},
+      "stiffness": {"mode": "learned", "initial": 800.0},
+      "damping": {"mode": "learned", "initial": 30.0}
+    }
+  ],
+  "actions": {"type": "zero_wrench"},
+  "training": {
+    "supervision": "image_only",
+    "fit_iterations": 500,
+    "image_loss": "l1_loftr"
+  }
+}

@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--ground_size", default=4.0, type=float)
     parser.add_argument("--camera_distance", default=6.0, type=float)
     parser.add_argument("--camera_height", default=3.0, type=float)
+    parser.add_argument("--camera_fovy", default=45.0, type=float)
     parser.add_argument(
         "--camera_target_z",
         default=0.0,
@@ -72,6 +73,11 @@ def parse_args():
         type=str,
     )
     parser.add_argument("--floor_rgba", default="0.92 0.92 0.92 1")
+    parser.add_argument("--floor_rgb1", default="0.62 0.64 0.66", type=str)
+    parser.add_argument("--floor_rgb2", default="0.55 0.57 0.59", type=str)
+    parser.add_argument("--floor_texrepeat", default=12.0, type=float)
+    parser.add_argument("--sky_rgb1", default="0.72 0.80 0.90", type=str)
+    parser.add_argument("--sky_rgb2", default="0.96 0.97 0.98", type=str)
     parser.add_argument("--skybox_rgb", default="255,255,255")
     parser.add_argument("--sphere_solref", default="0.02 0.2", type=str)
     parser.add_argument("--box_solref", default="", type=str)
@@ -81,6 +87,14 @@ def parse_args():
     parser.add_argument("--box_friction", default="0.35 0.01 0.001", type=str)
     parser.add_argument("--cylinder_friction", default="0.55 0.02 0.001", type=str)
     parser.add_argument("--freejoint_damping", default=0.05, type=float)
+    parser.add_argument("--initial_position", default="", type=str, help="Optional fixed x,y,z for every episode.")
+    parser.add_argument("--initial_euler_deg", default="", type=str, help="Optional fixed XYZ Euler angles in degrees.")
+    parser.add_argument(
+        "--initial_quaternion_wxyz", default="", type=str,
+        help="Optional fixed w,x,y,z quaternion; takes precedence over --initial_euler_deg.",
+    )
+    parser.add_argument("--initial_linear_velocity", default="", type=str, help="Optional fixed vx,vy,vz.")
+    parser.add_argument("--initial_angular_velocity", default="", type=str, help="Optional fixed wx,wy,wz.")
     parser.add_argument(
         "--vertical_speed_train",
         default=0.0,
@@ -150,6 +164,15 @@ def parse_face_colors(face_colors_arg):
     return colors[:6]
 
 
+def parse_optional_vec3(value, name):
+    if not str(value).strip():
+        return None
+    values = [float(item) for item in str(value).replace(",", " ").split()]
+    if len(values) != 3:
+        raise ValueError(f"{name} expects exactly three comma- or space-separated values")
+    return np.asarray(values, dtype=np.float64)
+
+
 def cola_can_visual_xml(radius: float, half_height: float) -> str:
     r = float(radius)
     h = float(half_height)
@@ -180,6 +203,7 @@ def euler_xyz_to_quat(rx, ry, rz):
 def build_mjcf(
     half_extents,
     physics_shape,
+    object_mass,
     object_rgba,
     floor_rgba,
     gravity,
@@ -190,6 +214,7 @@ def build_mjcf(
     camera_target_z,
     camera_target_x,
     camera_target_y,
+    camera_fovy,
     sphere_solref,
     box_solref,
     cylinder_solref,
@@ -202,8 +227,16 @@ def build_mjcf(
     object_rgb2,
     box_face_colors,
     visual_model,
+    floor_rgb1,
+    floor_rgb2,
+    floor_texrepeat,
+    sky_rgb1,
+    sky_rgb2,
 ):
     hx, hy, hz = [float(v) for v in half_extents]
+    object_mass = float(object_mass)
+    if object_mass <= 0.0:
+        raise ValueError("object_mass must be positive")
     # General look-at from camera pos (0, -camera_distance, camera_height) to the
     # target point. MuJoCo cameras look along -z_cam with xyaxes = right, up.
     _px, _py, _pz = 0.0, -float(camera_distance), float(camera_height)
@@ -230,7 +263,7 @@ def build_mjcf(
         body_name = "sphere"
         geom_xml = (
             f'<geom name="{geom_name}" type="sphere" size="{radius}" rgba="{object_rgba}" '
-            f'density="1000" friction="{sphere_friction}" solref="{sphere_solref}"/>'
+            f'mass="{object_mass}" friction="{sphere_friction}" solref="{sphere_solref}"/>'
         )
     elif physics_shape == "cylinder":
         radius = max(hx, hy)
@@ -241,7 +274,7 @@ def build_mjcf(
         extras = cola_can_visual_xml(radius, half_height) if visual_model == "cola_can" else ""
         geom_xml = (
             f'<geom name="{geom_name}" type="cylinder" size="{radius} {half_height}" rgba="{body_rgba}" '
-            f'density="1000" friction="{cylinder_friction}"{cylinder_solref_attr}/>\n'
+            f'mass="{object_mass}" friction="{cylinder_friction}"{cylinder_solref_attr}/>\n'
             f"      {extras}"
         ).rstrip()
     else:
@@ -267,26 +300,28 @@ def build_mjcf(
         )
         geom_xml = (
             f'<geom name="{geom_name}" type="box" size="{hx} {hy} {hz}" rgba="0.14 0.14 0.16 1" '
-            f'density="1000" friction="{box_friction}"{box_solref_attr}/>\n'
+            f'mass="{object_mass}" friction="{box_friction}"{box_solref_attr}/>\n'
             f"      {face_geom_xml}"
         )
     return f"""
 <mujoco model="contactwm_cube_fall">
   <option timestep="{timestep}" gravity="0 0 {gravity}" integrator="Euler"/>
   <visual>
-    <headlight diffuse="0.8 0.8 0.8" ambient="0.3 0.3 0.3" specular="0.1 0.1 0.1"/>
-    <rgba haze="1 1 1 1"/>
+    <headlight diffuse="0.65 0.65 0.65" ambient="0.22 0.22 0.22" specular="0.18 0.18 0.18"/>
+    <rgba haze="0.82 0.86 0.92 1"/>
   </visual>
   <asset>
-    <texture name="texplane" type="2d" builtin="checker" rgb1="0.96 0.96 0.96" rgb2="0.88 0.88 0.88" width="256" height="256"/>
-    <material name="matplane" texture="texplane" texrepeat="2 2" reflectance="0.05"/>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="{sky_rgb1}" rgb2="{sky_rgb2}" width="512" height="3072"/>
+    <texture name="texplane" type="2d" builtin="checker" rgb1="{floor_rgb1}" rgb2="{floor_rgb2}" width="512" height="512"/>
+    <material name="matplane" texture="texplane" texrepeat="{floor_texrepeat} {floor_texrepeat}" reflectance="0.03" shininess="0.08"/>
     <texture name="texobject" type="cube" builtin="checker" rgb1="{object_rgb1}" rgb2="{object_rgb2}" width="256" height="256"/>
     <material name="matobject" texture="texobject" texuniform="true" reflectance="0.1"/>
   </asset>
   <worldbody>
-    <light pos="0 0 6" dir="0 0 -1" directional="true"/>
+    <light pos="-2 -3 5" dir="0.25 0.35 -1" directional="true" diffuse="0.85 0.82 0.78" castshadow="true"/>
+    <light pos="3 -1 2.5" dir="-1 0.2 -0.5" directional="true" diffuse="0.25 0.28 0.35" specular="0.1 0.1 0.1"/>
     <geom name="floor" type="plane" size="{ground_size} {ground_size} 0.1" material="matplane" rgba="{floor_rgba}"{floor_solref_attr}/>
-    <camera name="cam0" pos="0 -{camera_distance} {camera_height}" xyaxes="{camera_xyaxes}"/>
+    <camera name="cam0" pos="0 -{camera_distance} {camera_height}" xyaxes="{camera_xyaxes}" fovy="{camera_fovy}"/>
     <body name="{body_name}" pos="0 0 2">
       <joint name="root_free" type="free" damping="{freejoint_damping}"/>
       {geom_xml}
@@ -298,6 +333,20 @@ def build_mjcf(
 
 def save_rgb(path: Path, rgb):
     Image.fromarray(rgb).save(path)
+
+
+def save_rollout_gif(rgb_dir: Path, output_path: Path, fps: int):
+    paths = sorted(rgb_dir.glob("*.png"))
+    if not paths:
+        return
+    frames = []
+    for path in paths:
+        with Image.open(path) as image:
+            frames.append(image.convert("RGB").copy())
+    frames[0].save(
+        output_path, save_all=True, append_images=frames[1:],
+        duration=max(1, round(1000 / fps)), loop=0,
+    )
 
 
 def save_mask(path: Path, segmentation, object_geom_ids):
@@ -474,10 +523,15 @@ def main():
     half_extents = derive_half_extents(object_manifest)
     physics_shape = str(object_manifest.get("physics_shape", "box"))
     visual_model = str(object_manifest.get("visual_model", object_manifest.get("object_type", physics_shape)))
+    physics_prior = dict(object_manifest.get("physics_prior") or {})
+    object_mass = float(physics_prior.get("mass_kg", 1.0))
+    if object_mass <= 0.0:
+        raise ValueError("object_manifest physics_prior.mass_kg must be positive")
 
     mjcf = build_mjcf(
         half_extents=half_extents,
         physics_shape=physics_shape,
+        object_mass=object_mass,
         object_rgba=args.object_rgba,
         floor_rgba=args.floor_rgba,
         gravity=args.gravity,
@@ -488,6 +542,7 @@ def main():
         camera_target_z=args.camera_target_z,
         camera_target_x=args.camera_target_x,
         camera_target_y=args.camera_target_y,
+        camera_fovy=args.camera_fovy,
         sphere_solref=args.sphere_solref,
         box_solref=args.box_solref,
         cylinder_solref=args.cylinder_solref,
@@ -500,8 +555,20 @@ def main():
         object_rgb2=args.object_rgb2,
         box_face_colors=args.box_face_colors,
         visual_model=visual_model,
+        floor_rgb1=args.floor_rgb1,
+        floor_rgb2=args.floor_rgb2,
+        floor_texrepeat=args.floor_texrepeat,
+        sky_rgb1=args.sky_rgb1,
+        sky_rgb2=args.sky_rgb2,
     )
     model = mujoco.MjModel.from_xml_string(mjcf)
+    moving_body_id = int(model.jnt_bodyid[0])
+    actual_mass = float(model.body_mass[moving_body_id])
+    actual_inertia = [float(value) for value in model.body_inertia[moving_body_id]]
+    if not math.isclose(actual_mass, object_mass, rel_tol=1e-6, abs_tol=1e-8):
+        raise RuntimeError(
+            f"MuJoCo body mass {actual_mass} does not match requested mass {object_mass}"
+        )
     object_geom_ids = [
         geom_id
         for geom_id in range(model.ngeom)
@@ -514,6 +581,20 @@ def main():
     data = mujoco.MjData(model)
 
     rng = np.random.default_rng(args.seed)
+    fixed_position = parse_optional_vec3(args.initial_position, "--initial_position")
+    fixed_euler_deg = parse_optional_vec3(args.initial_euler_deg, "--initial_euler_deg")
+    fixed_quaternion = None
+    if str(args.initial_quaternion_wxyz).strip():
+        values = [float(value) for value in str(args.initial_quaternion_wxyz).replace(",", " ").split()]
+        if len(values) != 4:
+            raise ValueError("--initial_quaternion_wxyz expects four values")
+        fixed_quaternion = np.asarray(values, dtype=np.float64)
+        norm = float(np.linalg.norm(fixed_quaternion))
+        if norm <= 1e-12:
+            raise ValueError("--initial_quaternion_wxyz must be non-zero")
+        fixed_quaternion = fixed_quaternion / norm
+    fixed_linear_velocity = parse_optional_vec3(args.initial_linear_velocity, "--initial_linear_velocity")
+    fixed_angular_velocity = parse_optional_vec3(args.initial_angular_velocity, "--initial_angular_velocity")
     episode_roots = get_episode_roots(dataset_root, args.object_name, args.split)
     if not episode_roots:
         raise FileNotFoundError("No episode directories found for the requested object/split.")
@@ -550,6 +631,17 @@ def main():
             dtype=np.float64,
         )
         init_angvel = rng.uniform(-spin_speed, spin_speed, size=3).astype(np.float64)
+        if fixed_position is not None:
+            init_pos = fixed_position.copy()
+        if fixed_euler_deg is not None:
+            fixed_euler = np.deg2rad(fixed_euler_deg)
+            init_quat = euler_xyz_to_quat(*[float(value) for value in fixed_euler])
+        if fixed_quaternion is not None:
+            init_quat = fixed_quaternion.copy()
+        if fixed_linear_velocity is not None:
+            init_linvel = fixed_linear_velocity.copy()
+        if fixed_angular_velocity is not None:
+            init_angvel = fixed_angular_velocity.copy()
 
         states = rollout_episode(
             model,
@@ -573,6 +665,37 @@ def main():
                     f"Sphere rollout penetrated the floor by {-min_bottom_z:.4f} m "
                     f"in {episode_root}. Check --sphere_solref/--timestep."
                 )
+
+        half_height = float(half_extents[2])
+        speeds = [float(np.linalg.norm(state["linear_velocity"])) for state in states]
+        angular_speeds = [float(np.linalg.norm(state["angular_velocity"])) for state in states]
+        impact_frames = [
+            int(state["frame_index"]) for state in states
+            if float(state["position"][2]) <= half_height + 0.015
+        ]
+        episode_manifest = read_json(episode_root / "episode_manifest.json")
+        episode_manifest["rollout_diagnostics"] = {
+            "first_near_floor_frame": None if not impact_frames else impact_frames[0],
+            "final_linear_speed": speeds[-1],
+            "final_angular_speed": angular_speeds[-1],
+            "final_position": states[-1]["position"],
+            "duration_seconds": len(states) / float(args.fps),
+        }
+        episode_manifest["camera"] = {
+            "name": "cam0", "distance": args.camera_distance, "height": args.camera_height,
+            "target": [args.camera_target_x, args.camera_target_y, args.camera_target_z],
+            "fovy_deg": float(model.cam_fovy[0]),
+        }
+        episode_manifest["mujoco_body_properties"] = {
+            "body_id": int(moving_body_id),
+            "requested_mass_kg": object_mass,
+            "actual_mass_kg": actual_mass,
+            "inertia_diagonal_kg_m2": actual_inertia,
+            "freejoint_damping": float(args.freejoint_damping),
+            "internal_timestep": float(model.opt.timestep),
+        }
+        write_json(episode_root / "episode_manifest.json", episode_manifest)
+        save_rollout_gif(episode_root / "rgb", episode_root / "rollout.gif", args.fps)
 
     print(
         json.dumps(

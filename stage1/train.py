@@ -84,11 +84,15 @@ def zero_active_optimizers(gaussians, use_decoupled_optimization):
 
 def compute_losses(render_pkg, viewpoint_cam, opt, depth_l1_weight_value):
     image = render_pkg["render"]
+    gt_image = viewpoint_cam.original_image.cuda()
     if viewpoint_cam.alpha_mask is not None:
         alpha_mask = viewpoint_cam.alpha_mask.cuda()
         image = image * alpha_mask
+        # Synthetic RGBA datasets keep the original RGB behind transparent
+        # pixels. Compare like-for-like foregrounds instead of penalising the
+        # model for MuJoCo floor pixels that alpha explicitly excluded.
+        gt_image = gt_image * alpha_mask
 
-    gt_image = viewpoint_cam.original_image.cuda()
     ll1 = l1_loss(image, gt_image)
     if FUSED_SSIM_AVAILABLE:
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -602,6 +606,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if viewpoint.alpha_mask is not None:
+                        alpha_mask = viewpoint.alpha_mask.to("cuda")
+                        image = image * alpha_mask
+                        gt_image = gt_image * alpha_mask
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]

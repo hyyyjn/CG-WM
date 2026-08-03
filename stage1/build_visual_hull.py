@@ -50,11 +50,22 @@ def parse_args():
     parser.add_argument("--output_ply", default="", type=str)
     parser.add_argument("--grid_resolution", default=128, type=int)
     parser.add_argument("--bounds_scale", default=1.2, type=float)
+    parser.add_argument("--bbox_min", default="", type=str, help="Optional explicit x,y,z grid minimum.")
+    parser.add_argument("--bbox_max", default="", type=str, help="Optional explicit x,y,z grid maximum.")
     parser.add_argument("--mask_threshold", default=0.5, type=float)
     parser.add_argument("--max_points", default=200000, type=int)
     parser.add_argument("--chunk_size", default=262144, type=int)
     parser.add_argument("--skip_color", action="store_true")
     return parser.parse_args()
+
+
+def parse_optional_vec3(value: str, name: str):
+    if not str(value).strip():
+        return None
+    values = [float(item) for item in str(value).replace(",", " ").split()]
+    if len(values) != 3:
+        raise ValueError(f"{name} expects exactly three values")
+    return np.asarray(values, dtype=np.float32)
 
 
 def resolve_mask_path(masks_root: Path, split_name: str, image_name: str):
@@ -329,7 +340,16 @@ def main():
         for view in views
     }
 
-    bbox_min, bbox_max = build_bounds(views, args.bounds_scale)
+    explicit_bbox_min = parse_optional_vec3(args.bbox_min, "--bbox_min")
+    explicit_bbox_max = parse_optional_vec3(args.bbox_max, "--bbox_max")
+    if (explicit_bbox_min is None) != (explicit_bbox_max is None):
+        raise ValueError("--bbox_min and --bbox_max must be provided together")
+    if explicit_bbox_min is not None:
+        if np.any(explicit_bbox_max <= explicit_bbox_min):
+            raise ValueError("Every --bbox_max component must be greater than --bbox_min")
+        bbox_min, bbox_max = explicit_bbox_min, explicit_bbox_max
+    else:
+        bbox_min, bbox_max = build_bounds(views, args.bounds_scale)
     points, _ = generate_grid_points(bbox_min, bbox_max, args.grid_resolution)
     keep = carve_visual_hull(points, views, masks_by_path, args.chunk_size)
     hull_points = points[keep]
@@ -348,6 +368,7 @@ def main():
     print(f"Saved visual hull seed to {output_ply}")
     print(f"Views used: {len(views)}")
     print(f"Grid resolution: {args.grid_resolution}")
+    print(f"Bounds: min={bbox_min.tolist()} max={bbox_max.tolist()}")
     print(f"Output points: {hull_points.shape[0]}")
     print(f"Occupied ratio: {occupied_ratio:.6f}")
 

@@ -19,9 +19,11 @@ for path in (str(REPO_ROOT), str(GS_ROOT)):
         sys.path.insert(0, path)
 
 from stage2.renderable_gaussian_asset import (  # noqa: E402
+    concatenate_gaussian_assets,
     copy_asset_to_gaussian_model,
     instantiate_rigid_gaussian_scene,
     load_renderable_gaussian_asset,
+    rigid_transform_asset,
 )
 from stage1.gaussian_renderer import GaussianModel  # noqa: E402
 from stage1.gaussian_renderer import render as gs_render  # noqa: E402
@@ -44,7 +46,9 @@ class GaussianRenderLossConfig:
     cam_distance: float = 1.12
     cam_height: float = 0.66
     cam_fovy_deg: float = 40.0
+    camera_target: tuple[float, float, float] | None = None
     white_background: bool = False
+    background_rgb: tuple[float, float, float] | None = None
     scale_multiplier: float = 1.0
     collision_radius_to_gaussian_scale: float = 0.5
     loss: str = "l1"
@@ -58,9 +62,27 @@ class GaussianRenderLossConfig:
 
 
 def mujoco_cam0_c2w_fov(cam_distance: float, cam_height: float, fovy_deg: float, width: int, height: int):
-    x_cam = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    y_cam = np.array([0.0, 0.48, 0.8772685], dtype=np.float64)
-    z_cam = np.cross(x_cam, y_cam)
+    return lookat_cam_c2w_fov(
+        cam_distance, cam_height, fovy_deg, width, height,
+        target=(0.0, 0.0, 0.0), legacy_axes=True,
+    )
+
+
+def lookat_cam_c2w_fov(cam_distance: float, cam_height: float, fovy_deg: float,
+                       width: int, height: int, *, target=(0.0, 0.0, 0.0),
+                       legacy_axes: bool = False):
+    if legacy_axes:
+        x_cam = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        y_cam = np.array([0.0, 0.48, 0.8772685], dtype=np.float64)
+        z_cam = np.cross(x_cam, y_cam)
+    else:
+        eye = np.array([0.0, -cam_distance, cam_height], dtype=np.float64)
+        forward = np.asarray(target, dtype=np.float64) - eye
+        forward /= max(float(np.linalg.norm(forward)), 1e-12)
+        x_cam = np.cross(forward, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+        x_cam /= max(float(np.linalg.norm(x_cam)), 1e-12)
+        y_cam = np.cross(x_cam, forward)
+        z_cam = -forward
     c2w = np.eye(4, dtype=np.float32)
     c2w[:3, :3] = np.stack([x_cam, y_cam, z_cam], axis=1).astype(np.float32)
     c2w[:3, 3] = np.array([0.0, -cam_distance, cam_height], dtype=np.float32)
@@ -77,13 +99,16 @@ def c2w_to_3dgs_rt(c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def make_mujoco_cam0_minicam(config: GaussianRenderLossConfig, *, device: torch.device | str) -> MiniCam:
-    c2w, fovx, fovy = mujoco_cam0_c2w_fov(
-        float(config.cam_distance),
-        float(config.cam_height),
-        float(config.cam_fovy_deg),
-        int(config.image_width),
-        int(config.image_height),
-    )
+    if config.camera_target is None:
+        c2w, fovx, fovy = mujoco_cam0_c2w_fov(
+            float(config.cam_distance), float(config.cam_height), float(config.cam_fovy_deg),
+            int(config.image_width), int(config.image_height),
+        )
+    else:
+        c2w, fovx, fovy = lookat_cam_c2w_fov(
+            float(config.cam_distance), float(config.cam_height), float(config.cam_fovy_deg),
+            int(config.image_width), int(config.image_height), target=config.camera_target,
+        )
     R, T = c2w_to_3dgs_rt(c2w)
     world_view = torch.tensor(getWorld2View2(R, T), dtype=torch.float32).T.to(device)
     proj = getProjectionMatrix(znear=0.01, zfar=200.0, fovX=fovx, fovY=fovy).T.to(device)
@@ -212,8 +237,15 @@ class Stage2GaussianRenderLoss:
                 torch.as_tensor(gaussian_indices, dtype=torch.long, device=device)
             )
         self.camera = make_mujoco_cam0_minicam(config, device=device)
-        bg_value = 1.0 if bool(config.white_background) else 0.0
-        self.background = torch.full((3,), bg_value, dtype=dtype, device=device)
+        if config.background_rgb is not None:
+            if len(config.background_rgb) != 3:
+                raise ValueError("background_rgb must contain three values")
+            if any(not 0.0 <= float(value) <= 1.0 for value in config.background_rgb):
+                raise ValueError("background_rgb values must be in [0, 1]")
+            self.background = torch.tensor(config.background_rgb, dtype=dtype, device=device)
+        else:
+            bg_value = 1.0 if bool(config.white_background) else 0.0
+            self.background = torch.full((3,), bg_value, dtype=dtype, device=device)
         self.targets = load_rgb_sequence(
             gt_rgb_dir,
             frame_indices,
@@ -278,6 +310,7 @@ class Stage2GaussianRenderLoss:
         copy_asset_to_gaussian_model(scene_asset, gaussians)
         return gs_render(self.camera, gaussians, PipelineParams(), self.background, separate_sh=False)["render"]
 
+
     def render_sequence(
         self,
         positions: torch.Tensor,
@@ -304,6 +337,7 @@ class Stage2GaussianRenderLoss:
         *,
         geometry_centers: torch.Tensor | None = None,
         geometry_radii: torch.Tensor | None = None,
+        target_indices: torch.Tensor | list[int] | None = None,
     ) -> tuple[torch.Tensor, dict]:
         rendered = self.render_sequence(
             positions,
@@ -311,8 +345,15 @@ class Stage2GaussianRenderLoss:
             geometry_centers=geometry_centers,
             geometry_radii=geometry_radii,
         )
-        targets = self.targets[: rendered.shape[0]]
-        masks = None if self.masks is None else self.masks[: rendered.shape[0]]
+        if target_indices is None:
+            targets = self.targets[: rendered.shape[0]]
+            masks = None if self.masks is None else self.masks[: rendered.shape[0]]
+        else:
+            target_indices = torch.as_tensor(target_indices, dtype=torch.long, device=self.targets.device)
+            if target_indices.numel() != rendered.shape[0]:
+                raise ValueError("target_indices must align with rendered frames")
+            targets = self.targets.index_select(0, target_indices)
+            masks = None if self.masks is None else self.masks.index_select(0, target_indices)
         loss, image_diagnostics = gaussian_image_loss(
             rendered,
             targets,
@@ -329,6 +370,67 @@ class Stage2GaussianRenderLoss:
             "gaussian_render_scale_multiplier": float(self.config.scale_multiplier),
         }
         return loss, diagnostics
+
+
+class MultiBodyStage2GaussianRenderLoss(Stage2GaussianRenderLoss):
+    """Image loss renderer for independently trained rigid Gaussian bodies."""
+
+    def __init__(self, *, stage1_plys: list[Path], gt_rgb_dir: Path,
+                 frame_indices: list[int], config: GaussianRenderLossConfig,
+                 gt_mask_dir: Path | None = None, dtype: torch.dtype = torch.float32,
+                 device: torch.device | str = "cuda",
+                 render_filters: list[dict] | None = None) -> None:
+        if not stage1_plys:
+            raise ValueError("stage1_plys must contain at least one render asset")
+        super().__init__(stage1_ply=stage1_plys[0], gt_rgb_dir=gt_rgb_dir,
+                         frame_indices=frame_indices, config=config,
+                         gt_mask_dir=gt_mask_dir, dtype=dtype, device=device)
+        self.base_assets = [self.base_asset] + [
+            load_renderable_gaussian_asset(path, dtype=dtype, device=self.device)
+            for path in stage1_plys[1:]
+        ]
+        filters = render_filters or [{} for _ in self.base_assets]
+        if len(filters) != len(self.base_assets):
+            raise ValueError("render_filters must have one entry per stage1_ply")
+        self.unfiltered_gaussian_counts = [asset.num_gaussians for asset in self.base_assets]
+        self.base_assets = [
+            asset.filter(
+                opacity_threshold=spec.get("opacity_threshold"),
+                foreground_threshold=spec.get("foreground_threshold"),
+                object_id=spec.get("object_id"),
+            ).subtract_local_offset(spec.get("canonical_offset", [0.0, 0.0, 0.0]))
+            for asset, spec in zip(self.base_assets, filters)
+        ]
+        self.filtered_gaussian_counts = [asset.num_gaussians for asset in self.base_assets]
+
+    def render_frame(
+        self, positions: torch.Tensor, quaternions_wxyz: torch.Tensor, *,
+        geometry_centers: list[torch.Tensor | None] | None = None,
+        geometry_radii: list[torch.Tensor | None] | None = None,
+        **_,
+    ) -> torch.Tensor:
+        if positions.shape != (len(self.base_assets), 3):
+            raise ValueError(f"positions must have shape ({len(self.base_assets)}, 3)")
+        if quaternions_wxyz.shape != (len(self.base_assets), 4):
+            raise ValueError(f"quaternions_wxyz must have shape ({len(self.base_assets)}, 4)")
+        if (geometry_centers is None) != (geometry_radii is None):
+            raise ValueError("geometry_centers and geometry_radii must be provided together")
+        if geometry_centers is not None and (
+            len(geometry_centers) != len(self.base_assets) or len(geometry_radii) != len(self.base_assets)
+        ):
+            raise ValueError("multi-body geometry overrides must align with render assets")
+        assets = []
+        for index, asset in enumerate(self.base_assets):
+            if geometry_centers is not None and geometry_centers[index] is not None:
+                asset = asset.with_spherical_geometry(
+                    geometry_centers[index], geometry_radii[index],
+                    radius_to_scale=float(self.config.collision_radius_to_gaussian_scale),
+                )
+            assets.append(rigid_transform_asset(asset, positions[index], quaternions_wxyz[index]))
+        scene = concatenate_gaussian_assets(*assets)
+        gaussians = GaussianModel(scene.sh_degree)
+        copy_asset_to_gaussian_model(scene, gaussians)
+        return gs_render(self.camera, gaussians, PipelineParams(), self.background, separate_sh=False)["render"]
 
 
 class MultiViewStage2GaussianRenderLoss:

@@ -249,6 +249,178 @@ output/actual_cola_can_*_data/     MuJoCo GT 에피소드 (rgb/, masks/, state/t
 output/actual_cola_can_*_output/   Stage 2 fit 결과, 렌더, 비교 GIF
 ```
 
+### 캔–바닥 MuJoCo 데이터셋 한 번에 생성
+
+Stage 1 정적 멀티뷰와 Stage 2 낙하/충돌 영상을 같은 물리 크기 규약으로 생성하려면:
+
+```bash
+conda run -n cg_wm python tools/generate_mujoco_can_floor_dataset.py \
+  --output_root output/can_floor_dataset \
+  --train_views 48 --test_views 12 \
+  --train_episodes 8 --test_episodes 2 \
+  --frames_per_episode 90 --fps 30 \
+  --width 640 --height 480 --mujoco_gl egl
+```
+
+`stage1/can_floor/images`와 `transforms_*.json`은 NeRF/Blender 형식의 calibrated
+multiview 입력이다. `masks`는 캔 binary mask이고 `instance_masks`는
+`0=background, 1=cola_can, 2=floor` label map이다. Stage 2의 각 episode에는
+`rgb/`, `masks/`, `state/trajectory.json`, `actions/trajectory.json`, `rollout.gif`가
+생성된다. 같은 명령과 seed로 재생성할 수 있으며 기존 경로를 덮어쓸 때만
+`--overwrite`를 추가한다.
+
+## 현재 캔–바닥 Pipeline: 입력, 출력, 데이터 흐름
+
+아래는 현재 실제 검증에 사용하는 end-to-end 경로이다. Stage 1은 캔과 바닥의
+appearance Gaussian을 각각 학습하고, Stage 2는 MuJoCo episode의 상태/RGB를 supervision으로
+물리 trajectory를 맞춘다. 마지막 영상은 SIBR Viewer나 MuJoCo renderer를 사용하지 않고
+두 Gaussian PLY를 하나의 CUDA Gaussian rasterizer 호출로 렌더링한 뒤 Pillow로 GIF를 만든다.
+
+```text
+MuJoCo scene/asset
+        |
+        +-- static calibrated multiview RGB + masks + transforms_*.json
+        |                         |
+        |                         +-- Stage 1 can training --> can point_cloud.ply
+        |                         +-- Stage 1 floor training -> floor point_cloud.ply
+        |                                                        |
+        |                                      planar calibration/resampling
+        |                                                        |
+        |                                      render_floor_grid/point_cloud.ply
+        |
+        +-- dynamic fall-and-rebound episode
+              rgb/ + masks/ + state/trajectory.json + actions/trajectory.json
+                                      |
+                                      v
+                           Stage 2 physics/RGB fitting
+                                      |
+                         predicted_trajectory.json
+                                      |
+                 can Gaussian rigid transform per frame
+                                      + static floor Gaussian
+                                      |
+                         one Gaussian rasterizer call
+                                      |
+                         gaussian_rgb/*.png
+                                      |
+                              Pillow GIF encoder
+                                      |
+                    stage2_gaussian_trajectory.gif
+```
+
+### 단계별 입출력
+
+| 단계 | 주요 입력 | 주요 출력 |
+|---|---|---|
+| MuJoCo dataset | can asset, floor, camera/physics 설정 | Stage 1 multiview와 Stage 2 episode |
+| Stage 1 can | `images/`, can binary `masks/`, `transforms_{train,test}.json` | can `point_cloud.ply` |
+| Stage 1 floor | `images/`, floor binary `masks/`, `transforms_{train,test}.json` | raw floor `point_cloud.ply` |
+| Floor render calibration | raw floor PLY, known plane extent/height | regular planar floor Gaussian PLY |
+| Stage 2 fit | episode state/RGB/masks, can PLY, initial physics values | `predicted_trajectory.json`, `fit_summary.json`, reproducibility bundle |
+| Gaussian-only render | predicted trajectory, can PLY, calibrated floor PLY, camera | per-frame PNG, GIF, renderer manifest |
+
+현재 검증 artifact의 구체적인 경로는 다음과 같다.
+
+```text
+# Stage 1 inputs
+output/can_stage1_check_data/cola_can/
+output/floor_stage1_data/floor/
+
+# Stage 1 outputs
+output/can_stage1_check_model_fixed/point_cloud/iteration_3000/point_cloud.ply
+output/floor_stage1_model/point_cloud/iteration_3000/point_cloud.ply
+
+# Stage 2 input episode
+output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/
+
+# Stage 2 outputs
+output/can_floor_stage2_end_to_end/predicted_trajectory.json
+output/can_floor_stage2_end_to_end/fit_summary.json
+output/can_floor_stage2_end_to_end/resolved_config.json
+output/can_floor_stage2_end_to_end/experiment_bundle.json
+
+# Gaussian-only rendering outputs
+output/floor_stage1_model/render_floor_grid/point_cloud.ply
+output/can_floor_stage2_gaussian_only_final/gaussian_rgb/*.png
+output/can_floor_stage2_gaussian_only_final/stage2_gaussian_trajectory.gif
+output/can_floor_stage2_gaussian_only_final/stage2_gaussian_trajectory_manifest.json
+```
+
+### Stage 1 학습
+
+캔과 바닥은 서로 다른 binary alpha mask로 학습한다. `--alpha_subject object`는 캔,
+`--alpha_subject floor`는 바닥 mask를 만든다. 현재 검증 모델과 동일한 3,000-iteration
+학습의 핵심 명령은 다음과 같다.
+
+```bash
+conda run -n gaussian_splatting python stage1/train.py \
+  -s output/can_stage1_check_data/cola_can \
+  -m output/can_stage1_check_model_fixed \
+  --masks_dir output/can_stage1_check_data/cola_can/masks \
+  --iterations 3000 --eval --disable_viewer
+
+conda run -n gaussian_splatting python stage1/train.py \
+  -s output/floor_stage1_data/floor \
+  -m output/floor_stage1_model \
+  --masks_dir output/floor_stage1_data/floor/masks \
+  --iterations 3000 --eval --disable_viewer
+```
+
+Texture가 거의 없는 평면은 RGB multiview만으로 depth가 유일하게 정해지지 않는다. 따라서
+raw floor checkpoint는 appearance 검증에는 사용할 수 있지만 동적 scene 렌더/접촉에는
+깊이 방향 blob이 생길 수 있다. 현재 pipeline은 알려진 MuJoCo 바닥 평면 prior를 적용해
+중심을 규칙적인 격자로 투영하고, 학습된 floor SH 색상 통계는 유지한다.
+
+```bash
+conda run -n gaussian_splatting python tools/calibrate_floor_gaussian_ply.py \
+  --input_ply output/floor_stage1_model/point_cloud/iteration_3000/point_cloud.ply \
+  --output_ply output/floor_stage1_model/render_floor_grid/point_cloud.ply \
+  --xy_extent 1.2 --regular_grid_size 49 \
+  --max_primitives 4096 --gaussian_scale 0.04 --surface_z 0.04
+```
+
+### Stage 2 출력의 의미
+
+`run_stage2_mujoco_stage1_fit.py`는 episode의 `state/trajectory.json`을 target으로 사용하고,
+선택적으로 `rgb/`와 `masks/`의 Gaussian image loss도 함께 계산한다. 주요 출력은 다음과 같다.
+
+- `predicted_trajectory.json`: 프레임별 predicted position, quaternion, contact gate
+- `fit_summary.json`: trajectory/RGB loss, 접촉 frame, 학습된 물리 파라미터
+- `resolved_config.json`: 실제로 적용된 전체 CLI/config
+- `experiment_bundle.json`: 입력 hash, Git 상태, 결과 hash를 포함한 재현성 정보
+- `stage2_fit_follow_view.gif`: 물리 진단용 영상이며 Gaussian-only 결과를 의미하지 않음
+
+현재 안정적인 캔–바닥 baseline은 learned can Gaussian과 analytic plane collider를 사용한다.
+raw learned-floor Gaussian을 직접 `pairwise_impedance` collider로 사용하는 경로는 planar depth
+ambiguity와 잘못된 contact normal 때문에 아직 안정화되지 않았다. 시각화에서 바닥이 Gaussian인
+것과 물리 contact collider가 Gaussian인 것은 구분해야 한다.
+
+### SIBR 없이 Gaussian-only PNG/GIF 생성
+
+다음 명령은 trajectory의 pose를 프레임마다 캔 Gaussian 전체에 rigid transform으로 적용한다.
+정적인 바닥 Gaussian을 결합한 뒤, 두 자산을 동일한 `gs_render` 호출로 depth-aware rasterize한다.
+MuJoCo RGB나 mesh pixel을 합성하지 않는다.
+
+```bash
+conda run -n gaussian_splatting python tools/render_stage2_gaussian_trajectory.py \
+  --stage1_ply \
+    output/can_stage1_check_model_fixed/point_cloud/iteration_3000/point_cloud.ply \
+  --floor_stage1_ply \
+    output/floor_stage1_model/render_floor_grid/point_cloud.ply \
+  --trajectory \
+    output/can_floor_stage2_end_to_end/predicted_trajectory.json \
+  --output_dir output/can_floor_stage2_gaussian_only_final \
+  --frame_stride 2 --image_width 640 --image_height 480 \
+  --cam_distance 1.12 --cam_height 0.66 --cam_fovy_deg 40 \
+  --white_background --recenter_asset --opacity_threshold 0.05 --fps 15
+```
+
+렌더러는 먼저 `gaussian_rgb/NNNNNN.png`를 저장하고 Pillow의 multi-frame GIF encoder로
+`stage2_gaussian_trajectory.gif`를 만든다. SIBR Viewer는 필요하지 않지만 현재 rasterizer가
+CUDA extension이므로 NVIDIA GPU/CUDA 환경은 필요하다. 출력 manifest의
+`renderer=single_call_gaussian_splatting`과 `mujoco_pixels_used=false`로 사용 경로를 확인할
+수 있다.
+
 ## 구현 범위
 
 ### Stage 1: Gaussian Initialization
@@ -433,7 +605,10 @@ collision filtering 후 남은 Gaussian의 원본 SH/opacity를 source index로 
 
 논문식 이미지 중심 학습에서는 `--image_only_objective`를 사용합니다. 이 모드는
 position/orientation/posed-geometry supervision weight를 0으로 만들고 Gaussian RGB
-loss와 parameter prior만으로 best state를 선택합니다.
+loss와 parameter prior만으로 best state를 선택합니다. `state/trajectory.json`은 필수가
+아니며, `--evaluation_trajectory`가 있더라도 학습 graph에는 넣지 않고 종료 후 metric
+계산에만 사용합니다. GT가 없을 때는 rollout 시작점을 정하기 위해
+`--initial_state_json` 또는 `--prefit_initial_state` 중 하나가 필요합니다.
 
 ```bash
 conda run -n gaussian_splatting python \
@@ -444,12 +619,576 @@ conda run -n gaussian_splatting python \
   --refine_geometry \
   --geometry_gradient_route collision_only \
   --image_only_objective \
+  --initial_state_json <initial_state_estimate.json> \
   --gaussian_rgb_loss_weight 1.0 \
   --gaussian_render_loss l1_loftr \
   --gaussian_render_loftr_weight 0.1 \
   --loftr_pretrained outdoor \
   --device cuda
 ```
+
+GT가 없는 실행에서 `fit_summary.json`은
+`ground_truth_trajectory_used_for_training=false`, position loss/RMSE는 `null`로 기록한다.
+GT를 평가용으로만 추가하려면 `--evaluation_trajectory <trajectory.json>`을 사용한다.
+학습 입력 RGB/mask/camera/time과 평가 pose는 각각
+`stage2/video_observations.py`의 `VideoObservations`, `EvaluationTrajectory`로 분리되어 있다.
+
+### 객체 이름에 독립적인 scene manifest
+
+`stage2/scene_manifest.py`는 `cola_can`, `floor`, `box` 같은 클래스명이나 shape preset을
+사용하지 않는다. 각 항목은 사용자가 정한 ID, rigid-body 역할, render asset, collision
+표현으로만 정의된다. 전체 예제는 `configs/scene_manifest.example.json`에 있다.
+
+```json
+{
+  "version": 1,
+  "scene_id": "rigid_contact_000",
+  "bodies": [
+    {
+      "id": "object_00",
+      "role": "dynamic",
+      "render": {"gaussian_ply": "models/object_00.ply"},
+      "collision": {"type": "gaussian_union"}
+    }
+  ],
+  "environment": [
+    {
+      "id": "surface_00",
+      "role": "static",
+      "collision": {
+        "type": "plane",
+        "normal": [0, 0, 1],
+        "height": 0.0
+      }
+    }
+  ],
+  "observations": {
+    "rgb_dir": "observations/rgb",
+    "instance_mask_dir": "observations/masks",
+    "fps": 30
+  },
+  "contact_pairs": [
+    {"body_a": "object_00", "body_b": "surface_00", "model": "dual_cone"}
+  ]
+}
+```
+
+모든 상대경로는 manifest 파일 위치를 기준으로 해석한다. 지원 역할은 `dynamic`,
+`kinematic`, `static`, collision 표현은 `gaussian_union`, `plane`, `query_points`, `none`이다.
+Kinematic body에는 trajectory가 필요하고, 관측에는 양의 FPS 또는 strictly-increasing
+timestamp 배열이 필요하다.
+
+```bash
+conda run -n gaussian_splatting python tools/validate_scene_manifest.py \
+  configs/scene_manifest.example.json
+```
+
+Validator는 ID 중복, 존재하지 않는 contact body, self/duplicate pair, 잘못된 plane normal,
+누락된 Gaussian/trajectory/RGB/camera 경로와 frame time 계약을 검사한다.
+
+검증된 manifest는 adapter를 통해 현재 single-body image-only Stage2에 바로 전달할 수 있다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_contactgaussian_pipeline.py \
+  --manifest configs/scene_manifest.example.json \
+  --output_dir output/manifest_stage2_run
+```
+
+실행 전 생성될 명령만 확인하려면 `--dry_run`을 추가한다. 짧은 검증에는
+`--fit_iters`, `--max_frames`, `--device`, `--image_loss` override를 사용할 수 있다.
+Adapter는 원본 manifest를 검증하고 현재 Stage2가 읽을 compatibility manifest와
+`compiled_manifest_run.json`을 생성한다. 원본 manifest 경로와 SHA-256도
+`experiment_bundle.json`에 보존한다.
+
+현재 adapter 지원 범위는 다음과 같다.
+
+- 정확히 하나의 `dynamic` spherical-Gaussian body
+- 동일 PLY를 공유하는 render/collision representation
+- `normal=[0,0,1]`, `height=0`인 하나의 static plane
+- `image_only` supervision
+- initial-state JSON 또는 image prefit
+
+여러 dynamic body, 움직이는 kinematic contact target, 임의 방향/높이 plane은 잘못된
+single-body 변환을 하지 않고 명시적으로 거부한다. Gaussian-union multi-body 장면은
+아래 native manifest runner가 `bodies[]`와 `contact_pairs[]`를 직접 실행한다.
+
+Gaussian-union끼리 충돌하는 장면은 native N-body rollout 경로로 직접 실행할 수 있다.
+
+```bash
+python tools/run_native_multibody_manifest.py \
+  --manifest configs/your_multibody_scene.json \
+  --output output/native_multibody/trajectory.json \
+  --steps 60 --device cpu
+```
+
+이 경로는 선언된 `contact_pairs[]`만 contact graph edge로 사용하며, GT trajectory를 읽지
+않고 모든 body의 pose/velocity를 ID별로 출력한다. native dynamics는 dynamic/static
+`gaussian_union` body와 static analytic `plane`을 한 장면에서 함께 지원한다. Plane body도
+`render.gaussian_ply`를 가지면 화면에는 Gaussian으로 렌더링되지만, 접촉 거리·법선·힘은
+manifest의 `normal`과 `height`로 계산된다. 따라서 바닥 Gaussian의 불규칙한 sphere proxy가
+물리 안정성을 해치지 않는다. kinematic trajectory playback은 아직 지원하지 않는다.
+
+실제 영상만 사용하여 여러 body의 초기 pose/linear velocity/angular velocity, body별
+mass/inertia와 contact stiffness/damping/friction을 학습하려면 `--fit_iters`를 지정한다.
+Gaussian rasterizer 때문에
+이 모드는 CUDA가 필요하다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \
+  --manifest configs/your_multibody_scene.json \
+  --output output/native_multibody/image_only_fit.json \
+  --fit_iters 500 --lr 0.01 --device cuda \
+  --render_stride 2 --render_max_frames 30 \
+  --image_loss l1_ssim \
+  --mass_inertia_lr 0.001 --mass_l2 0.0001 --inertia_l2 0.0001
+```
+
+모든 renderable body의 Stage1 PLY를 `MultiBodyStage2GaussianRenderLoss`가 하나의 Gaussian
+rasterizer scene으로 합성하고 RGB/mask loss를 dynamics까지 역전파한다. 출력에는 loss history,
+학습된 initial state, `learned_contact_pairs[]`, sampled trajectory가 포함되며
+`ground_truth_trajectory_used_for_training=false`가 기록된다. stiffness/damping/friction은
+manifest에 선언된 contact pair 순서대로 각각 초기화되고 독립적으로 학습된다. 기존 코드에서
+scalar contact parameter를 전달하는 경우에는 이전처럼 모든 edge가 그 값을 공유한다.
+
+Body 물성 초기값은 객체 이름이나 shape preset이 아니라 각 manifest body의 `physics`에서 읽는다.
+
+```json
+"physics": {
+  "mass": {"initial": 0.35},
+  "inertia": {"initial_diagonal": [0.0018, 0.0018, 0.0007]}
+}
+```
+
+`inertia.initial_diagonal`을 생략하면 dynamic Gaussian-union의 inertia는 고정 `[1,1,1]`이
+아니라 Stage1 collision Gaussian으로부터 자동 초기화된다. 각 Gaussian을 반지름 세제곱에
+비례한 질량을 가진 solid sphere로 보고, Gaussian 전체의 volume-weighted center of mass에
+대한 parallel-axis 항까지 합산한다. 따라서 특정 캔/상자 preset 없이도 객체 크기와 manifest
+mass에 맞는 `kg·m²` 단위의 초기 관성을 얻는다. Manifest에 관성을 명시하면 그 값이 우선한다.
+
+Mass는 softplus로 양수를 보장한다. Body-frame principal inertia는 세 양수 성분
+`(a,b,c)`에서 `(Ix,Iy,Iz)=(a+b,a+c,b+c)`로 만들기 때문에 학습 중에도 양수성과 세
+triangle inequality를 만족한다. 이 값은 contact Jacobian의 inverse-mass block, Delassus
+행렬, linear/angular velocity update에 공통으로 사용된다. Static body는 optimizer의 학습
+대상이 아니며 inverse-mass block도 0이다. 결과 JSON의 `learned_body_physics.<body_id>`에
+최종 mass와 `inertia_diagonal`이 기록된다.
+
+초기값에서 지나치게 멀어지는 것을 막는 prior와 별도 learning rate는
+`--mass_l2`, `--inertia_l2`, `--mass_inertia_lr`로 조절한다. 비교 실험에서 고정하려면
+`--freeze_mass_inertia`를 사용한다.
+
+긴 낙하 영상은 `--render_max_frames 0`으로 끝까지 읽고, GPU rasterization 메모리는
+`--temporal_window_frames`로 제한할 수 있다. 학습 iteration마다 선택된 sampled-frame 배열의
+연속 window를 cyclic하게 이동하며, `--temporal_window_step`이 window 시작 간격을 정한다.
+Dynamics는 각 window의 실제 frame 번호까지 처음부터 적분하므로 후반 충돌 window에서도 초기
+상태와 물성치로 gradient가 이어진다. 최종 evaluation과 GIF는 window가 아니라 전체 선택
+프레임을 사용한다. 각 iteration의 실제 학습 프레임은 JSON `loss_history[].training_frame_indices`에
+기록된다.
+
+```bash
+conda run -n cg_wm python tools/run_native_multibody_manifest.py \
+  --manifest configs/scene_manifest.sggs_prefit_test.json \
+  --output output/sggs_stage2_mass_inertia/full_sequence.json \
+  --device cuda --fit_iters 300 --render_stride 3 --render_max_frames 0 \
+  --temporal_window_frames 8 --temporal_window_step 4 \
+  --render_output_dir output/sggs_stage2_mass_inertia/full_sequence_render
+```
+
+물리 파라미터와 초기 상태를 동시에 맞추기 전에 native manifest 경로에서도 image-only
+초기 상태 prefit을 실행할 수 있다. 첫 프레임으로 모든 dynamic body의 position/quaternion을
+먼저 맞추고, 처음 N개 접촉 전 프레임에는 constant-velocity 모델을 사용해 linear/angular
+velocity를 맞춘다. static body는 고정되며 GT trajectory는 읽지 않는다. `--fit_iters 0`이면
+prefit만 수행한다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \
+  --manifest configs/scene_manifest.sggs_prefit_test.json \
+  --output output/sggs_stage2_prefit/prefit_only.json --device cuda \
+  --fit_iters 0 --render_max_frames 6 --render_width 160 --render_height 120 \
+  --prefit_initial_state --prefit_pose_iters 100 \
+  --prefit_velocity_iters 100 --prefit_velocity_frames 6 --prefit_lr 0.01
+```
+
+실제 SG-GS 캔과 낙하 영상에서 pose loss는 `0.00448 → 0.00208`, velocity loss는
+`0.00454 → 0.00269`로 감소했다. 전체 history와 추정 state는 출력 JSON의
+`initial_state_prefit`에 저장된다.
+
+### Stage2 pipeline modes
+
+Stage2 실행 경로는 논문 재현과 추가 기능이 섞이지 않도록 세 contract로 분리한다.
+
+- `paper_compatible`: 알려진 manifest initial state와 action을 입력으로 사용하는 논문 기준 경로
+- `image_only`: 영상으로 initial state까지 추정하는 확장 경로
+- `experimental`: temporal window와 renderer-direct geometry gradient 등의 ablation 경로
+
+```bash
+python tools/run_native_multibody_manifest.py \
+  --pipeline_mode paper_compatible \
+  --manifest configs/your_multibody_scene.json \
+  --output output/paper_compatible/result.json --device cuda --fit_iters 100
+```
+
+`paper_compatible`에서는 initial-state prefit, temporal window,
+`collision_and_render` geometry gradient를 허용하지 않는다. 실행 결과에는
+`pipeline_mode`, `pipeline_contract`, `paper_compatibility`가 기록되어 어떤 가정으로 생성된
+결과인지 확인할 수 있다. 현재 known-state/action과 fixed-penetration collision 경로까지
+구현됐으며, dual-cone contact dynamics와 full-image L1+LoFTR supervision도
+Gaussian–Gaussian과 Gaussian–plane에 통일했다.
+교체·검증한다. 기존 명령에서 모드를 생략하면 사용 옵션에 따라
+`image_only` 또는 `experimental`로 자동 분류되어 이전 실행과 호환된다.
+
+Paper-compatible 경로의 모든 dynamic initial position/quaternion/linear velocity/angular
+velocity는 `initialization.state_json`에서 읽은 뒤 optimizer에서 제외된다. Action은 manifest의
+`actions`로 선언하며, 자유낙하는 `{"type":"zero_wrench"}`를 사용한다. 외력이 있는 장면은
+body ID 기반 world-frame wrench 파일을 지정한다.
+
+RGB를 기록하기 전에 simulator가 먼저 step되는 dataset에서는 episode 생성 전 초기값이 아니라
+실제로 렌더된 첫 state를 사용해야 한다. `state_json`이 `{"states": [...]}` trajectory이면
+`state_frame`으로 RGB와 같은 frame index를 명시한다.
+
+```json
+"initialization": {
+  "state_json": "episode_000/state/trajectory.json",
+  "state_frame": 0
+}
+```
+
+Trajectory인데 `state_frame`이 없거나 중복/누락된 frame을 요청하면 실행을 거부한다. 결과의
+`initial_state_learning.bodies`에 사용한 파일과 frame 번호가 기록된다.
+
+MuJoCo dataset generator는 object manifest의 `physics_prior.mass_kg`를 collision geom의
+명시적 `mass`로 적용한다. 이전의 고정 `density=1000`은 객체 크기에 따라 manifest prior와
+다른 질량을 만들 수 있으므로 사용하지 않는다. 모델 생성 직후 요청 mass와
+`model.body_mass`를 비교해 불일치하면 중단하며, 각 episode의 `mujoco_body_properties`에 실제
+mass, inertia diagonal, free-joint damping, internal timestep을 기록한다. 기존 데이터는 보존하고
+질량 수정 데이터는 `output/can_floor_mass_corrected_test`에 별도로 생성했다.
+
+Body `physics.generalized_damping`은 MuJoCo free-joint damping과 같은 generalized coefficient로
+해석한다. Translation에는 `f_d=-d*v`, rotation에는 `tau_d=-d*omega`가 적용된다. 작은 inertia에
+explicit damping을 적용하면 불안정하므로 MuJoCo처럼 velocity update에서 implicit denominator
+`1+h*d/m`과 body-frame `1+h*d/I`를 사용한다. Paper manifest는 mass-corrected episode에 기록된
+값 `0.05`를 사용하며, 결과 `contact_dynamics_profile.generalized_damping`에 body 순서대로 저장된다.
+
+```json
+"actions": {"type": "wrench_sequence", "path": "actions.json"}
+```
+
+```json
+{
+  "coordinate_frame": "world",
+  "frames": [
+    {"frame": 0, "bodies": {
+      "dynamic_0": {"force": [1, 0, 0], "torque": [0, 0, 0.1]}
+    }}
+  ]
+}
+```
+
+`frame=t`의 wrench는 `state[t] → state[t+1]` transition에 적용된다. Force는 mass를 통한
+linear acceleration, torque는 현재 quaternion으로 변환한 body-frame inertia와 Euler rigid-body
+equation을 통한 angular acceleration에 연결된다. 결과 JSON의 `initial_state_learning`과
+`actions`가 고정 상태 및 action 출처를 기록한다.
+
+Paper-compatible collision profile은 Gaussian-union primitive distance에 LSE smooth-min을
+적용한 뒤, 내부 거리를 sigmoid로 `-inside_penalty`에 수렴시킨다. 동일 변환을 analytic plane
+접촉에도 적용해 깊은 관통이 무제한 penalty force로 바뀌지 않도록 한다. 기본값은
+`smooth_min_temperature=0.01`, `inside_penalty=0.02`, `inside_sharpness=50`이며 다음처럼
+manifest에서 장면 단위로 조절할 수 있다.
+
+```json
+"training": {
+  "paper_collision": {
+    "smooth_min_temperature": 0.01,
+    "inside_penalty": 0.02,
+    "inside_sharpness": 50.0
+  }
+}
+```
+
+결과 JSON의 `collision_profile`은 적용된 profile과 Gaussian-union/plane 적용 범위를 기록하고,
+plane contact diagnostics는 변환 전 `raw_signed_distance`와 dynamics에 전달된
+`signed_distance`를 함께 제공한다.
+
+Paper-compatible contact dynamics는 각 patch의 normal과 tangent basis에서 dual friction-cone
+facet `d_k = n - μt_k`를 만들고 해당 facet의 rigid contact Jacobian을 사용한다. Normal force와
+friction을 별도로 projection하지 않고 하나의 closed-form facet force로 복원한다.
+
+```text
+A = I + h * (h*K + D) * J_dual * M_inv * J_dual^T
+lambda = SoftPlus(solve(A, -K*phi - (h*K + D)*J_dual*b))
+v_next = b + h * M_inv * J_dual^T * lambda
+```
+
+여기서 `b`는 gravity/action을 적용한 free velocity이고 `M_inv`는 학습되는 body mass와
+body-frame inertia를 world frame으로 옮긴 generalized inverse mass이다. 결과 JSON의
+`contact_dynamics_profile`과 contact diagnostics의 `dual_cone_faces`, `dual_cone_velocity`,
+`dual_cone_lambda`로 실제 활성 경로를 확인할 수 있다.
+
+Paper-compatible supervision은 CLI의 일반 `--image_loss`와 GT instance mask crop을 사용하지
+않고 논문의 `L = L1 + LLoFTR`를 강제한다. 두 항의 가중치는 1이며 전체 RGB 프레임에서
+계산한다. 따라서 예측 객체가 GT mask 밖으로 이동하거나 화면에서 사라지는 것도 L1 벌점을
+받는다. LoFTR match 선택은 detach하지만 선택된 rendered RGB patch는 differentiable하므로
+renderer, dynamics, physics parameter로 gradient가 이어진다. 결과 JSON의
+`image_loss_config.requested_type`과 `type`, `full_image`, `gt_mask_used_for_loss`에서 요청값과
+실제 paper 설정을 구분할 수 있다.
+
+### Full multi-contact Jacobian dynamics
+
+Native dynamics는 각 Gaussian contact patch와 dual-cone facet에 대해 rigid contact
+Jacobian `J=[d, r_a×d, -d, -r_b×d]`를 명시적으로 구성한다. body–plane 접촉은 뒤쪽 body
+block을 생략한다. body-frame diagonal inertia는 현재 quaternion으로 world frame에 옮기고,
+정적 body의 inverse mass block은 0으로 둔다. 각 edge에서 다음 contact-space 행렬과
+유효질량을 계산해 diagnostics로 제공한다.
+
+```text
+W = J M⁻¹ Jᵀ
+m_eff = 1 / diag(W)
+v_contact = J v_generalized
+v_next = b + h M⁻¹ Jᵀ λ
+```
+
+Plane 접촉도 더 이상 모든 Gaussian을 하나의 점으로 평균내지 않고 signed distance가 가장
+작은 `num_contact_patches`개의 surface point를 유지한다. 따라서 캔 rim처럼 중심에서 벗어난
+동시 접촉이 서로 다른 torque를 만든다. `tests/test_contact_jacobian.py`는 off-center angular
+Jacobian, 회전 관성을 포함한 Delassus 행렬, static mass block, gradient 전파를 검증한다.
+SG-GS 캔의 75-step CPU rollout 결과는
+`output/sggs_stage2_jacobian/rollout_k200_d5.json`에 있으며 모든 상태가 finite이고 최저
+translation z는 `0.00338 m`였다.
+
+### Observation frames and physics substeps
+
+RGB frame 간격과 contact integration timestep을 분리한다. Manifest의
+`observations.fps=30`은 학습 영상 간격을, `simulation.physics_timestep=0.002`는
+원하는 물리 간격을 나타낸다. Runner는 한 RGB frame의 시간을 정확히 맞추기
+위해 `ceil((1/fps)/physics_timestep)`을 사용하고, 실제 integration timestep을
+`(1/fps)/substeps`로 설정한다. 30 fps와 0.002초 설정은 frame당 17 substep,
+실제 timestep 약 0.0019608초가 된다.
+
+```json
+"observations": {"fps": 30},
+"simulation": {"physics_timestep": 0.002}
+```
+
+Frame action wrench는 해당 frame의 모든 substep 동안 유지된다. 출력의
+`contact_dynamics_profile`에 `observation_frame_dt`, `requested_physics_timestep`,
+`integration_dt`, `substeps_per_frame`을 기록해 실행 시간축을 재현할 수 있다.
+
+Contact pair에 `impedance_prior`를 주면 object preset 없이 body mass와 time constant로
+학습 시작 stiffness/damping을 계산한다. Dynamic–static pair은 dynamic mass,
+dynamic–dynamic pair은 reduced mass `m_eff=1/(1/m1+1/m2)`를 사용한다.
+
+```text
+K = m_eff / time_constant²
+D = 2 * damping_ratio * m_eff / time_constant
+```
+
+```json
+"impedance_prior": {"time_constant": 0.02, "damping_ratio": 1.0}
+```
+
+명시적 `stiffness` 또는 `damping`이 있으면 그 값이 prior보다 우선한다.
+
+Collision Gaussian 수를 줄일 때 `primitive_selection="spatial_coverage"`를 선택하면
+opacity 상위 점만 가져와 proxy가 한쪽으로 치우치는 문제를 막는다. 이 모드는
+정규화한 asset-local 좌표에서 deterministic farthest-point sampling을 적용해
+전체 형상을 균일하게 대표한다.
+
+Full-image supervision에서 renderer의 빈 화면은 manifest camera의 `background_rgb`로
+설정할 수 있다. 이 값을 GT 생성 환경의 clear color와 맞춰야 정적 배경 오차가
+물리 gradient를 압도하지 않는다.
+
+```json
+"training": {
+  "camera": {"background_rgb": [0.807843, 0.862745, 0.929412]}
+}
+```
+
+Analytic plane은 collision에만 사용되므로 렌더용 바닥 Gaussian의 XY 범위는 독립적으로
+넓힐 수 있다. Paper-compatible 테스트는 `render_floor_grid_wide/point_cloud.ply`의
+81×81, 6,561 Gaussian grid를 사용해 카메라 frustum의 바닥을 모두 덮는다.
+
+### Stage1 asset canonical-frame alignment
+
+Stage1 PLY 좌표의 원점과 물리 body의 local origin이 다르면 body의
+`initialization.canonical_offset`에 Stage1 asset 좌표계에서 본 body origin을 미터 단위로
+적는다. Runner는 이 값을 Gaussian center에서 빼서 renderer, collision primitive,
+collision query point에 동일하게 적용한다. 따라서 회전 pivot, contact lever arm,
+영상의 객체 자세가 하나의 body-local frame을 사용한다.
+
+```json
+"initialization": {
+  "state_json": "trajectory.json",
+  "state_frame": 0,
+  "canonical_offset": [0.0, 0.0, 0.1]
+}
+```
+
+`canonical_offset`은 객체 이름이나 shape preset이 아닌 asset 별 calibration metadata다.
+생략하면 `[0, 0, 0]`이며, 출력 JSON의 `canonical_alignment`에 실제 적용값이
+기록된다. 현재 paper-compatible 캔 asset은 Stage1 좌표의 캔 중심이
+`z=0.1 m`에 있어 `[0, 0, 0.1]`을 사용한다.
+
+### Native physics–geometry refinement
+
+Manifest 기반 native 학습에서도 dynamic `gaussian_union` body의 object-local center와
+log-radius를 contact parameter 및 초기 상태와 함께 학습할 수 있다. Collision proxy의
+`source_indices`를 filtered render asset의 원본 PLY index와 대조하므로 객체/opacity filter를
+사용해도 동일 Gaussian에만 보정이 적용된다. Center는 `tanh` bounded offset, radius는 bounded
+log-scale로 parameterize한다. 논문 설정에 맞춘 기본 gradient route는 `collision_only`이다.
+Renderer는 보정된 geometry 값으로 영상을 만들지만 해당 center/radius를 detach하므로 image
+loss가 renderer에서 geometry로 직접 흐르지 않는다. Geometry는 collision/dynamics/BPTT 경로와
+regularization을 통해서만 갱신된다. 직접 photometric geometry gradient를 비교하려는 경우에만
+`--geometry_gradient_route collision_and_render`를 사용한다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \
+  --manifest configs/scene_manifest.sggs_prefit_test.json \
+  --output output/sggs_stage2_geometry_refine/fit.json --device cuda \
+  --fit_iters 100 --render_stride 3 --render_max_frames 8 \
+  --refine_geometry --geometry_lr 0.001 \
+  --geometry_gradient_route collision_only \
+  --geometry_center_l2 0.001 --geometry_radius_l2 0.001 \
+  --geometry_max_center_delta 0.005 --geometry_max_log_radius_delta 0.1
+```
+
+최종 결과의 `geometry_refinement.refined_collision_geometry`에는 body별 원본 PLY
+`source_indices`, refined `local_centers`, `radii`가 저장되어 다음 실행에서 재사용할 수 있다.
+이전에 수행한 10-iteration `collision_and_render` ablation에서는 image objective가
+`0.0045847 → 0.0045305`로 감소했고 256개 공유 Gaussian의 center/radius가 갱신됐다. 결과는
+`output/sggs_stage2_geometry_refine/fit.json`에 있다.
+
+Gradient-routing 회귀 테스트는 기본 경로의 renderer center/radius가 gradient를 갖지 않고
+collision geometry에는 gradient가 남는지 확인한다. 실제 5-iteration 접촉 구간 smoke test도
+`renderer_geometry_detached=true` 상태에서 256개 proxy 중 접촉 관련 geometry가 갱신되고
+loss가 `0.0029673 → 0.0029345`로 감소했다. 결과는
+`output/sggs_stage2_gradient_route/collision_only.json`에 있다.
+
+### Native L1 + LoFTR supervision
+
+Native multi-body runner의 `--image_loss l1_loftr`는 frozen Kornia LoFTR가 선택한
+correspondence에서 differentiable normalized RGB patch loss를 계산한다. Match 선택 자체는
+detach하지만 rendered patch는 live tensor이므로 pose, dynamics, contact parameter와 공유
+geometry까지 gradient가 전달된다. Mask가 있으면 rendered/target keypoint가 모두 foreground인
+match만 남긴다. Match가 `--loftr_min_matches`보다 적으면 LoFTR 항만 graph에 연결된 0이 되고
+L1 항은 계속 학습된다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \
+  --manifest configs/scene_manifest.sggs_prefit_test.json \
+  --output output/sggs_stage2_loftr/fit.json --device cuda \
+  --fit_iters 100 --image_loss l1_loftr --loftr_pretrained outdoor \
+  --loftr_weight 0.1 --loftr_confidence_threshold 0.05 \
+  --loftr_max_matches 128 --loftr_min_matches 1 --loftr_patch_radius 2 \
+  --refine_geometry
+```
+
+결과 JSON은 raw/confidence/final match 수, 평균 confidence, feature loss와 설정 전체를
+기록한다. 8개 sampled frame의 3-iteration smoke test에서는 foreground mask 이후 10개
+match, 평균 confidence 약 0.94를 사용했고 LoFTR loss가 `0.1503 → 0.1408`로 감소했다.
+동일 budget의 L1-only foreground L1은 `0.3897`, L1+LoFTR은 `0.3943`으로 짧은 실행에서는
+pixel metric 개선이 없었다. 따라서 현재 결과는 feature supervision 동작 검증이며 충분한
+iteration/weight ablation 전에는 품질 우위로 해석하지 않는다. 비교 결과는
+`output/sggs_stage2_loftr/fit.json`과 `l1_baseline.json`에 있다.
+
+30-iteration weight ablation (`0`, `0.02`, `0.05`, `0.1`)에서는 L1-only가 foreground
+L1 `0.3732`로 가장 좋았고, LoFTR weight 0.1은 feature loss가 가장 낮았지만 foreground
+L1은 `0.3923`으로 나빠졌다. 현재 데이터의 권장 기본값은 L1-only이며 LoFTR가 필요하면
+`0.02`부터 사용한다. 전체 설정과 결과는 `docs/sggs_loftr_weight_ablation.md`에 기록한다.
+
+실제 접촉 구간을 포함한 end-to-end 테스트 명령, 정량 결과 및 현재 실패 판정은
+`docs/native_stage2_test_report.md`에 기록한다. 이 테스트는 GIF 생성 성공만으로 물리 학습
+성공을 판정하지 않고, 접촉 후 trajectory 안정성과 contact parameter 갱신 여부도 확인한다.
+
+### 명확한 캔–바닥 충돌 테스트 영상
+
+`tools/generate_mujoco_fall_dataset.py`는 고정 초기 상태 옵션과 `rollout.gif`, 충돌/정지
+diagnostics 출력을 지원한다. 현재 채택한 테스트 episode는 다음 위치에 있다.
+
+```text
+output/can_floor_contact_test_dataset_v3/
+  stage2/fall_and_rebound/train/cola_can/episode_000/
+    rgb/                 # 75 frames, 640x480
+    masks/               # can foreground masks
+    state/trajectory.json
+    episode_manifest.json
+    rollout.gif
+```
+
+카메라는 2.2 m 거리, 1.1 m 높이에서 z=0.82 m를 바라본다. 캔은 z=1.5 m에서 떨어져
+frame 15 부근에서 바닥과 충돌하고 frame 30에 정지한다. 전체 75 frames/2.5 s이므로 낙하,
+충돌/감쇠, 정지 상태가 모두 포함되며 캔은 모든 구간에서 화면 안에 있다. 재생성 명령은 다음과 같다.
+
+```bash
+conda run -n cg_wm python tools/generate_mujoco_fall_dataset.py \
+  --dataset_root output/can_floor_contact_test_dataset_v3 \
+  --object_name cola_can --split train --fps 30 --seed 2026 \
+  --camera_distance 2.2 --camera_height 1.1 --camera_target_z 0.82 \
+  --initial_position 0,0,1.5 --initial_euler_deg 8,-6,12 \
+  --initial_linear_velocity 0,0,0 --initial_angular_velocity 0.8,0.4,0.3 \
+  --cylinder_friction "0.8 0.03 0.003" \
+  --cylinder_solref "0.03 1" --floor_solref "0.03 1" \
+  --freejoint_damping 0.25
+```
+
+이 v3 영상으로 실제 camera calibration을 적용해 Stage2를 다시 학습한 결과와 실패 분석은
+`docs/contact_test_v3_stage2_report.md`에 있다. 실행은 완료되고 image loss는 감소했지만,
+접촉 후 침투/횡방향 drift 및 새 MuJoCo 영상과 기존 floor Gaussian 사이의 외관 불일치 때문에
+현재 물리·렌더 품질 acceptance test는 통과하지 못했다.
+
+현실적인 육안 검사용 영상은 `output/can_floor_realistic_test`에 별도로 생성했다. 이 버전은
+하늘 gradient, 작은 타일의 무광 바닥, key/fill light와 그림자, 낮은 실제 촬영 구도를 사용한다.
+캔은 기울어진 상태로 떨어져 rim으로 먼저 충돌하고 옆으로 넘어져 짧게 구른 뒤 정지한다.
+전체 영상은 episode의 `rollout.gif`에서 확인할 수 있다.
+
+### 현실형 장면과 일치하는 Stage1 multiview
+
+논문 재현 순서의 첫 단계로 현실형 Stage2와 같은 하늘, 타일 바닥, 조명을 사용하는 Stage1
+multiview를 `output/realistic_stage1_multiview/can_floor_realistic`에 생성했다. 단일 orbit이
+아니라 12–65도 upper-hemisphere를 golden-angle로 샘플링한다.
+
+```bash
+conda run -n cg_wm python -m stage1.generate_mujoco_synthetic_dataset \
+  --output_root output/realistic_stage1_multiview \
+  --scene_name can_floor_realistic --object_type cola_can \
+  --alpha_subject scene --train_views 72 --test_views 12 \
+  --width 640 --height 480 --fovy_deg 42 --camera_radius 1.1 \
+  --camera_sampling hemisphere --min_elevation_deg 12 --max_elevation_deg 65 \
+  --appearance_preset realistic_contact --mujoco_gl egl --seed 2026
+```
+
+각 view는 RGBA image, binary subject mask, `0=background, 1=can, 2=floor` instance map,
+calibrated camera transform을 제공한다. 72개 train view와 12개 test view 모두 캔과 바닥
+label을 포함한다.
+
+### SG-GS Stage1 검증 경로
+
+합성 데이터에서는 SAM2 대신 MuJoCo가 제공한 정확한 instance mask로 geometry feature를
+만들 수 있다. 객체 이름이나 shape preset은 사용하지 않으며 label 정수만 feature code로
+변환한다. 실제 이미지에는 `extract_sam2_features.py`를 사용한다.
+
+```bash
+conda run -n cg_wm python -m stage1.build_mask_geometry_features \
+  --source_path output/realistic_stage1_multiview/can_realistic_sggs
+
+conda run -n cg_wm python -m stage1.build_visual_hull \
+  --source_path output/realistic_stage1_multiview/can_realistic_sggs \
+  --masks_dir output/realistic_stage1_multiview/can_realistic_sggs/object_masks \
+  --bbox_min=-0.085,-0.085,-0.005 --bbox_max=0.085,0.085,0.215 \
+  --grid_resolution 128 --max_points 120000
+
+conda run -n gaussian_splatting python -m stage1.train \
+  -s output/realistic_stage1_multiview/can_realistic_sggs \
+  -m output/stage1_sggs_can_test --eval --resolution 2 \
+  --init_mode visual_hull --sam_features mask_geometry_features \
+  --masks_dir object_masks --stage1_preset contactwm \
+  --sam_feature_weight 0.1 --object_mask_weight 0.1 --iterations 600 \
+  --densify_from_iter 100 --densify_until_iter 400 --disable_viewer
+```
+
+학습 뒤 `auto_assign_object_ids.py --propagate_unassigned`를 실행하면 2D mask 투표를 받은
+표면 Gaussian의 ownership을 가려진 Visual-Hull 내부점까지 전파한다. 검증 결과는
+`output/stage1_sggs_can_test_owned_complete`에 있으며 119,370개 Gaussian 모두 캔 ID 1이다.
+저장 PLY의 세 log-scale 축 차이와 identity quaternion 오차는 모두 0이며, SIBR 없이 생성한
+12개 test render는 `test/ours_600/renders/`에 있다.
 
 `--gaussian_mask_dir`를 주면 foreground만 비교하고 배경은 설정된 renderer background로
 합성합니다. `--gaussian_render_stride`와 `--gaussian_render_max_frames`로 sparse frame

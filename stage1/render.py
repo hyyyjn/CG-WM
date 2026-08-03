@@ -114,6 +114,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             gaussian_mask=gaussian_mask,
         )
         gt = view.original_image[0:3, :, :]
+        if view.alpha_mask is not None:
+            gt = gt * view.alpha_mask
         object_mask_prior = None
         if getattr(view, "has_object_mask_prior", False) and view.object_mask is not None:
             object_mask_prior = view.object_mask[:1, :, :]

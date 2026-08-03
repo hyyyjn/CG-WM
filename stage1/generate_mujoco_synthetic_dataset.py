@@ -33,6 +33,13 @@ def parse_args():
     parser.add_argument("--fovy_deg", default=45.0, type=float, help="Vertical field of view in degrees.")
     parser.add_argument("--camera_radius", default=1.45, type=float, help="Distance from camera to object center.")
     parser.add_argument("--elevation_deg", default=25.0, type=float, help="Orbit elevation angle in degrees.")
+    parser.add_argument("--camera_sampling", default="orbit", choices=("orbit", "hemisphere"))
+    parser.add_argument("--min_elevation_deg", default=12.0, type=float)
+    parser.add_argument("--max_elevation_deg", default=70.0, type=float)
+    parser.add_argument(
+        "--appearance_preset", default="legacy", choices=("legacy", "realistic_contact"),
+        help="Use the same floor, sky, and lighting family as the realistic Stage2 contact scene.",
+    )
     parser.add_argument(
         "--object_height",
         default=None,
@@ -61,6 +68,16 @@ def parse_args():
         "--add_pose_jitter",
         action="store_true",
         help="Apply a small random yaw rotation to the object before settling.",
+    )
+    parser.add_argument(
+        "--alpha_subject",
+        default="object",
+        choices=["object", "floor", "scene"],
+        help=(
+            "Content represented by the PNG alpha channel. 'object' keeps the legacy "
+            "can-only behavior; 'floor' isolates the support surface; 'scene' includes both for a joint "
+            "can/floor Gaussian reconstruction. Per-instance label maps are always written."
+        ),
     )
     parser.add_argument(
         "--box_face_colors",
@@ -244,24 +261,45 @@ def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]
     raise ValueError(f"Unsupported object_type: {object_type}")
 
 
-def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int, box_face_colors: str) -> str:
+def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int,
+                    box_face_colors: str, appearance_preset: str = "legacy") -> str:
     object_xml, _ = object_geom_xml(object_type, box_face_colors)
+    if appearance_preset == "realistic_contact":
+        visual_xml = """
+    <headlight ambient="0.22 0.22 0.22" diffuse="0.65 0.65 0.65" specular="0.18 0.18 0.18"/>
+    <rgba haze="0.82 0.86 0.92 1"/>"""
+        asset_xml = """
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.68 0.77 0.88" rgb2="0.95 0.96 0.98" width="512" height="3072"/>
+    <texture name="checker" type="2d" builtin="checker" rgb1="0.60 0.62 0.64" rgb2="0.56 0.58 0.60" width="512" height="512"/>
+    <material name="floor_mat" texture="checker" texrepeat="16 16" reflectance="0.03" shininess="0.08"/>"""
+        light_xml = """
+    <light name="key" pos="-2 -3 5" dir="0.25 0.35 -1" directional="true" diffuse="0.85 0.82 0.78" castshadow="true"/>
+    <light name="fill" pos="3 -1 2.5" dir="-1 0.2 -0.5" directional="true" diffuse="0.25 0.28 0.35" specular="0.1 0.1 0.1"/>"""
+        floor_rgba = "0.92 0.92 0.92 1"
+    else:
+        visual_xml = """
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.65 0.65 0.65" specular="0.15 0.15 0.15"/>
+    <rgba haze="0.95 0.95 0.95 1"/>"""
+        asset_xml = """
+    <texture name="checker" type="2d" builtin="checker" rgb1="0.92 0.92 0.92" rgb2="0.84 0.84 0.84" width="256" height="256"/>
+    <material name="floor_mat" texture="checker" texrepeat="3 3" reflectance="0.05"/>"""
+        light_xml = """
+    <light name="key" pos="1.5 -1.5 2.8" dir="-0.4 0.3 -1"/>
+    <light name="fill" pos="-1.2 1.0 2.1" dir="0 -0.1 -1" diffuse="0.5 0.5 0.5"/>"""
+        floor_rgba = "0.95 0.95 0.95 1"
     return f"""
 <mujoco model="cgwm_simple_scene">
   <option timestep="0.002" gravity="0 0 -9.81"/>
   <visual>
     <global offwidth="{int(width)}" offheight="{int(height)}"/>
-    <headlight ambient="0.35 0.35 0.35" diffuse="0.65 0.65 0.65" specular="0.15 0.15 0.15"/>
-    <rgba haze="0.95 0.95 0.95 1"/>
+    {visual_xml}
   </visual>
   <asset>
-    <texture name="checker" type="2d" builtin="checker" rgb1="0.92 0.92 0.92" rgb2="0.84 0.84 0.84" width="256" height="256"/>
-    <material name="floor_mat" texture="checker" texrepeat="3 3" reflectance="0.05"/>
+    {asset_xml}
   </asset>
   <worldbody>
-    <light name="key" pos="1.5 -1.5 2.8" dir="-0.4 0.3 -1"/>
-    <light name="fill" pos="-1.2 1.0 2.1" dir="0 -0.1 -1" diffuse="0.5 0.5 0.5"/>
-    <geom name="floor" type="plane" size="2 2 0.1" material="floor_mat" rgba="0.95 0.95 0.95 1"/>
+    {light_xml}
+    <geom name="floor" type="plane" size="5 5 0.1" material="floor_mat" rgba="{floor_rgba}"/>
     <camera name="render_cam" mode="fixed" pos="1 0 0.5" xyaxes="0 1 0 -0.3 0 1" fovy="{float(fovy_deg)}"/>
     {object_xml}
   </worldbody>
@@ -306,6 +344,30 @@ def orbit_camera_positions(count: int, radius: float, elevation_deg: float, look
             dtype=np.float32,
         )
         positions.append(eye)
+    return positions
+
+
+def hemisphere_camera_positions(count: int, radius: float, min_elevation_deg: float,
+                                max_elevation_deg: float, lookat: np.ndarray) -> list[np.ndarray]:
+    """Deterministic golden-angle sampling over an upper spherical band."""
+    if count < 1:
+        return []
+    min_sin = math.sin(math.radians(float(min_elevation_deg)))
+    max_sin = math.sin(math.radians(float(max_elevation_deg)))
+    if not 0.0 <= min_sin < max_sin <= 1.0:
+        raise ValueError("hemisphere elevations must satisfy 0 <= min < max <= 90 degrees")
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    positions = []
+    for index in range(count):
+        fraction = (index + 0.5) / float(count)
+        sin_elevation = min_sin + fraction * (max_sin - min_sin)
+        elevation = math.asin(sin_elevation)
+        theta = index * golden_angle
+        xy_radius = radius * math.cos(elevation)
+        positions.append(lookat + np.array(
+            [xy_radius * math.cos(theta), xy_radius * math.sin(theta), radius * math.sin(elevation)],
+            dtype=np.float32,
+        ))
     return positions
 
 
@@ -372,9 +434,13 @@ def render_split(
     floor_geom_id: int | None,
     width: int,
     height: int,
+    alpha_subject: str,
 ):
     image_dir = dataset_dir / "images" / split_name
     mask_dir = dataset_dir / "masks" / split_name
+    instance_mask_dir = dataset_dir / "instance_masks" / split_name
+    object_mask_dir = dataset_dir / "object_masks" / split_name
+    floor_mask_dir = dataset_dir / "floor_masks" / split_name
     frames = []
     for index, eye in enumerate(positions):
         set_camera_pose(mujoco, model, "render_cam", eye, lookat, np.array([0.0, 0.0, 1.0], dtype=np.float32))
@@ -390,11 +456,27 @@ def render_split(
         segmentation = renderer.render()
 
         mask = segmentation_to_mask(segmentation, target_geom_ids=target_geom_ids, floor_geom_id=floor_geom_id)
-        rgba = build_rgba(rgb, mask)
+        geom_labels = segmentation if segmentation.ndim == 2 else segmentation[..., 0]
+        floor_mask = geom_labels == int(floor_geom_id) if floor_geom_id is not None else np.zeros_like(mask, dtype=bool)
+        # Stable IDs consumed by auto_assign_object_ids.py: 0=background, 1=can, 2=floor.
+        instance_mask = np.zeros(mask.shape, dtype=np.uint8)
+        instance_mask[floor_mask] = 2
+        instance_mask[mask.astype(bool)] = 1
+        if alpha_subject == "scene":
+            alpha_mask = (instance_mask > 0).astype(np.uint8)
+        elif alpha_subject == "floor":
+            alpha_mask = floor_mask.astype(np.uint8)
+        else:
+            alpha_mask = mask
+        rgba = build_rgba(rgb, alpha_mask)
 
         stem = f"{split_name}_{index:03d}"
         save_png(imageio, image_dir / f"{stem}.png", rgba)
-        save_png(imageio, mask_dir / f"{stem}.png", mask * 255)
+        # ``masks`` is the binary prior for the selected Stage-1 subject.
+        save_png(imageio, mask_dir / f"{stem}.png", alpha_mask * 255)
+        save_png(imageio, instance_mask_dir / f"{stem}.png", instance_mask)
+        save_png(imageio, object_mask_dir / f"{stem}.png", mask * 255)
+        save_png(imageio, floor_mask_dir / f"{stem}.png", floor_mask.astype(np.uint8) * 255)
 
         c2w = camera_to_world_matrix(eye, lookat, np.array([0.0, 0.0, 1.0], dtype=np.float32))
         frames.append(
@@ -429,7 +511,10 @@ def main():
     dataset_dir = Path(args.output_root).expanduser().resolve() / args.scene_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    xml = build_model_xml(args.object_type, args.fovy_deg, args.width, args.height, args.box_face_colors)
+    xml = build_model_xml(
+        args.object_type, args.fovy_deg, args.width, args.height,
+        args.box_face_colors, args.appearance_preset,
+    )
     (dataset_dir / "scene.xml").write_text(xml)
 
     model = mujoco.MjModel.from_xml_string(xml)
@@ -457,8 +542,16 @@ def main():
     _, default_object_height = object_geom_xml(args.object_type, args.box_face_colors)
     object_height = float(default_object_height if args.object_height is None else args.object_height)
     lookat = np.array([0.0, 0.0, object_height], dtype=np.float32)
-    train_positions = orbit_camera_positions(args.train_views, args.camera_radius, args.elevation_deg, lookat)
-    test_positions = orbit_camera_positions(args.test_views, args.camera_radius, args.elevation_deg, lookat)
+    if args.camera_sampling == "hemisphere":
+        position_builder = lambda count: hemisphere_camera_positions(
+            count, args.camera_radius, args.min_elevation_deg, args.max_elevation_deg, lookat
+        )
+    else:
+        position_builder = lambda count: orbit_camera_positions(
+            count, args.camera_radius, args.elevation_deg, lookat
+        )
+    train_positions = position_builder(args.train_views)
+    test_positions = position_builder(args.test_views)
     if args.test_views > 0:
         test_positions = test_positions[1:] + test_positions[:1]
 
@@ -476,6 +569,7 @@ def main():
         floor_geom_id=floor_geom_id,
         width=args.width,
         height=args.height,
+        alpha_subject=args.alpha_subject,
     )
     render_split(
         mujoco=mujoco,
@@ -491,6 +585,7 @@ def main():
         floor_geom_id=floor_geom_id,
         width=args.width,
         height=args.height,
+        alpha_subject=args.alpha_subject,
     )
 
     manifest = {
@@ -503,12 +598,18 @@ def main():
         "fovy_deg": args.fovy_deg,
         "camera_radius": args.camera_radius,
         "elevation_deg": args.elevation_deg,
+        "camera_sampling": args.camera_sampling,
+        "min_elevation_deg": args.min_elevation_deg,
+        "max_elevation_deg": args.max_elevation_deg,
+        "appearance_preset": args.appearance_preset,
         "mujoco_gl": os.environ.get("MUJOCO_GL", mujoco_gl),
+        "alpha_subject": args.alpha_subject,
+        "instance_labels": {"0": "background", "1": "object", "2": "floor"},
     }
     (dataset_dir / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2))
 
     print(f"[DONE] MuJoCo synthetic dataset created at: {dataset_dir}")
-    print("[INFO] Expected layout: images/train|test, masks/train|test, transforms_train.json, transforms_test.json")
+    print("[INFO] Expected layout: images/, masks/ (selected alpha subject), object_masks/, floor_masks/, instance_masks/, transforms_*.json")
 
 
 if __name__ == "__main__":

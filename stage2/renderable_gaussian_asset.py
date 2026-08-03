@@ -30,6 +30,7 @@ class RenderableGaussianAsset:
     foreground_logit: torch.Tensor
     object_ids: torch.Tensor
     sh_degree: int
+    source_indices: torch.Tensor | None = None
 
     def to(self, *, dtype=None, device=None) -> "RenderableGaussianAsset":
         return RenderableGaussianAsset(
@@ -43,6 +44,7 @@ class RenderableGaussianAsset:
             foreground_logit=self.foreground_logit.to(dtype=dtype, device=device),
             object_ids=self.object_ids.to(device=device),
             sh_degree=int(self.sh_degree),
+            source_indices=None if self.source_indices is None else self.source_indices.to(device=device),
         )
 
     @property
@@ -62,6 +64,50 @@ class RenderableGaussianAsset:
             foreground_logit=self.foreground_logit[indices],
             object_ids=self.object_ids[indices],
             sh_degree=self.sh_degree,
+            source_indices=(indices if self.source_indices is None else self.source_indices[indices]),
+        )
+
+    def filter(
+        self,
+        *,
+        opacity_threshold: float | None = None,
+        foreground_threshold: float | None = None,
+        object_id: int | None = None,
+    ) -> "RenderableGaussianAsset":
+        """Select render Gaussians using activated Stage1 metadata fields."""
+        keep = torch.ones((self.num_gaussians,), dtype=torch.bool, device=self.xyz.device)
+        if opacity_threshold is not None:
+            keep &= self.activated_opacity.reshape(-1) >= float(opacity_threshold)
+        if foreground_threshold is not None:
+            keep &= torch.sigmoid(self.foreground_logit).reshape(-1) >= float(foreground_threshold)
+        if object_id is not None:
+            keep &= self.object_ids.reshape(-1) == int(object_id)
+        indices = torch.nonzero(keep, as_tuple=False).reshape(-1)
+        if indices.numel() == 0:
+            raise ValueError(
+                "No render Gaussians remain after filtering "
+                f"(opacity_threshold={opacity_threshold}, "
+                f"foreground_threshold={foreground_threshold}, object_id={object_id})."
+            )
+        return self.index_select(indices)
+
+    def subtract_local_offset(self, offset) -> "RenderableGaussianAsset":
+        """Express centers in a body frame whose origin is ``offset`` in asset coordinates."""
+        offset_tensor = torch.as_tensor(offset, dtype=self.xyz.dtype, device=self.xyz.device)
+        if offset_tensor.shape != (3,):
+            raise ValueError("canonical local offset must contain three values")
+        return RenderableGaussianAsset(
+            xyz=self.xyz - offset_tensor,
+            features_dc=self.features_dc,
+            features_rest=self.features_rest,
+            opacity=self.opacity,
+            scaling=self.scaling,
+            rotation=self.rotation,
+            features_geo=self.features_geo,
+            foreground_logit=self.foreground_logit,
+            object_ids=self.object_ids,
+            sh_degree=self.sh_degree,
+            source_indices=self.source_indices,
         )
 
     def with_spherical_geometry(
@@ -94,6 +140,7 @@ class RenderableGaussianAsset:
             foreground_logit=self.foreground_logit,
             object_ids=self.object_ids,
             sh_degree=self.sh_degree,
+            source_indices=self.source_indices,
         )
 
     @property
@@ -223,6 +270,7 @@ def load_renderable_gaussian_asset(
         foreground_logit=torch.as_tensor(foreground_np, dtype=dtype, device=device),
         object_ids=torch.as_tensor(object_ids_np, dtype=torch.int32, device=device),
         sh_degree=sh_degree,
+        source_indices=torch.arange(xyz_np.shape[0], dtype=torch.long, device=device),
     )
     return asset
 
@@ -281,6 +329,7 @@ def rigid_transform_asset(
         foreground_logit=asset.foreground_logit,
         object_ids=asset.object_ids,
         sh_degree=asset.sh_degree,
+        source_indices=asset.source_indices,
     )
 
 
@@ -306,6 +355,31 @@ def instantiate_rigid_gaussian_scene(
         foreground_logit=torch.cat([item.foreground_logit for item in instances], dim=0),
         object_ids=torch.cat([torch.full_like(item.object_ids, idx) for idx, item in enumerate(instances)], dim=0),
         sh_degree=asset.sh_degree,
+    )
+
+
+def concatenate_gaussian_assets(*assets: RenderableGaussianAsset) -> RenderableGaussianAsset:
+    """Join independently trained assets into one Gaussian rasterizer scene."""
+    assets = tuple(asset for asset in assets if asset.num_gaussians > 0)
+    if not assets:
+        raise ValueError("at least one non-empty Gaussian asset is required")
+    sh_degrees = {int(asset.sh_degree) for asset in assets}
+    if len(sh_degrees) != 1:
+        raise ValueError(f"all Gaussian assets must use the same SH degree, got {sorted(sh_degrees)}")
+    geo_widths = {int(asset.features_geo.shape[1]) for asset in assets}
+    if len(geo_widths) != 1:
+        raise ValueError(f"all Gaussian assets must use the same geometry feature width, got {sorted(geo_widths)}")
+    return RenderableGaussianAsset(
+        xyz=torch.cat([asset.xyz for asset in assets], dim=0),
+        features_dc=torch.cat([asset.features_dc for asset in assets], dim=0),
+        features_rest=torch.cat([asset.features_rest for asset in assets], dim=0),
+        opacity=torch.cat([asset.opacity for asset in assets], dim=0),
+        scaling=torch.cat([asset.scaling for asset in assets], dim=0),
+        rotation=torch.cat([asset.rotation for asset in assets], dim=0),
+        features_geo=torch.cat([asset.features_geo for asset in assets], dim=0),
+        foreground_logit=torch.cat([asset.foreground_logit for asset in assets], dim=0),
+        object_ids=torch.cat([asset.object_ids for asset in assets], dim=0),
+        sh_degree=assets[0].sh_degree,
     )
 
 

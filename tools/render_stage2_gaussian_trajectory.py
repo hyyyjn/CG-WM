@@ -18,6 +18,7 @@ for path in (str(REPO_ROOT), str(GS_ROOT)):
 
 from stage2.renderable_gaussian_asset import (  # noqa: E402
     RenderableGaussianAsset,
+    concatenate_gaussian_assets,
     copy_asset_to_gaussian_model,
     instantiate_rigid_gaussian_scene,
     load_renderable_gaussian_asset,
@@ -41,6 +42,8 @@ class PipelineParams:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a Stage2 pose trajectory with a rigid Stage1 Gaussian asset.")
     parser.add_argument("--stage1_ply", required=True, type=Path)
+    parser.add_argument("--floor_stage1_ply", default=None, type=Path,
+                        help="Optional static floor Gaussian PLY rendered in the same rasterizer call.")
     parser.add_argument("--trajectory", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--max_frames", default=0, type=int)
@@ -60,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale_multiplier", default=1.0, type=float)
     parser.add_argument("--foreground_threshold", default=None, type=float)
     parser.add_argument("--opacity_threshold", default=None, type=float)
+    parser.add_argument("--floor_foreground_threshold", default=None, type=float)
+    parser.add_argument("--floor_opacity_threshold", default=None, type=float)
     parser.add_argument("--recenter_asset", action="store_true")
     parser.add_argument(
         "--auto_scale_to_trajectory_half_extent",
@@ -293,7 +298,7 @@ def infer_stage1_to_mujoco_scale(stage1_ply: Path, *, half_extent: float, device
     return float((float(half_extent) * 2.0 / torch.clamp(diameter, min=1e-12)).detach().cpu().item())
 
 
-def render_frame(base_asset, frame: dict, camera: MiniCam, background: torch.Tensor, scale_multiplier: float) -> np.ndarray:
+def render_frame(base_asset, floor_asset, frame: dict, camera: MiniCam, background: torch.Tensor, scale_multiplier: float) -> np.ndarray:
     positions, quaternions = frame_pose_tensors(frame, device=str(base_asset.xyz.device))
     scene_asset = instantiate_rigid_gaussian_scene(
         base_asset,
@@ -301,6 +306,8 @@ def render_frame(base_asset, frame: dict, camera: MiniCam, background: torch.Ten
         quaternions,
         scale_multiplier=float(scale_multiplier),
     )
+    if floor_asset is not None:
+        scene_asset = concatenate_gaussian_assets(floor_asset, scene_asset)
     gaussians = GaussianModel(scene_asset.sh_degree)
     copy_asset_to_gaussian_model(scene_asset, gaussians)
     output = gs_render(camera, gaussians, PipelineParams(), background, separate_sh=False)["render"]
@@ -317,8 +324,6 @@ def main() -> None:
         raise RuntimeError(message)
 
     device = "cuda"
-    import imageio.v2 as imageio
-
     output_dir = args.output_dir.resolve()
     rgb_dir = output_dir / "gaussian_rgb"
     rgb_dir.mkdir(parents=True, exist_ok=True)
@@ -331,6 +336,16 @@ def main() -> None:
         opacity_threshold=args.opacity_threshold,
         recenter=bool(args.recenter_asset),
     )
+    floor_asset = None
+    floor_filter_info = None
+    if args.floor_stage1_ply is not None:
+        floor_asset = load_renderable_gaussian_asset(args.floor_stage1_ply.resolve(), device=device)
+        floor_asset, floor_filter_info = filter_asset(
+            floor_asset,
+            foreground_threshold=args.floor_foreground_threshold,
+            opacity_threshold=args.floor_opacity_threshold,
+            recenter=False,
+        )
     scale_multiplier = float(args.scale_multiplier)
     if bool(args.auto_scale_to_trajectory_half_extent):
         scale_multiplier *= infer_scale_from_asset(base_asset, half_extent=float(payload.get("half_extent", 0.055)))
@@ -348,16 +363,24 @@ def main() -> None:
             if bool(args.follow_object):
                 target = frame_camera_target(frame) + parse_vec3(args.follow_target_offset)
             camera = make_camera(args, device=device, yaw_deg=yaw_deg, target=target)
-        image = render_frame(base_asset, frame, camera, background, scale_multiplier)
+        image = render_frame(base_asset, floor_asset, frame, camera, background, scale_multiplier)
         frame_index = int(frame.get("frame_index", local_idx))
         path = rgb_dir / f"{frame_index:06d}.png"
         Image.fromarray(image).save(path)
         rendered_frames.append(image)
         frame_records.append({"frame_index": frame_index, "path": str(path), "camera_yaw_deg": yaw_deg})
     gif_path = output_dir / "stage2_gaussian_trajectory.gif"
-    imageio.mimsave(gif_path, rendered_frames, fps=max(1, int(args.fps)))
+    gif_images = [Image.fromarray(frame) for frame in rendered_frames]
+    gif_images[0].save(
+        gif_path,
+        save_all=True,
+        append_images=gif_images[1:],
+        duration=max(1, round(1000.0 / max(1, int(args.fps)))),
+        loop=0,
+    )
     manifest = {
         "stage1_ply": str(args.stage1_ply.resolve()),
+        "floor_stage1_ply": str(args.floor_stage1_ply.resolve()) if args.floor_stage1_ply else None,
         "trajectory": str(args.trajectory.resolve()),
         "rgb_dir": str(rgb_dir),
         "gif": str(gif_path),
@@ -365,6 +388,10 @@ def main() -> None:
         "num_frames": len(frame_records),
         "num_base_gaussians": int(base_asset.num_gaussians),
         "filter": filter_info,
+        "floor_filter": floor_filter_info,
+        "num_floor_gaussians": int(floor_asset.num_gaussians) if floor_asset is not None else 0,
+        "renderer": "single_call_gaussian_splatting",
+        "mujoco_pixels_used": False,
         "scale_multiplier": float(scale_multiplier),
         "requested_scale_multiplier": float(args.scale_multiplier),
         "auto_scale_to_trajectory_half_extent": bool(args.auto_scale_to_trajectory_half_extent),

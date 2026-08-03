@@ -72,6 +72,12 @@ class LoFTRCorrespondenceLoss(nn.Module):
         self.max_matches = int(max_matches)
         self.min_matches = int(min_matches)
         self.patch_radius = int(patch_radius)
+        if not 0.0 <= self.confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be in [0, 1]")
+        if self.max_matches < 1 or self.min_matches < 0:
+            raise ValueError("max_matches must be positive and min_matches non-negative")
+        if self.patch_radius < 0:
+            raise ValueError("patch_radius must be non-negative")
 
     def forward(
         self,
@@ -95,7 +101,9 @@ class LoFTRCorrespondenceLoss(nn.Module):
                 "batch_indexes",
                 torch.zeros(keypoints0.shape[0], dtype=torch.long, device=keypoints0.device),
             ).long()
+            raw_count = int(confidence.numel())
             keep = confidence >= self.confidence_threshold
+            confidence_count = int(keep.sum())
             if masks is not None and keypoints0.numel() > 0:
                 mask0 = _sample_patches(
                     masks, batch_indices, keypoints0, 0
@@ -117,6 +125,8 @@ class LoFTRCorrespondenceLoss(nn.Module):
             return loss, {
                 "loftr_loss": 0.0,
                 "loftr_matches": count,
+                "loftr_raw_matches": raw_count,
+                "loftr_confidence_matches": confidence_count,
                 "loftr_sufficient_matches": False,
             }
         rendered_patches = _sample_patches(
@@ -140,6 +150,8 @@ class LoFTRCorrespondenceLoss(nn.Module):
         return loss, {
             "loftr_loss": float(loss.detach().cpu().item()),
             "loftr_matches": count,
+            "loftr_raw_matches": raw_count,
+            "loftr_confidence_matches": confidence_count,
             "loftr_mean_confidence": float(confidence.mean().detach().cpu().item()),
             "loftr_sufficient_matches": True,
         }

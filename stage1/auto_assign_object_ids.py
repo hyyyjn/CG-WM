@@ -218,8 +218,14 @@ def save_grouped_model(scene, dataset, output_model_path, save_iteration, object
     if os.path.exists(source_exposure_path):
         shutil.copy2(source_exposure_path, os.path.join(output_model_path, "exposure.json"))
 
-    with open(os.path.join(output_model_path, "cfg_args"), "w") as f:
-        f.write(str(Namespace(**vars(dataset))))
+    # Preserve training-time flags such as ``eval`` and resolution. Rebuilding
+    # this file from the assignment CLI silently changed eval=True to False.
+    source_cfg_path = os.path.join(source_model_path, "cfg_args")
+    if os.path.exists(source_cfg_path):
+        shutil.copy2(source_cfg_path, os.path.join(output_model_path, "cfg_args"))
+    else:
+        with open(os.path.join(output_model_path, "cfg_args"), "w") as f:
+            f.write(str(Namespace(**vars(dataset))))
 
 
 def accumulate_view_votes(
@@ -362,6 +368,31 @@ def assign_labels_from_votes(vote_counts, num_gaussians, background_id, min_vote
     return object_ids
 
 
+def propagate_unassigned_ids(object_ids, xyz, background_id):
+    """Transfer surface ownership to occluded Visual-Hull interior points."""
+    assigned = object_ids != int(background_id)
+    unassigned = ~assigned
+    if not np.any(assigned) or not np.any(unassigned):
+        return object_ids, 0
+    assigned_ids = object_ids[assigned]
+    unique_ids = np.unique(assigned_ids)
+    propagated = object_ids.copy()
+    if unique_ids.size == 1:
+        propagated[unassigned] = unique_ids[0]
+        return propagated, int(unassigned.sum())
+
+    xyz_np = xyz.detach().cpu().numpy() if torch.is_tensor(xyz) else np.asarray(xyz)
+    reference = torch.from_numpy(xyz_np[assigned]).float().to(xyz.device)
+    queries = torch.from_numpy(xyz_np[unassigned]).float().to(xyz.device)
+    nearest_chunks = []
+    for start in range(0, queries.shape[0], 256):
+        distances = torch.cdist(queries[start:start + 256], reference)
+        nearest_chunks.append(distances.argmin(dim=1).cpu().numpy())
+    nearest = np.concatenate(nearest_chunks)
+    propagated[unassigned] = assigned_ids[nearest]
+    return propagated, int(unassigned.sum())
+
+
 def refine_object_ids(object_ids, vote_counts, per_view_observations, background_id, consistency_threshold, max_iterations):
     if max_iterations <= 0:
         return object_ids, []
@@ -454,6 +485,11 @@ if __name__ == "__main__":
     parser.add_argument("--depth_tolerance", default=1e-3, type=float)
     parser.add_argument("--refine_iterations", default=0, type=int)
     parser.add_argument("--refine_consistency_threshold", default=0.6, type=float)
+    parser.add_argument(
+        "--propagate_unassigned",
+        action="store_true",
+        help="Assign occluded/unvoted hull points from the nearest voted Gaussian.",
+    )
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -511,6 +547,9 @@ if __name__ == "__main__":
         consistency_threshold=args.refine_consistency_threshold,
         max_iterations=args.refine_iterations,
     )
+    num_propagated = 0
+    if args.propagate_unassigned:
+        object_ids, num_propagated = propagate_unassigned_ids(object_ids, xyz, args.background_id)
 
     output_model_path = args.output_model_path if args.output_model_path else args.model_path
     save_iteration = scene.loaded_iter if args.save_iteration == -1 else args.save_iteration
@@ -538,6 +577,8 @@ if __name__ == "__main__":
         "depth_tolerance": float(args.depth_tolerance),
         "refine_iterations": int(args.refine_iterations),
         "refine_consistency_threshold": float(args.refine_consistency_threshold),
+        "propagate_unassigned": bool(args.propagate_unassigned),
+        "num_propagated": int(num_propagated),
         "refinement_stats": refinement_stats,
         "total_visible_projections": int(total_visible_projections),
         "total_frontmost_projections": int(total_frontmost_projections),

@@ -32,6 +32,11 @@ from stage2.differentiable_complementarity_free_contact_dynamics import (
     smooth_weighted_max,
 )
 from stage2.experiment_provenance import write_experiment_bundle
+from stage2.video_observations import (
+    load_optional_evaluation_trajectory,
+    load_video_observations,
+    observation_summary,
+)
 import torch.nn.functional as F
 
 
@@ -43,6 +48,21 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--episode_root", required=True, type=Path)
+    parser.add_argument(
+        "--source_scene_manifest",
+        default=None,
+        type=Path,
+        help="Original generic scene manifest, recorded for provenance when invoked through the adapter.",
+    )
+    parser.add_argument(
+        "--evaluation_trajectory",
+        default=None,
+        type=Path,
+        help=(
+            "Optional pose-label trajectory used by the legacy supervised adapter and metrics. "
+            "Defaults to episode_root/state/trajectory.json for now; video observations are loaded independently."
+        ),
+    )
     parser.add_argument("--stage1_ply", default=None, type=Path)
     parser.add_argument("--stage1_model_path", default=None, type=Path)
     parser.add_argument("--output_dir", default=None, type=Path)
@@ -430,19 +450,6 @@ def resolve_stage1_ply(stage1_ply: Path | None, stage1_model_path: Path | None) 
         return int(match.group(1)) if match else -1
 
     return max(candidates, key=iteration_number)
-
-
-def load_target_positions(episode_root: Path, max_frames: int) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
-    trajectory_path = episode_root / "state" / "trajectory.json"
-    payload = read_json(trajectory_path)
-    states = payload["states"]
-    if max_frames > 0:
-        states = states[:max_frames]
-    if len(states) < 3:
-        raise ValueError("Need at least 3 trajectory states for Stage 2 fitting.")
-    positions = torch.tensor([state["position"] for state in states], dtype=torch.float32)
-    times = torch.tensor([float(state.get("time", idx)) for idx, state in enumerate(states)], dtype=torch.float32)
-    return positions, times, states
 
 
 def load_target_quaternions(states: list[dict]) -> torch.Tensor:
@@ -928,6 +935,33 @@ def angular_velocity_from_quaternions(quaternions: torch.Tensor, dt: float) -> t
     return (vec / vec_norm) * (angle / float(dt)).unsqueeze(-1)
 
 
+def integrate_quaternion_sequence(
+    initial_quaternion: torch.Tensor,
+    angular_velocity: torch.Tensor,
+    *,
+    steps: int,
+    dt: float,
+) -> torch.Tensor:
+    """Differentiably integrate a constant world-frame angular velocity."""
+    quaternion = normalize_quaternion(initial_quaternion)
+    quaternions = [quaternion]
+    omega_quaternion = torch.cat((torch.zeros_like(angular_velocity[:1]), angular_velocity))
+    for _ in range(max(0, int(steps) - 1)):
+        w1, x1, y1, z1 = omega_quaternion.unbind(-1)
+        w2, x2, y2, z2 = quaternion.unbind(-1)
+        derivative = 0.5 * torch.stack(
+            (
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            )
+        )
+        quaternion = normalize_quaternion(quaternion + float(dt) * derivative)
+        quaternions.append(quaternion)
+    return torch.stack(quaternions, dim=0)
+
+
 def _resolve_num_query_points(
     query_mode: str,
     body_query_scheme: str,
@@ -1376,7 +1410,7 @@ def simulate_pairwise_impedance(
 
 
 def fit_stage2(
-    target_positions: torch.Tensor,
+    target_positions: torch.Tensor | None,
     target_quaternions: torch.Tensor | None,
     initial_linear_velocity_hint: torch.Tensor,
     initial_angular_velocity_hint: torch.Tensor,
@@ -1400,7 +1434,11 @@ def fit_stage2(
     body_b_trajectory_metadata: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, dict]:
     device = torch.device(args.device)
-    target_positions = target_positions.to(device=device)
+    image_only = bool(args.image_only_objective)
+    if target_positions is None and not image_only:
+        raise ValueError("Pose-supervised fitting requires target_positions; use --image_only_objective without GT.")
+    if target_positions is not None:
+        target_positions = target_positions.to(device=device)
     if target_quaternions is not None:
         target_quaternions = normalize_quaternion(target_quaternions.to(device=device))
     initial_linear_velocity_hint = initial_linear_velocity_hint.to(device=device)
@@ -1408,17 +1446,21 @@ def fit_stage2(
     times = times.to(device=device)
     local_centers = local_centers.to(device=device)
     radii = radii.to(device=device)
+    dtype = local_centers.dtype
+    num_frames = int(times.shape[0])
+    if num_frames < 3:
+        raise ValueError("Need at least 3 video observation frames for Stage 2 fitting.")
     external_forces = (
-        torch.zeros((target_positions.shape[0] - 1, 3), dtype=target_positions.dtype, device=device)
-        if external_forces is None else external_forces.to(device=device, dtype=target_positions.dtype)
+        torch.zeros((num_frames - 1, 3), dtype=dtype, device=device)
+        if external_forces is None else external_forces.to(device=device, dtype=dtype)
     )
     external_torques = (
         torch.zeros_like(external_forces)
-        if external_torques is None else external_torques.to(device=device, dtype=target_positions.dtype)
+        if external_torques is None else external_torques.to(device=device, dtype=dtype)
     )
     if body_b_trajectory is not None:
         body_b_trajectory = {
-            key: value.to(device=device, dtype=target_positions.dtype)
+            key: value.to(device=device, dtype=dtype)
             for key, value in body_b_trajectory.items()
         }
     floor_query_offsets_xy = floor_query_offsets_xy.to(device=device)
@@ -1430,7 +1472,6 @@ def fit_stage2(
     query_mode = str(args.query_mode)
     use_impedance = dynamics_mode == "impedance"
     use_pairwise = dynamics_mode == "pairwise_impedance"
-    image_only = bool(args.image_only_objective)
     position_loss_weight = 0.0 if image_only else float(args.position_loss_weight)
     orientation_loss_weight = 0.0 if image_only else float(args.orientation_loss_weight)
     geometry_supervision_weight = 0.0 if image_only else float(args.geometry_loss_weight)
@@ -1442,10 +1483,14 @@ def fit_stage2(
     base_radii = radii.detach().clone()
     center_offsets = torch.nn.Parameter(torch.zeros_like(base_local_centers))
     log_radius_offsets = torch.nn.Parameter(torch.zeros_like(base_radii))
+    if target_positions is None and initial_state_override is None:
+        raise ValueError(
+            "GT-free image-only fitting requires --initial_state_json or --prefit_initial_state."
+        )
     initial_position = (
         initial_state_override["position"].to(device=device).detach()
         if initial_state_override is not None
-        else target_positions[0].detach()
+        else target_positions[0].detach()  # type: ignore[index]
     )
     initial_quaternion = (
         initial_state_override["quaternion_wxyz"].to(device=device).detach()
@@ -1454,7 +1499,11 @@ def fit_stage2(
         if target_quaternions is not None
         else torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device)
     )
-    finite_velocity = (target_positions[1] - target_positions[0]) / dt
+    finite_velocity = (
+        (target_positions[1] - target_positions[0]) / dt
+        if target_positions is not None
+        else initial_linear_velocity_hint
+    )
     initial_velocity_value = (
         initial_state_override["linear_velocity"].to(device=device)
         if initial_state_override is not None
@@ -1568,6 +1617,8 @@ def fit_stage2(
     angular_velocity_sequence = (
         angular_velocity_from_quaternions(target_quaternions, dt)
         if friction_mode != "off" and target_quaternions is not None
+        else initial_angular_velocity.unsqueeze(0).expand(num_frames - 1, -1)
+        if friction_mode != "off"
         else None
     )
 
@@ -1587,6 +1638,16 @@ def fit_stage2(
 
     def run(grad: bool):
         geometry_centers, geometry_radii = effective_geometry(grad)
+        rollout_quaternions = (
+            target_quaternions.detach()
+            if target_quaternions is not None and not image_only
+            else integrate_quaternion_sequence(
+                initial_quaternion,
+                initial_angular_velocity if grad else initial_angular_velocity.detach(),
+                steps=num_frames,
+                dt=dt,
+            )
+        )
         if use_pairwise:
             if pairwise_body_b is None:
                 local_centers_b, radii_b = geometry_centers, geometry_radii
@@ -1596,7 +1657,7 @@ def fit_stage2(
                 radii_b = radii_b.to(device=device)
             static_position_b = torch.tensor(
                 parse_vec3(args.pairwise_static_position),
-                dtype=target_positions.dtype,
+                dtype=dtype,
                 device=device,
             )
             pairwise_patch_count = (
@@ -1621,7 +1682,7 @@ def fit_stage2(
                 local_centers_b,
                 radii_b,
                 static_position_b,
-                steps=target_positions.shape[0],
+                steps=num_frames,
                 dt=dt,
                 mass=float(args.mass),
                 mass_parameter=(
@@ -1673,8 +1734,8 @@ def fit_stage2(
                 local_centers,
                 radii,
                 floor_query_offsets_xy,
-                target_quaternions.detach() if target_quaternions is not None else None,
-                steps=target_positions.shape[0],
+                rollout_quaternions,
+                steps=num_frames,
                 dt=dt,
                 mass=float(args.mass),
                 contact_softness=float(args.contact_softness),
@@ -1685,7 +1746,7 @@ def fit_stage2(
                 query_mode=query_mode,
                 local_query_points=local_query_points,
             )
-            return predicted_positions, None, gates
+            return predicted_positions, rollout_quaternions, gates
         restitution = torch.sigmoid(raw_restitution if grad else raw_restitution.detach())
         friction_coefficient = None
         if raw_friction is not None:
@@ -1698,8 +1759,8 @@ def fit_stage2(
             local_centers,
             radii,
             floor_query_offsets_xy,
-            target_quaternions.detach() if target_quaternions is not None else None,
-            steps=target_positions.shape[0],
+            rollout_quaternions,
+            steps=num_frames,
             dt=dt,
             contact_softness=float(args.contact_softness),
             smooth_max_temperature=float(args.smooth_max_temperature),
@@ -1714,16 +1775,20 @@ def fit_stage2(
             body_lowest_k=int(getattr(args, "body_lowest_k", 0)),
             body_query_scheme=str(getattr(args, "body_query_scheme", "axis6")),
         )
-        return predicted_positions, None, gates
+        # Restitution mode currently consumes the observed angular-velocity
+        # sequence instead of integrating orientation. Returning the observed
+        # quaternions still allows RGB/posed-geometry supervision to train the
+        # predicted translational contact dynamics end-to-end.
+        return predicted_positions, rollout_quaternions, gates
 
     geometry_stride = max(1, int(args.geometry_loss_stride))
     geometry_indices = torch.arange(
-        0, target_positions.shape[0], geometry_stride, device=device, dtype=torch.long
+        0, num_frames, geometry_stride, device=device, dtype=torch.long
     )
     render_indices = gaussian_render_indices or []
 
     def auxiliary_losses(predicted_positions, predicted_quaternions):
-        zero = torch.zeros((), dtype=target_positions.dtype, device=device)
+        zero = torch.zeros((), dtype=dtype, device=device)
         geometry_loss = zero
         gaussian_rgb_loss = zero
         gaussian_rgb_diagnostics = {}
@@ -1732,7 +1797,7 @@ def fit_stage2(
             str(args.geometry_gradient_route),
         )
         if geometry_supervision_weight > 0.0:
-            if predicted_quaternions is None or target_quaternions is None:
+            if predicted_quaternions is None or target_quaternions is None or target_positions is None:
                 raise ValueError("--geometry_loss_weight requires pairwise quaternion rollout.")
             pred_geometry = transform_local_points(
                 supervision_centers,
@@ -1758,32 +1823,38 @@ def fit_stage2(
 
     def geometry_regularization() -> torch.Tensor:
         if not bool(args.refine_geometry):
-            return torch.zeros((), dtype=target_positions.dtype, device=device)
+            return torch.zeros((), dtype=dtype, device=device)
         return (
             float(args.geometry_center_l2_weight) * torch.mean(center_offsets * center_offsets)
             + float(args.geometry_radius_l2_weight) * torch.mean(log_radius_offsets * log_radius_offsets)
         )
 
     def physical_regularization() -> torch.Tensor:
-        regularizer = torch.zeros((), dtype=target_positions.dtype, device=device)
+        regularizer = torch.zeros((), dtype=dtype, device=device)
         if raw_mass is not None:
             regularizer = regularizer + float(args.pairwise_mass_l2_weight) * (
                 F.softplus(raw_mass) - float(args.mass)
             ) ** 2
         if raw_inertia is not None:
-            inertia_reference = torch.tensor(inertia_init, dtype=target_positions.dtype, device=device)
+            inertia_reference = torch.tensor(inertia_init, dtype=dtype, device=device)
             regularizer = regularizer + float(args.pairwise_inertia_l2_weight) * torch.mean(
                 (F.softplus(raw_inertia) - inertia_reference) ** 2
             )
         return regularizer
 
     initial_predicted, initial_quaternions, _ = run(grad=False)
-    initial_position_tensor = torch.mean((initial_predicted - target_positions) ** 2)
-    initial_orientation_tensor = torch.tensor(0.0, dtype=target_positions.dtype, device=device)
+    initial_position_tensor = (
+        torch.mean((initial_predicted - target_positions) ** 2)
+        if target_positions is not None
+        else torch.zeros((), dtype=dtype, device=device)
+    )
+    initial_orientation_tensor = torch.tensor(0.0, dtype=dtype, device=device)
     if use_pairwise and initial_quaternions is not None and target_quaternions is not None:
         initial_orientation_tensor = quaternion_loss(initial_quaternions, target_quaternions)
     initial_geometry, initial_rgb, _ = auxiliary_losses(initial_predicted, initial_quaternions)
-    initial_loss = float(initial_position_tensor.detach().cpu().item())
+    initial_loss = (
+        float(initial_position_tensor.detach().cpu().item()) if target_positions is not None else None
+    )
     initial_objective = (
         position_loss_weight * initial_position_tensor
         + orientation_loss_weight * initial_orientation_tensor
@@ -1806,9 +1877,13 @@ def fit_stage2(
     for iteration in range(num_fit_iterations):
         optimizer.zero_grad(set_to_none=True)
         predicted, predicted_quaternions, gates = run(grad=True)
-        position_loss = torch.mean((predicted - target_positions) ** 2)
+        position_loss = (
+            torch.mean((predicted - target_positions) ** 2)
+            if target_positions is not None
+            else torch.zeros((), dtype=dtype, device=device)
+        )
         loss = position_loss_weight * position_loss + 1e-4 * torch.mean(initial_velocity * initial_velocity)
-        orientation_loss = torch.tensor(0.0, dtype=target_positions.dtype, device=device)
+        orientation_loss = torch.tensor(0.0, dtype=dtype, device=device)
         if (
             use_pairwise
             and predicted_quaternions is not None
@@ -1835,7 +1910,7 @@ def fit_stage2(
         # pairs a loss with the wrong parameters by one iteration.
         current_objective = float(loss.detach().cpu().item())
         if current_objective < best_objective:
-            best_loss = current_position_loss
+            best_loss = current_position_loss if target_positions is not None else None
             best_objective = current_objective
             best_state = [p.detach().clone() for p in learnable]
             best_iteration = iteration
@@ -1859,10 +1934,12 @@ def fit_stage2(
     # The final optimizer.step() creates one additional parameter state that was
     # not evaluated at the start of a loop iteration. Include it as a candidate.
     post_step_predicted, post_step_quaternions, _ = run(grad=False)
-    post_step_loss = float(
-        torch.mean((post_step_predicted - target_positions) ** 2).detach().cpu().item()
+    post_step_loss = (
+        float(torch.mean((post_step_predicted - target_positions) ** 2).detach().cpu().item())
+        if target_positions is not None
+        else 0.0
     )
-    post_step_orientation = torch.tensor(0.0, dtype=target_positions.dtype, device=device)
+    post_step_orientation = torch.tensor(0.0, dtype=dtype, device=device)
     if use_pairwise and post_step_quaternions is not None and target_quaternions is not None:
         post_step_orientation = quaternion_loss(post_step_quaternions, target_quaternions)
     post_geometry, post_rgb, _ = auxiliary_losses(post_step_predicted, post_step_quaternions)
@@ -1870,7 +1947,7 @@ def fit_stage2(
         post_step_orientation.detach().cpu().item()
     )
     post_step_objective += 1e-4 * float(torch.mean(initial_velocity.detach() ** 2).cpu().item())
-    post_step_objective += float(args.geometry_loss_weight) * float(post_geometry.detach().cpu().item())
+    post_step_objective += geometry_supervision_weight * float(post_geometry.detach().cpu().item())
     post_step_objective += float(args.gaussian_rgb_loss_weight) * float(post_rgb.detach().cpu().item())
     post_step_objective += float(geometry_regularization().detach().cpu().item())
     if use_pairwise and bool(args.fit_initial_angular_velocity):
@@ -1878,7 +1955,7 @@ def fit_stage2(
             torch.mean(initial_angular_velocity.detach() ** 2).cpu().item()
         )
     if post_step_objective < best_objective:
-        best_loss = post_step_loss
+        best_loss = post_step_loss if target_positions is not None else None
         best_objective = post_step_objective
         best_state = [p.detach().clone() for p in learnable]
         best_iteration = num_fit_iterations
@@ -1889,13 +1966,17 @@ def fit_stage2(
     predicted, predicted_quaternions, gates = run(grad=False)
     final_geometry, final_rgb, final_rgb_diagnostics = auxiliary_losses(predicted, predicted_quaternions)
     refined_centers, refined_radii = effective_geometry(False)
-    final_loss = float(torch.mean((predicted - target_positions) ** 2).detach().cpu().item())
+    final_loss = (
+        float(torch.mean((predicted - target_positions) ** 2).detach().cpu().item())
+        if target_positions is not None
+        else None
+    )
     contact_indices = torch.nonzero(gates.detach().cpu() > 0.5).flatten()
     first_contact_frame = int(contact_indices[0].item() + 1) if contact_indices.numel() else None
-    rmse = float(np.sqrt(final_loss))
+    rmse = None if final_loss is None else float(np.sqrt(final_loss))
     diagnostics = {
         "dt": dt,
-        "frames": int(target_positions.shape[0]),
+        "frames": num_frames,
         "dynamics": dynamics_mode,
         "query_mode": query_mode,
         "num_query_points": (
@@ -1933,7 +2014,7 @@ def fit_stage2(
         "best_position_loss": best_loss,
         "best_objective": best_objective,
         "eval_only": bool(args.eval_only),
-        "geometry_loss_weight": float(args.geometry_loss_weight),
+        "geometry_loss_weight": geometry_supervision_weight,
         "geometry_loss": float(final_geometry.detach().cpu().item()),
         "geometry_loss_stride": geometry_stride,
         "geometry_refinement_enabled": bool(args.refine_geometry),
@@ -1976,6 +2057,7 @@ def fit_stage2(
             "fovy_deg": float(args.gaussian_cam_fovy_deg),
         },
         "image_only_objective": image_only,
+        "ground_truth_trajectory_used_for_training": target_positions is not None,
         "effective_position_loss_weight": position_loss_weight,
         "effective_orientation_loss_weight": orientation_loss_weight,
         "effective_geometry_supervision_weight": geometry_supervision_weight,
@@ -2228,8 +2310,47 @@ def main() -> None:
     episode_manifest = read_json(episode_root / "episode_manifest.json")
     object_shape = str(episode_manifest.get("physics_shape", "sphere"))
 
-    target_positions_cpu, times_cpu, states = load_target_positions(episode_root, int(args.max_frames))
-    target_quaternions_cpu = load_target_quaternions(states)
+    observations = load_video_observations(
+        episode_root,
+        max_frames=int(args.max_frames),
+        rgb_dir=args.gaussian_rgb_dir,
+        mask_dir=args.gaussian_mask_dir,
+        views_manifest=args.gaussian_views_manifest,
+        camera_defaults={
+            "distance": float(args.gaussian_cam_distance),
+            "height": float(args.gaussian_cam_height),
+            "fovy_deg": float(args.gaussian_cam_fovy_deg),
+        },
+    )
+    evaluation_path = (
+        args.evaluation_trajectory.resolve()
+        if args.evaluation_trajectory is not None
+        else episode_root / "state" / "trajectory.json"
+    )
+    evaluation = load_optional_evaluation_trajectory(
+        evaluation_path,
+        max_frames=int(args.max_frames),
+    )
+    if evaluation is None and not bool(args.image_only_objective):
+        raise ValueError(
+            "Pose-supervised fitting requires --evaluation_trajectory. "
+            "Use --image_only_objective with --initial_state_json or --prefit_initial_state for GT-free fitting."
+        )
+    if evaluation is not None and observations.num_frames != evaluation.num_frames:
+        raise ValueError(
+            f"RGB/evaluation frame count mismatch: {observations.num_frames} vs {evaluation.num_frames}."
+        )
+    states = (
+        list(evaluation.states)
+        if evaluation is not None
+        else [
+            {"frame_index": frame_index, "time": float(observations.times[index].item())}
+            for index, frame_index in enumerate(observations.frame_indices)
+        ]
+    )
+    target_positions_cpu = None if evaluation is None else evaluation.positions
+    target_quaternions_cpu = None if evaluation is None else evaluation.quaternions_wxyz
+    times_cpu = observations.times if bool(args.image_only_objective) else evaluation.times
     default_actions_path = episode_root / "actions" / "trajectory.json"
     actions_path = (
         args.actions_json.resolve()
@@ -2240,7 +2361,7 @@ def main() -> None:
     )
     external_forces_cpu, external_torques_cpu, action_metadata = load_action_wrenches(
         actions_path,
-        num_steps=len(states) - 1,
+        num_steps=observations.num_frames - 1,
         force_scale=float(args.action_force_scale),
         torque_scale=float(args.action_torque_scale),
     )
@@ -2251,14 +2372,18 @@ def main() -> None:
             raise ValueError("--pairwise_body_b_trajectory_json requires --dynamics pairwise_impedance.")
         body_b_trajectory, body_b_trajectory_metadata = load_kinematic_body_trajectory(
             args.pairwise_body_b_trajectory_json.resolve(),
-            num_frames=len(states),
+            num_frames=observations.num_frames,
             dt=infer_dt(times_cpu),
         )
-    if str(args.initial_velocity_source) == "trajectory":
+    if str(args.initial_velocity_source) == "trajectory" and evaluation is not None:
         initial_linear_velocity_hint_cpu = load_initial_linear_velocity(states)
     else:
-        initial_linear_velocity_hint_cpu = torch.zeros_like(target_positions_cpu[0])
-    initial_angular_velocity_hint_cpu = load_initial_angular_velocity(states)
+        initial_linear_velocity_hint_cpu = torch.zeros(3, dtype=torch.float32)
+    initial_angular_velocity_hint_cpu = (
+        load_initial_angular_velocity(states)
+        if evaluation is not None and not bool(args.image_only_objective)
+        else torch.zeros(3, dtype=torch.float32)
+    )
     stage1_world_translation = parse_optional_vec3(args.stage1_world_translation, label="--stage1_world_translation")
     stage1_world_rotation = parse_optional_matrix3(args.stage1_world_rotation, label="--stage1_world_rotation")
     stage1_coordinate_contract = load_stage1_coordinate_contract(
@@ -2345,8 +2470,6 @@ def main() -> None:
     gaussian_render_loss = None
     gaussian_render_indices: list[int] = []
     if float(args.gaussian_rgb_loss_weight) > 0.0 or bool(args.prefit_initial_state):
-        if str(args.dynamics) != "pairwise_impedance":
-            raise ValueError("--gaussian_rgb_loss_weight requires --dynamics pairwise_impedance.")
         if torch.device(args.device).type != "cuda":
             raise ValueError("--gaussian_rgb_loss_weight requires --device cuda.")
         from stage2.differentiable_gaussian_render_loss import (
@@ -2356,7 +2479,7 @@ def main() -> None:
         )
 
         render_stride = max(1, int(args.gaussian_render_stride))
-        gaussian_render_indices = list(range(0, len(states), render_stride))
+        gaussian_render_indices = list(range(0, observations.num_frames, render_stride))
         if int(args.gaussian_render_max_frames) > 0 and len(gaussian_render_indices) > int(args.gaussian_render_max_frames):
             selected = np.linspace(
                 0,
@@ -2389,7 +2512,7 @@ def main() -> None:
             render_views.append(Stage2GaussianRenderLoss(
                 stage1_ply=stage1_ply,
                 gt_rgb_dir=rgb_path,
-                frame_indices=[int(states[idx]["frame_index"]) for idx in gaussian_render_indices],
+                frame_indices=[int(observations.frame_indices[idx]) for idx in gaussian_render_indices],
                 gaussian_indices=stage1_metadata.get("source_indices"),
                 gt_mask_dir=mask_path,
                 config=GaussianRenderLossConfig(
@@ -2433,7 +2556,7 @@ def main() -> None:
     elif bool(args.prefit_initial_state):
         from stage2.initial_state_estimation import estimate_initial_state_from_images
 
-        prefit_frames = max(2, min(int(args.prefit_velocity_frames), len(states)))
+        prefit_frames = max(2, min(int(args.prefit_velocity_frames), observations.num_frames))
         prefit_indices = list(range(prefit_frames))
         prefit_views = []
         for spec in view_specs:
@@ -2446,7 +2569,7 @@ def main() -> None:
             prefit_views.append(Stage2GaussianRenderLoss(
                 stage1_ply=stage1_ply,
                 gt_rgb_dir=rgb_path,
-                frame_indices=[int(states[idx]["frame_index"]) for idx in prefit_indices],
+                frame_indices=[int(observations.frame_indices[idx]) for idx in prefit_indices],
                 gaussian_indices=stage1_metadata.get("source_indices"),
                 gt_mask_dir=mask_path,
                 config=GaussianRenderLossConfig(
@@ -2494,8 +2617,8 @@ def main() -> None:
     if float(args.gaussian_rgb_loss_weight) <= 0.0:
         gaussian_render_loss = None
     predicted_positions, predicted_quaternions, contact_gates, diagnostics = fit_stage2(
-        target_positions_cpu,
-        target_quaternions_cpu,
+        None if bool(args.image_only_objective) else target_positions_cpu,
+        None if bool(args.image_only_objective) else target_quaternions_cpu,
         initial_linear_velocity_hint_cpu,
         initial_angular_velocity_hint_cpu,
         times_cpu,
@@ -2516,28 +2639,35 @@ def main() -> None:
         body_b_trajectory=body_b_trajectory,
         body_b_trajectory_metadata=body_b_trajectory_metadata,
     )
+    diagnostics["training_observations"] = observation_summary(observations)
+    diagnostics["evaluation_trajectory"] = {
+        "path": None if evaluation is None else str(evaluation.path),
+        "num_frames": 0 if evaluation is None else evaluation.num_frames,
+        "used_by_legacy_training_objective": not bool(args.image_only_objective),
+        "separated_from_video_observations": True,
+    }
+    if evaluation is not None:
+        evaluation_mse = float(torch.mean((predicted_positions - evaluation.positions) ** 2).item())
+        diagnostics["evaluation_position_rmse"] = float(np.sqrt(evaluation_mse))
 
     trajectory_states = []
     for idx in range(predicted_positions.shape[0]):
         state_payload = {
-            "frame_index": int(states[idx]["frame_index"]),
-            "time": float(states[idx].get("time", idx)),
-            "target_position": target_positions_cpu[idx].tolist(),
+            "frame_index": int(observations.frame_indices[idx]),
+            "time": float(times_cpu[idx].item()),
             "predicted_position": predicted_positions[idx].tolist(),
             "contact_gate": float(contact_gates[idx - 1].item()) if idx > 0 and idx - 1 < contact_gates.numel() else 0.0,
         }
-        if target_quaternions_cpu is not None:
+        if evaluation is not None:
+            state_payload["target_position"] = evaluation.positions[idx].tolist()
+            state_payload["target_quaternion_wxyz"] = evaluation.quaternions_wxyz[idx].tolist()
+        if predicted_quaternions is not None:
             # Restitution dynamics does not predict orientation; it reads omega
             # from the GT quaternion sequence. Persist the GT orientation so the
             # trajectory renderer tumbles the object consistently across query
             # modes (orientation is the controlled variable — only the predicted
             # position differs between modes).
-            state_payload["target_quaternion_wxyz"] = target_quaternions_cpu[idx].tolist()
-            state_payload["predicted_quaternion_wxyz"] = (
-                predicted_quaternions[idx].tolist()
-                if predicted_quaternions is not None
-                else target_quaternions_cpu[idx].tolist()
-            )
+            state_payload["predicted_quaternion_wxyz"] = predicted_quaternions[idx].tolist()
         if idx < external_forces_cpu.shape[0]:
             state_payload["action_force_world"] = external_forces_cpu[idx].tolist()
             state_payload["action_torque_world"] = external_torques_cpu[idx].tolist()
@@ -2554,7 +2684,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gif_path = output_dir / "stage2_fit_follow_view.gif"
     diagnostics["output_dir"] = str(output_dir)
-    diagnostics["diagnostic_gif"] = str(gif_path)
+    diagnostics["diagnostic_gif"] = str(gif_path) if evaluation is not None else None
     diagnostics["experiment_bundle"] = str(output_dir / "experiment_bundle.json")
     initial_state_path = output_dir / "initial_state_estimate.json"
     if initial_state_override is not None:
@@ -2581,14 +2711,15 @@ def main() -> None:
     diagnostics["refined_geometry"] = str(refined_geometry_path)
     write_json(output_dir / "fit_summary.json", diagnostics)
     write_json(output_dir / "predicted_trajectory.json", trajectory)
-    draw_follow_view(
-        target_positions_cpu.numpy(),
-        predicted_positions.numpy(),
-        contact_gates.numpy(),
-        gif_path,
-        fps=int(args.gif_fps),
-        object_shape=object_shape,
-    )
+    if evaluation is not None:
+        draw_follow_view(
+            evaluation.positions.numpy(),
+            predicted_positions.numpy(),
+            contact_gates.numpy(),
+            gif_path,
+            fps=int(args.gif_fps),
+            object_shape=object_shape,
+        )
     bundle_path = write_experiment_bundle(
         output_dir=output_dir,
         repo_root=REPO_ROOT,
@@ -2596,6 +2727,8 @@ def main() -> None:
         episode_manifest_path=episode_root / "episode_manifest.json",
         input_paths={
             "stage1_ply": stage1_ply,
+            "source_scene_manifest": args.source_scene_manifest,
+            "evaluation_trajectory": None if evaluation is None else evaluation.path,
             "pairwise_body_b_ply": args.pairwise_body_b_ply,
             "initial_state_json": args.initial_state_json,
             "actions_json": actions_path,
@@ -2604,7 +2737,7 @@ def main() -> None:
         result_paths={
             "fit_summary": output_dir / "fit_summary.json",
             "predicted_trajectory": output_dir / "predicted_trajectory.json",
-            "diagnostic_gif": gif_path,
+            **({"diagnostic_gif": gif_path} if evaluation is not None else {}),
             "refined_geometry": refined_geometry_path,
             **(
                 {"initial_state_estimate": initial_state_path}

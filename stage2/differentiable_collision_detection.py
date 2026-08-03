@@ -31,6 +31,19 @@ class CollisionEngineConfig:
     floor_query_angles: int = 32
 
 
+def fixed_penetration_signed_distance(
+    phi_soft: torch.Tensor, *, inside_penalty: float, inside_sharpness: float
+) -> torch.Tensor:
+    """Paper sigmoid blend: preserve exterior distance and bound deep penetration."""
+    if inside_penalty <= 0.0:
+        raise ValueError("inside_penalty must be positive.")
+    if inside_sharpness <= 0.0:
+        raise ValueError("inside_sharpness must be positive.")
+    exterior_gate = torch.sigmoid(float(inside_sharpness) * phi_soft)
+    fixed_inside = torch.full_like(phi_soft, -float(inside_penalty))
+    return exterior_gate * phi_soft + (1.0 - exterior_gate) * fixed_inside
+
+
 @dataclass(frozen=True)
 class PlaneCollider:
     """A differentiable infinite plane collider.
@@ -989,8 +1002,9 @@ def evaluate_gaussian_union_sdf(
         dim=-1,
     )
 
-    sigma_blend = torch.sigmoid(inside_sharpness * phi_soft)
-    signed_distances = sigma_blend * phi_soft + (1.0 - sigma_blend) * (-inside_penalty)
+    signed_distances = fixed_penetration_signed_distance(
+        phi_soft, inside_penalty=inside_penalty, inside_sharpness=inside_sharpness
+    )
 
     direction_per_prim = offsets / torch.clamp(center_distances.unsqueeze(-1), min=1e-9)
     surface_normals = torch.sum(primitive_weights.unsqueeze(-1) * direction_per_prim, dim=-2)
@@ -1285,6 +1299,29 @@ def load_gaussian_collision_primitives_from_ply(
     return centers, radii
 
 
+def _spatial_coverage_indices(centers: np.ndarray, count: int) -> np.ndarray:
+    """Deterministic farthest-point subset in normalized local coordinates."""
+    count = int(count)
+    if count <= 0 or centers.shape[0] <= count:
+        return np.arange(centers.shape[0], dtype=np.int64)
+    lower = centers.min(axis=0)
+    extent = np.maximum(centers.max(axis=0) - lower, 1e-8)
+    normalized = (centers - lower) / extent
+    centroid = normalized.mean(axis=0, keepdims=True)
+    first = int(np.argmin(np.sum((normalized - centroid) ** 2, axis=1)))
+    chosen = np.empty((count,), dtype=np.int64)
+    chosen[0] = first
+    min_distance_sq = np.sum((normalized - normalized[first]) ** 2, axis=1)
+    min_distance_sq[first] = -1.0
+    for index in range(1, count):
+        selected = int(np.argmax(min_distance_sq))
+        chosen[index] = selected
+        distance_sq = np.sum((normalized - normalized[selected]) ** 2, axis=1)
+        min_distance_sq = np.minimum(min_distance_sq, distance_sq)
+        min_distance_sq[chosen[: index + 1]] = -1.0
+    return chosen
+
+
 def load_gaussian_collision_body_from_ply(
     path: str | Path,
     *,
@@ -1298,6 +1335,7 @@ def load_gaussian_collision_body_from_ply(
     foreground_threshold: float | None = None,
     opacity_threshold: float | None = None,
     max_primitives: int | None = None,
+    primitive_selection: str = "top_score",
     use_centers_as_queries: bool = True,
     world_translation: "np.ndarray | torch.Tensor | tuple | list | None" = None,
     world_rotation: "np.ndarray | torch.Tensor | None" = None,
@@ -1366,8 +1404,16 @@ def load_gaussian_collision_body_from_ply(
             f"(object_id={object_id}, foreground_threshold={foreground_threshold}, opacity_threshold={opacity_threshold})."
         )
     if max_primitives is not None and int(max_primitives) > 0 and selected.size > int(max_primitives):
-        order = np.argsort(scores[selected])[::-1]
-        selected = selected[order[: int(max_primitives)]]
+        if primitive_selection == "top_score":
+            order = np.argsort(scores[selected], kind="stable")[::-1]
+            selected = selected[order[: int(max_primitives)]]
+        elif primitive_selection == "spatial_coverage":
+            local = _spatial_coverage_indices(centers_np[selected], int(max_primitives))
+            selected = selected[local]
+        else:
+            raise ValueError(
+                "primitive_selection must be 'top_score' or 'spatial_coverage'"
+            )
         selected = np.sort(selected)
 
     centers_np = centers_np[selected]
