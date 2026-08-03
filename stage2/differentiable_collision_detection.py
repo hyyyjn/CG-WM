@@ -29,6 +29,7 @@ class CollisionEngineConfig:
     floor_query_radius_scale: float = 1.1
     floor_query_rings: int = 5
     floor_query_angles: int = 32
+    primitive_locality_margin: float | None = None
 
 
 def fixed_penetration_signed_distance(
@@ -345,6 +346,45 @@ class GaussianCollisionBody:
         return torch.min(centers - radii, dim=-2).values, torch.max(centers + radii, dim=-2).values
 
 
+def _local_primitive_indices(
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    other_centers: torch.Tensor,
+    other_radii: torch.Tensor,
+    *,
+    margin: float,
+) -> torch.Tensor:
+    """Select spheres intersecting the other union's expanded world AABB."""
+    if margin < 0.0:
+        raise ValueError("primitive_locality_margin must be non-negative.")
+    other_min = torch.min(other_centers - other_radii.unsqueeze(-1), dim=0).values
+    other_max = torch.max(other_centers + other_radii.unsqueeze(-1), dim=0).values
+    lower = centers + radii.unsqueeze(-1) >= other_min.unsqueeze(0) - margin
+    upper = centers - radii.unsqueeze(-1) <= other_max.unsqueeze(0) + margin
+    indices = torch.nonzero(torch.all(lower & upper, dim=-1), as_tuple=False).squeeze(-1)
+    if indices.numel() > 0:
+        return indices
+    clamped = torch.maximum(torch.minimum(centers, other_max), other_min)
+    distance_to_aabb = torch.linalg.norm(centers - clamped, dim=-1) - radii
+    return torch.argmin(distance_to_aabb).reshape(1)
+
+
+def _subset_collision_body(body: GaussianCollisionBody, indices: torch.Tensor) -> GaussianCollisionBody:
+    """Create a narrow-phase view without copying or subsampling the scene asset."""
+    local_queries = body.local_query_points
+    if local_queries is not None and local_queries.shape[0] == body.local_centers.shape[0]:
+        local_queries = local_queries.index_select(0, indices)
+    elif local_queries is not None:
+        local_queries = None
+    source_indices = None if body.source_indices is None else body.source_indices.index_select(0, indices)
+    return GaussianCollisionBody(
+        body.local_centers.index_select(0, indices),
+        body.radii.index_select(0, indices),
+        local_queries,
+        source_indices,
+    )
+
+
 def make_pairwise_body_query_points(
     body: GaussianCollisionBody,
     position: torch.Tensor,
@@ -528,6 +568,20 @@ class DifferentiableCollisionEngine:
             quaternion_wxyz=quaternion_b_wxyz,
             rotation_matrix=rotation_b_matrix,
         )
+        if self.config.primitive_locality_margin is not None:
+            margin = float(self.config.primitive_locality_margin)
+            radii_a = body_a.radii.to(dtype=centers_a.dtype, device=centers_a.device)
+            radii_b = body_b.radii.to(dtype=centers_b.dtype, device=centers_b.device)
+            indices_a = _local_primitive_indices(
+                centers_a, radii_a, centers_b, radii_b, margin=margin,
+            )
+            indices_b = _local_primitive_indices(
+                centers_b, radii_b, centers_a, radii_a, margin=margin,
+            )
+            body_a = _subset_collision_body(body_a, indices_a)
+            body_b = _subset_collision_body(body_b, indices_b)
+            centers_a = centers_a.index_select(0, indices_a)
+            centers_b = centers_b.index_select(0, indices_b)
         if self.config.body_query_scheme == "floor_disk":
             if self.config.floor_query_rings < 0 or self.config.floor_query_angles < 1:
                 raise ValueError("floor query rings must be non-negative and angles must be positive.")
@@ -1322,6 +1376,97 @@ def _spatial_coverage_indices(centers: np.ndarray, count: int) -> np.ndarray:
     return chosen
 
 
+def _support_surface_indices(centers: np.ndarray, count: int) -> np.ndarray:
+    """Select directional support points before filling by spatial coverage.
+
+    This preserves extrema, edges, and rims of an arbitrary local point cloud
+    without relying on an object class or analytic shape preset.
+    """
+    count = int(count)
+    if count <= 0 or centers.shape[0] <= count:
+        return np.arange(centers.shape[0], dtype=np.int64)
+    lower, upper = centers.min(axis=0), centers.max(axis=0)
+    extent = np.maximum(upper - lower, 1e-8)
+    normalized = (centers - 0.5 * (lower + upper)) / extent
+    direction_count = max(64, count * 8)
+    indices = np.arange(direction_count, dtype=np.float64)
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - 2.0 * (indices + 0.5) / float(direction_count)
+    radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    directions = np.stack(
+        (radius * np.cos(golden_angle * indices),
+         radius * np.sin(golden_angle * indices), z), axis=1,
+    ).astype(np.float32)
+    support = np.unique(np.argmax(normalized @ directions.T, axis=0)).astype(np.int64)
+    if support.size >= count:
+        # Reduce an over-complete support set while retaining directional spread.
+        return support[_spatial_coverage_indices(normalized[support], count)]
+
+    chosen = list(int(value) for value in support)
+    selected_mask = np.zeros((centers.shape[0],), dtype=bool)
+    selected_mask[support] = True
+    if support.size:
+        distances = np.sum(
+            (normalized[:, None, :] - normalized[support][None, :, :]) ** 2, axis=-1
+        ).min(axis=1)
+    else:
+        distances = np.full((centers.shape[0],), np.inf, dtype=np.float32)
+    distances[selected_mask] = -1.0
+    while len(chosen) < count:
+        next_index = int(np.argmax(distances))
+        chosen.append(next_index)
+        selected_mask[next_index] = True
+        new_distance = np.sum((normalized - normalized[next_index]) ** 2, axis=1)
+        distances = np.minimum(distances, new_distance)
+        distances[selected_mask] = -1.0
+    return np.asarray(chosen, dtype=np.int64)
+
+
+def _trim_support_outliers(centers: np.ndarray, quantile: float) -> np.ndarray:
+    """Return a robust per-axis inlier mask for visual-surface point clouds."""
+    quantile = float(quantile)
+    if quantile <= 0.0:
+        return np.ones((centers.shape[0],), dtype=bool)
+    if not 0.0 < quantile < 0.5:
+        raise ValueError("support_trim_quantile must be in [0, 0.5)")
+    lower = np.quantile(centers, quantile, axis=0)
+    upper = np.quantile(centers, 1.0 - quantile, axis=0)
+    return np.all((centers >= lower) & (centers <= upper), axis=1)
+
+
+def _geometry_feature_support_indices(
+    centers: np.ndarray, features: np.ndarray, count: int, *, feature_weight: float = 1.0
+) -> np.ndarray:
+    """Preserve physical support plus diversity in Stage1 geometry features."""
+    if features.ndim != 2 or features.shape[0] != centers.shape[0] or features.shape[1] == 0:
+        raise ValueError("geometry_feature_support requires non-empty per-Gaussian f_geo features")
+    if feature_weight < 0.0:
+        raise ValueError("geometry_feature_weight must be non-negative")
+    count = min(int(count), int(centers.shape[0]))
+    support_count = max(1, min(count, int(round(count * 0.75))))
+    support = _support_surface_indices(centers, support_count)
+    lower, upper = centers.min(axis=0), centers.max(axis=0)
+    xyz = (centers - lower) / np.maximum(upper - lower, 1e-8)
+    activated = 1.0 / (1.0 + np.exp(-np.clip(features, -30.0, 30.0)))
+    feature_std = np.maximum(activated.std(axis=0, keepdims=True), 1e-6)
+    normalized_features = (activated - activated.mean(axis=0, keepdims=True)) / feature_std
+    embedding = np.concatenate((xyz, float(feature_weight) * normalized_features), axis=1)
+    chosen = list(int(value) for value in support)
+    selected = np.zeros((centers.shape[0],), dtype=bool)
+    selected[support] = True
+    distance = np.sum(
+        (embedding[:, None, :] - embedding[support][None, :, :]) ** 2, axis=-1
+    ).min(axis=1)
+    distance[selected] = -1.0
+    while len(chosen) < count:
+        index = int(np.argmax(distance))
+        chosen.append(index)
+        selected[index] = True
+        distance = np.minimum(distance, np.sum((embedding - embedding[index]) ** 2, axis=1))
+        distance[selected] = -1.0
+    return np.asarray(chosen, dtype=np.int64)
+
+
 def load_gaussian_collision_body_from_ply(
     path: str | Path,
     *,
@@ -1336,6 +1481,9 @@ def load_gaussian_collision_body_from_ply(
     opacity_threshold: float | None = None,
     max_primitives: int | None = None,
     primitive_selection: str = "top_score",
+    support_trim_quantile: float = 0.0,
+    max_radius: float | None = None,
+    geometry_feature_weight: float = 1.0,
     use_centers_as_queries: bool = True,
     world_translation: "np.ndarray | torch.Tensor | tuple | list | None" = None,
     world_rotation: "np.ndarray | torch.Tensor | None" = None,
@@ -1403,6 +1551,15 @@ def load_gaussian_collision_body_from_ply(
             "No Gaussian primitives remain after filtering "
             f"(object_id={object_id}, foreground_threshold={foreground_threshold}, opacity_threshold={opacity_threshold})."
         )
+    if primitive_selection in {"support_surface", "geometry_feature_support"} and float(support_trim_quantile) > 0.0:
+        inliers = _trim_support_outliers(centers_np[selected], float(support_trim_quantile))
+        selected = selected[inliers]
+        if selected.size == 0:
+            raise ValueError("support_trim_quantile removed every collision primitive")
+    geometry_names = sorted(
+        (name for name in names if name.startswith("f_geo_")),
+        key=lambda name: int(name.split("_")[-1]),
+    )
     if max_primitives is not None and int(max_primitives) > 0 and selected.size > int(max_primitives):
         if primitive_selection == "top_score":
             order = np.argsort(scores[selected], kind="stable")[::-1]
@@ -1410,9 +1567,24 @@ def load_gaussian_collision_body_from_ply(
         elif primitive_selection == "spatial_coverage":
             local = _spatial_coverage_indices(centers_np[selected], int(max_primitives))
             selected = selected[local]
+        elif primitive_selection == "support_surface":
+            local = _support_surface_indices(centers_np[selected], int(max_primitives))
+            selected = selected[local]
+        elif primitive_selection == "geometry_feature_support":
+            if not geometry_names:
+                raise ValueError("geometry_feature_support requires f_geo_* fields in the Stage1 PLY")
+            geometry_features = np.stack(
+                [vertices[name] for name in geometry_names], axis=-1
+            ).astype(np.float32)[selected]
+            local = _geometry_feature_support_indices(
+                centers_np[selected], geometry_features, int(max_primitives),
+                feature_weight=float(geometry_feature_weight),
+            )
+            selected = selected[local]
         else:
             raise ValueError(
-                "primitive_selection must be 'top_score' or 'spatial_coverage'"
+                "primitive_selection must be 'top_score', 'spatial_coverage', "
+                "'support_surface', or 'geometry_feature_support'"
             )
         selected = np.sort(selected)
 
@@ -1433,6 +1605,10 @@ def load_gaussian_collision_body_from_ply(
     else:
         radii_np = np.full((centers_np.shape[0],), float(min_radius), dtype=np.float32)
     radii_np = np.maximum(radii_np, float(min_radius))
+    if max_radius is not None:
+        if float(max_radius) <= 0.0:
+            raise ValueError("max_radius must be positive")
+        radii_np = np.minimum(radii_np, float(max_radius))
 
     if world_rotation is not None and world_translation is None:
         raise ValueError("world_rotation requires world_translation so the object-local frame origin is explicit.")

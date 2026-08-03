@@ -77,6 +77,16 @@ class SceneManifestTests(unittest.TestCase):
             self.assertTrue(any("non-zero" in error for error in errors))
             self.assertTrue(any("strictly increasing" in error for error in errors))
 
+    def test_rejects_invalid_fixed_step_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_scene(Path(temporary))
+            payload = json.loads(path.read_text())
+            payload["simulation"] = {"physics_timestep": 0.002, "steps_per_frame": 0}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = load_scene_manifest(path, validate=False)
+            errors = validate_scene_manifest(manifest)
+            self.assertTrue(any("steps_per_frame" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

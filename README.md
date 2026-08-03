@@ -390,10 +390,9 @@ conda run -n gaussian_splatting python tools/calibrate_floor_gaussian_ply.py \
 - `experiment_bundle.json`: 입력 hash, Git 상태, 결과 hash를 포함한 재현성 정보
 - `stage2_fit_follow_view.gif`: 물리 진단용 영상이며 Gaussian-only 결과를 의미하지 않음
 
-현재 안정적인 캔–바닥 baseline은 learned can Gaussian과 analytic plane collider를 사용한다.
-raw learned-floor Gaussian을 직접 `pairwise_impedance` collider로 사용하는 경로는 planar depth
-ambiguity와 잘못된 contact normal 때문에 아직 안정화되지 않았다. 시각화에서 바닥이 Gaussian인
-것과 물리 contact collider가 Gaussian인 것은 구분해야 한다.
+Experimental baseline에서는 analytic plane collider를 계속 사용할 수 있다. 반면
+paper-compatible manifest는 캔과 바닥 모두 Stage1 Gaussian을 렌더와 collision에 공유한다.
+따라서 paper-compatible 결과에서는 바닥 mesh/plane을 물리용으로 따로 사용하지 않는다.
 
 ### SIBR 없이 Gaussian-only PNG/GIF 생성
 
@@ -889,8 +888,10 @@ equation을 통한 angular acceleration에 연결된다. 결과 JSON의 `initial
 `actions`가 고정 상태 및 action 출처를 기록한다.
 
 Paper-compatible collision profile은 Gaussian-union primitive distance에 LSE smooth-min을
-적용한 뒤, 내부 거리를 sigmoid로 `-inside_penalty`에 수렴시킨다. 동일 변환을 analytic plane
-접촉에도 적용해 깊은 관통이 무제한 penalty force로 바뀌지 않도록 한다. 기본값은
+적용한 뒤, 내부 거리를 sigmoid로 `-inside_penalty`에 수렴시킨다. 이 변환은
+학습된 Gaussian-union SDF의 내부 안정화에만 사용한다. Analytic plane은 정확한
+signed distance를 제공하므로 raw distance를 그대로 사용해 바닥 위의 exterior point가
+가짜 penetration으로 변환되는 것을 막는다. 기본값은
 `smooth_min_temperature=0.01`, `inside_penalty=0.02`, `inside_sharpness=50`이며 다음처럼
 manifest에서 장면 단위로 조절할 수 있다.
 
@@ -904,9 +905,8 @@ manifest에서 장면 단위로 조절할 수 있다.
 }
 ```
 
-결과 JSON의 `collision_profile`은 적용된 profile과 Gaussian-union/plane 적용 범위를 기록하고,
-plane contact diagnostics는 변환 전 `raw_signed_distance`와 dynamics에 전달된
-`signed_distance`를 함께 제공한다.
+결과 JSON의 `collision_profile`은 fixed-penetration이 Gaussian-union에만 적용됨을 기록하고,
+plane contact diagnostics의 `raw_signed_distance`와 `signed_distance`는 동일하다.
 
 Paper-compatible contact dynamics는 각 patch의 normal과 tangent basis에서 dual friction-cone
 facet `d_k = n - μt_k`를 만들고 해당 facet의 rigid contact Jacobian을 사용한다. Normal force와
@@ -957,20 +957,22 @@ translation z는 `0.00338 m`였다.
 ### Observation frames and physics substeps
 
 RGB frame 간격과 contact integration timestep을 분리한다. Manifest의
-`observations.fps=30`은 학습 영상 간격을, `simulation.physics_timestep=0.002`는
-원하는 물리 간격을 나타낸다. Runner는 한 RGB frame의 시간을 정확히 맞추기
-위해 `ceil((1/fps)/physics_timestep)`을 사용하고, 실제 integration timestep을
-`(1/fps)/substeps`로 설정한다. 30 fps와 0.002초 설정은 frame당 17 substep,
-실제 timestep 약 0.0019608초가 된다.
+`observations.fps=30`은 명목상 영상 간격을, `simulation.physics_timestep=0.002`는
+데이터를 생성한 fixed physics timestep을 나타낸다. Simulator가 frame당 step 수를
+반올림해 녹화하면 명목 FPS와 실제 timestamp가 다를 수 있으므로 Runner는
+physics timestep을 임의로 조정하지 않는다. `steps_per_frame`이 있으면 그 값을,
+없으면 `round((1/fps)/physics_timestep)`을 사용한다. 현재 GT는 17개의
+0.002초 step으로 녹화되어 실제 frame 간격이 0.034초이다.
 
 ```json
 "observations": {"fps": 30},
-"simulation": {"physics_timestep": 0.002}
+"simulation": {"physics_timestep": 0.002, "steps_per_frame": 17}
 ```
 
 Frame action wrench는 해당 frame의 모든 substep 동안 유지된다. 출력의
-`contact_dynamics_profile`에 `observation_frame_dt`, `requested_physics_timestep`,
-`integration_dt`, `substeps_per_frame`을 기록해 실행 시간축을 재현할 수 있다.
+`contact_dynamics_profile`에 `nominal_observation_frame_dt`, `observation_frame_dt`,
+`requested_physics_timestep`, `integration_dt`, `substeps_per_frame`을 기록해
+명목 FPS와 실제 시간축을 둘 다 재현할 수 있다.
 
 Contact pair에 `impedance_prior`를 주면 object preset 없이 body mass와 time constant로
 학습 시작 stiffness/damping을 계산한다. Dynamic–static pair은 dynamic mass,
@@ -992,6 +994,40 @@ opacity 상위 점만 가져와 proxy가 한쪽으로 치우치는 문제를 막
 정규화한 asset-local 좌표에서 deterministic farthest-point sampling을 적용해
 전체 형상을 균일하게 대표한다.
 
+Plane contact와 같이 객체의 최외곽이 torque를 결정하는 실험은
+`primitive_selection="support_surface"`를 사용할 수 있다. Fibonacci sphere 방향에서
+각각 최대 projection을 가진 Gaussian을 먼저 선택하고 남은 budget은 spatial
+coverage로 채운다. 이 방식은 객체 이름이나 cylinder/box preset 없이 끝단, edge,
+rim과 같은 support surface를 보존한다.
+
+Visual decoration이 물리 외곽을 부풀리는 asset은 `support_trim_quantile`로
+좌표축 별 극단 outlier를 제외하고, `max_radius`로 visual Gaussian scale이
+collision surface에 중복 더해지는 것을 제한할 수 있다. 두 값 모두 manifest의
+collision metadata이며 object class preset은 사용하지 않는다.
+
+`primitive_selection="geometry_feature_support"`는 experimental mode에서 Stage1 PLY의
+`f_geo_*` feature를
+Stage2 collision proxy 생성에 직접 사용한다. Primitive budget의 75%는 directional
+support surface에 배정하고 나머지는 정규화된 local coordinate와 sigmoid geometry
+feature의 joint embedding에서 farthest-point로 선택한다. `geometry_feature_weight`로
+형상 coverage 대 feature diversity의 비율을 조절한다.
+
+Paper-compatible mode에서는 `support_surface`, `geometry_feature_support`,
+`support_trim_quantile`, `max_radius`를 허용하지 않는다. 논문의 Stage1 geometry
+feature는 collision primitive 선택 feature가 아니라 spherical Gaussian의 center와 scale을
+학습하는 supervision으로 사용되기 때문이다.
+
+또한 paper-compatible dynamic Gaussian body는 `max_primitives` 및 `primitive_selection`을
+허용하지 않는다. Renderer와 collision detector가 object filter 후의 동일한
+Stage1 primitive center `c`와 isotropic scale `s`를 사용하며 collision radius는 논문과
+같이 `r=2s`로 계산한다. Subsampling 기능은 experimental mode에만 남겨둔다.
+
+Paper-compatible Stage2는 `--refine_geometry` 지정 여부와 관계없이 dynamic
+Gaussian body의 center `c`와 isotropic scale `s`를 물리 파라미터
+`(M, mu, K, D)`와 공동 최적화한다. 따라서 paper mode에서 `--freeze_mass_inertia`는
+허용되지 않는다. 출력의 `geometry_refinement.requested`, `enabled`,
+`enabled_by_pipeline_mode`로 CLI 요청과 mode contract에 의한 실제 활성화를 구분한다.
+
 Full-image supervision에서 renderer의 빈 화면은 manifest camera의 `background_rgb`로
 설정할 수 있다. 이 값을 GT 생성 환경의 clear color와 맞춰야 정적 배경 오차가
 물리 gradient를 압도하지 않는다.
@@ -1002,9 +1038,12 @@ Full-image supervision에서 renderer의 빈 화면은 manifest camera의 `backg
 }
 ```
 
-Analytic plane은 collision에만 사용되므로 렌더용 바닥 Gaussian의 XY 범위는 독립적으로
-넓힐 수 있다. Paper-compatible 테스트는 `render_floor_grid_wide/point_cloud.ply`의
-81×81, 6,561 Gaussian grid를 사용해 카메라 frustum의 바닥을 모두 덮는다.
+Paper-compatible 테스트는 `render_floor_grid_wide/point_cloud.ply`의 81×81,
+6,561 Gaussian grid를 렌더와 collision 양쪽에 사용한다. 각 primitive는 동일한 center와
+scale에서 `r=2s` collision sphere가 된다. 캔 119,370개와 바닥 6,561개를 밀집 곱으로
+만들지 않도록 `paper_collision.primitive_locality_margin`은 상대 물체의 확장 AABB와
+교차하는 primitive만 narrow phase에서 평가한다. 이는 Stage1 asset을 subsampling하는 것이
+아니며 전체 primitive와 parameter는 scene 및 renderer에 그대로 남는다.
 
 ### Stage1 asset canonical-frame alignment
 
@@ -1033,11 +1072,11 @@ Manifest 기반 native 학습에서도 dynamic `gaussian_union` body의 object-l
 log-radius를 contact parameter 및 초기 상태와 함께 학습할 수 있다. Collision proxy의
 `source_indices`를 filtered render asset의 원본 PLY index와 대조하므로 객체/opacity filter를
 사용해도 동일 Gaussian에만 보정이 적용된다. Center는 `tanh` bounded offset, radius는 bounded
-log-scale로 parameterize한다. 논문 설정에 맞춘 기본 gradient route는 `collision_only`이다.
-Renderer는 보정된 geometry 값으로 영상을 만들지만 해당 center/radius를 detach하므로 image
-loss가 renderer에서 geometry로 직접 흐르지 않는다. Geometry는 collision/dynamics/BPTT 경로와
-regularization을 통해서만 갱신된다. 직접 photometric geometry gradient를 비교하려는 경우에만
-`--geometry_gradient_route collision_and_render`를 사용한다.
+log-scale로 parameterize한다. Paper-compatible mode의 gradient route는
+`collision_and_render`이며 보정된 center/radius가 renderer와 collision/dynamics에
+동일한 live tensor로 전달된다. 따라서 image loss는 photometric renderer 경로와
+contact BPTT 경로 두 곳에서 geometry를 갱신한다. `collision_only`는
+image-only/experimental ablation에만 남겨둔다.
 
 ```bash
 conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \

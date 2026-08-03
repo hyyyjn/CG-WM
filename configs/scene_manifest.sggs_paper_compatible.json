@@ -10,8 +10,6 @@
     },
     "collision": {
       "type": "gaussian_union",
-      "max_primitives": 256,
-      "primitive_selection": "spatial_coverage",
       "radius_convention": "paper_r2s"
     },
     "initialization": {
@@ -28,7 +26,10 @@
     "id": "static_0",
     "role": "static",
     "render": {"gaussian_ply": "../output/floor_stage1_model/render_floor_grid_wide/point_cloud.ply"},
-    "collision": {"type": "plane", "normal": [0.0, 0.0, 1.0], "height": 0.0},
+    "collision": {
+      "type": "gaussian_union",
+      "radius_convention": "paper_r2s"
+    },
     "initialization": {"state_json": "static_state.example.json"}
   }],
   "observations": {
@@ -38,7 +39,7 @@
     "fps": 30
   },
   "actions": {"type": "zero_wrench"},
-  "simulation": {"physics_timestep": 0.002},
+  "simulation": {"physics_timestep": 0.002, "steps_per_frame": 17},
   "contact_pairs": [{
     "body_a": "dynamic_0",
     "body_b": "static_0",
@@ -52,7 +53,8 @@
     "paper_collision": {
       "smooth_min_temperature": 0.01,
       "inside_penalty": 0.02,
-      "inside_sharpness": 50.0
+      "inside_sharpness": 50.0,
+      "primitive_locality_margin": 0.05
     }
   }
 }

@@ -82,7 +82,18 @@ def validate_stage2_mode_options(
         raise ValueError(
             f"temporal windows belong to experimental mode, not {contract.mode.value}"
         )
-    if geometry_gradient_route != "collision_only" and not contract.allow_nonpaper_geometry_gradient:
+    if (
+        contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
+        and geometry_gradient_route != "collision_and_render"
+    ):
+        raise ValueError(
+            "paper_compatible requires geometry gradients through collision_and_render"
+        )
+    if (
+        contract.mode is not Stage2PipelineMode.PAPER_COMPATIBLE
+        and geometry_gradient_route != "collision_only"
+        and not contract.allow_nonpaper_geometry_gradient
+    ):
         raise ValueError(
             f"{geometry_gradient_route!r} geometry gradients belong to experimental mode"
         )

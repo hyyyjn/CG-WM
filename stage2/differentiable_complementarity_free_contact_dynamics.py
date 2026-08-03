@@ -260,6 +260,7 @@ class PairwiseImpedanceDynamicsConfig:
     floor_query_radius_scale: float = 1.1
     floor_query_rings: int = 5
     floor_query_angles: int = 32
+    primitive_locality_margin: Optional[float] = None
     linear_damping: float = 0.0
     angular_damping: float = 0.0
     friction_coefficient: float = 0.0
@@ -293,6 +294,7 @@ class MultiBodyImpedanceDynamicsConfig:
     patch_selection: str = "spatial"
     candidate_pair_mode: str = "spatial_hash"
     spatial_hash_cell_size: float = 0.15
+    primitive_locality_margin: Optional[float] = None
     contact_threshold: float = 0.5
     linear_damping: float = 0.0
     angular_damping: float = 0.0
@@ -628,6 +630,7 @@ class PairwiseGaussianBodyImpedanceDynamics:
                 floor_query_radius_scale=self.config.floor_query_radius_scale,
                 floor_query_rings=self.config.floor_query_rings,
                 floor_query_angles=self.config.floor_query_angles,
+                primitive_locality_margin=self.config.primitive_locality_margin,
             )
         )
 
@@ -1189,6 +1192,7 @@ class MultiBodyGaussianImpedanceDynamics:
                 broad_phase_margin=float(cfg.broad_phase_margin),
                 broad_phase_mode=str(cfg.broad_phase_mode),
                 patch_selection=str(cfg.patch_selection),
+                primitive_locality_margin=cfg.primitive_locality_margin,
             ),
             include_inactive=False,
             contact_threshold=float(cfg.contact_threshold),

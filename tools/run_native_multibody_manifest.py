@@ -167,15 +167,27 @@ def _canonical_offset(body, *, device: torch.device) -> torch.Tensor:
 
 
 def _simulation_timing(manifest) -> tuple[float, int, float]:
-    """Return observation-frame dt, substep count, and exact integration dt."""
+    """Return actual observation dt, substep count, and physics integration dt.
+
+    A recorded simulator dataset commonly rounds the number of fixed physics
+    steps per video frame.  Preserve that fixed timestep instead of shrinking it
+    to force the nominal FPS interval; otherwise the replay slowly drifts from
+    the recorded timestamps.
+    """
     if manifest.observations.fps is None:
         raise ValueError("native runner currently requires observations.fps")
-    frame_dt = 1.0 / float(manifest.observations.fps)
-    requested_dt = float(manifest.simulation.get("physics_timestep", frame_dt))
+    nominal_frame_dt = 1.0 / float(manifest.observations.fps)
+    requested_dt = float(manifest.simulation.get("physics_timestep", nominal_frame_dt))
     if requested_dt <= 0.0:
         raise ValueError("simulation.physics_timestep must be positive")
-    substeps = max(1, int(math.ceil(frame_dt / requested_dt)))
-    return frame_dt, substeps, frame_dt / substeps
+    declared_substeps = manifest.simulation.get("steps_per_frame")
+    substeps = (
+        max(1, int(round(nominal_frame_dt / requested_dt)))
+        if declared_substeps is None else int(declared_substeps)
+    )
+    if substeps < 1:
+        raise ValueError("simulation.steps_per_frame must be at least 1")
+    return requested_dt * substeps, substeps, requested_dt
 
 
 def _step_observation_frame(states, dynamics, *, external_wrenches=None):
@@ -218,14 +230,39 @@ def build_native_runtime(
     for body in bodies:
         params = body.collision.parameters
         render = body.render
+        if paper_mode and body.collision.type == "gaussian_union":
+            selection = str(params.get("primitive_selection", "top_score"))
+            experimental_keys = {
+                key for key in (
+                    "max_primitives", "primitive_selection", "geometry_feature_weight",
+                    "support_trim_quantile", "max_radius"
+                ) if params.get(key) is not None
+            }
+            if selection in {"support_surface", "geometry_feature_support"}:
+                experimental_keys.add("primitive_selection")
+            if experimental_keys:
+                raise ValueError(
+                    f"paper_compatible body {body.id!r} cannot use experimental collision "
+                    f"proxy options: {sorted(experimental_keys)}"
+                )
         if body.collision.type == "gaussian_union":
             ply = body.collision.gaussian_ply or body.render.gaussian_ply
+            max_primitives = params.get("max_primitives")
             loaded_collision = load_gaussian_collision_body_from_ply(
                 ply,
                 radius_convention=str(params.get("radius_convention", "paper_r2s")),
                 radius_scale=float(params.get("radius_scale", 1.0)),
-                max_primitives=int(params.get("max_primitives", 512)),
+                max_primitives=(
+                    None if max_primitives is None and paper_mode
+                    else int(512 if max_primitives is None else max_primitives)
+                ),
                 primitive_selection=str(params.get("primitive_selection", "top_score")),
+                support_trim_quantile=float(params.get("support_trim_quantile", 0.0)),
+                max_radius=(
+                    None if params.get("max_radius") is None
+                    else float(params["max_radius"])
+                ),
+                geometry_feature_weight=float(params.get("geometry_feature_weight", 1.0)),
                 foreground_threshold=None if render is None else render.foreground_threshold,
                 opacity_threshold=None if render is None else render.opacity_threshold,
                 object_id=None if render is None else render.object_id,
@@ -275,7 +312,7 @@ def build_native_runtime(
         _positive_raw(_parameter_initial(pair.parameters.get("friction"), 0.4))
         for pair in manifest.contact_pairs
     ]).to(device)
-    _, frame_substeps, integration_dt = _simulation_timing(manifest)
+    actual_frame_dt, frame_substeps, integration_dt = _simulation_timing(manifest)
     gaussian_pairs, gaussian_parameter_indices, plane_pairs = [], [], []
     for parameter_index, pair in enumerate(manifest.contact_pairs):
         index_a, index_b = id_to_index[pair.body_a], id_to_index[pair.body_b]
@@ -290,6 +327,11 @@ def build_native_runtime(
         plane_body, gaussian_body = bodies[plane_index], bodies[gaussian_index]
         if plane_body.collision.type != "plane" or gaussian_body.collision.type != "gaussian_union":
             raise ValueError(f"unsupported contact pair {pair.body_a!r}, {pair.body_b!r}")
+        if paper_mode:
+            raise ValueError(
+                "paper_compatible mode requires Gaussian-union geometry for both bodies; "
+                "analytic plane contact is an experimental baseline"
+            )
         if plane_body.role != "static":
             raise ValueError(f"analytic plane body {plane_body.id!r} must have role='static'")
         normal = torch.tensor(
@@ -311,7 +353,14 @@ def build_native_runtime(
         smooth_min_temperature=float(paper_collision.get("smooth_min_temperature", 1e-2)),
         inside_penalty=float(paper_collision.get("inside_penalty", 0.02)),
         inside_sharpness=float(paper_collision.get("inside_sharpness", 50.0)),
-        plane_fixed_penetration=bool(paper_mode),
+        primitive_locality_margin=(
+            None if paper_collision.get("primitive_locality_margin") is None
+            else float(paper_collision["primitive_locality_margin"])
+        ),
+        # The fixed-inside transform stabilizes learned Gaussian-union SDFs.
+        # An analytic plane already has an exact signed distance, so applying
+        # the blend there creates false penetration for exterior points.
+        plane_fixed_penetration=False,
         paper_closed_form_contact=bool(paper_mode),
     )
     dynamics = MultiBodyGaussianImpedanceDynamics(
@@ -324,7 +373,8 @@ def build_native_runtime(
         inertia_parameters=torch.stack([_inertia_component_raw(value) for value in inertia]).to(device),
     )
     dynamics.frame_substeps = frame_substeps
-    dynamics.observation_frame_dt = integration_dt * frame_substeps
+    dynamics.observation_frame_dt = actual_frame_dt
+    dynamics.nominal_observation_frame_dt = 1.0 / float(manifest.observations.fps)
     dynamics.requested_physics_timestep = float(
         manifest.simulation.get("physics_timestep", integration_dt)
     )
@@ -351,11 +401,15 @@ def rollout_manifest(
                 states, dynamics, external_wrenches=action_wrenches[frame]
             )
     collision_profile = {
-        "type": "paper_lse_sigmoid_fixed_penetration" if dynamics.config.plane_fixed_penetration else "legacy",
+        "type": (
+            "paper_lse_sigmoid_fixed_penetration_gaussian_raw_plane"
+            if mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE else "legacy"
+        ),
         "smooth_min_temperature": float(dynamics.config.smooth_min_temperature),
         "inside_penalty": float(dynamics.config.inside_penalty),
         "inside_sharpness": float(dynamics.config.inside_sharpness),
-        "applies_to": ["gaussian_union", "analytic_plane"] if dynamics.config.plane_fixed_penetration else ["gaussian_union"],
+        "applies_to": ["gaussian_union"],
+        "analytic_plane_distance": "raw_signed_distance",
     }
     dynamics_profile = {
         "type": "paper_complementarity_free_dual_cone" if dynamics.config.paper_closed_form_contact else "legacy",
@@ -363,6 +417,7 @@ def rollout_manifest(
         "unified_normal_and_friction": bool(dynamics.config.paper_closed_form_contact),
         "generalized_damping": list(dynamics.config.generalized_damping or ()),
         "observation_frame_dt": float(dynamics.observation_frame_dt),
+        "nominal_observation_frame_dt": float(dynamics.nominal_observation_frame_dt),
         "requested_physics_timestep": float(dynamics.requested_physics_timestep),
         "integration_dt": float(dynamics.config.dt),
         "substeps_per_frame": int(dynamics.frame_substeps),
@@ -709,11 +764,23 @@ def fit_native_image_only(
             else "image_only"
         )
     mode_contract = resolve_stage2_mode(pipeline_mode)
+    requested_geometry_gradient_route = str(geometry_gradient_route)
+    effective_geometry_gradient_route = (
+        "collision_and_render"
+        if mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
+        else requested_geometry_gradient_route
+    )
     validate_stage2_mode_options(
         mode_contract, prefit_initial_state=prefit_initial_state,
         temporal_window_frames=temporal_window_frames,
-        geometry_gradient_route=geometry_gradient_route,
+        geometry_gradient_route=effective_geometry_gradient_route,
     )
+    paper_supervision = mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
+    if paper_supervision and not learn_mass_inertia:
+        raise ValueError(
+            "paper_compatible jointly optimizes M, mu, K, D and Gaussian geometry; "
+            "mass/inertia cannot be frozen"
+        )
     if device.type != "cuda" and render_loss_factory is MultiBodyStage2GaussianRenderLoss:
         raise ValueError("native image-only fitting requires --device cuda for the Gaussian rasterizer")
     bodies, base_states, dynamics = build_native_runtime(
@@ -726,7 +793,7 @@ def fit_native_image_only(
     action_wrenches, action_report = _load_action_wrenches(
         manifest, bodies, max_frame=max(frame_indices), device=device
     )
-    paper_supervision = mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
+    effective_refine_geometry = bool(refine_geometry or paper_supervision)
     effective_image_loss = "l1_loftr" if paper_supervision else image_loss
     effective_loftr_weight = 1.0 if paper_supervision else float(loftr_weight)
     effective_mask_dir = None if paper_supervision else manifest.observations.instance_mask_dir
@@ -785,7 +852,7 @@ def fit_native_image_only(
     center_deltas, log_radius_deltas = [], []
     geometry_parameters = []
     for body, collision in zip(bodies, dynamics.bodies):
-        if refine_geometry and body.role == "dynamic" and body.collision.type == "gaussian_union":
+        if effective_refine_geometry and body.role == "dynamic" and body.collision.type == "gaussian_union":
             center_delta = torch.nn.Parameter(torch.zeros_like(collision.local_centers))
             radius_delta = torch.nn.Parameter(torch.zeros_like(collision.radii))
             center_deltas.append(center_delta)
@@ -814,13 +881,13 @@ def fit_native_image_only(
                     position, F.normalize(quaternion, dim=-1), linear_velocity, angular_velocity
                 ))
         render_geometry_centers = render_geometry_radii = None
-        if refine_geometry:
+        if effective_refine_geometry:
             refined_collision, render_geometry_centers, render_geometry_radii, geometry_stats = refined_geometry_overrides(
                 bodies, base_collision_bodies, render_loss.base_assets,
                 center_deltas, log_radius_deltas,
                 max_center_delta=geometry_max_center_delta,
                 max_log_radius_delta=geometry_max_log_radius_delta,
-                gradient_route=geometry_gradient_route,
+                gradient_route=effective_geometry_gradient_route,
             )
             dynamics.bodies = refined_collision
         training_frames, target_indices = _temporal_window(
@@ -830,7 +897,7 @@ def fit_native_image_only(
         positions, quaternions, _ = _rollout_selected(
             initial_states, dynamics, training_frames, action_wrenches
         )
-        if refine_geometry:
+        if effective_refine_geometry:
             loss, diagnostics = render_loss(
                 positions, quaternions,
                 geometry_centers=render_geometry_centers,
@@ -873,13 +940,13 @@ def fit_native_image_only(
         ))
     render_geometry_centers = render_geometry_radii = None
     refined_geometry_payload = {}
-    if refine_geometry:
+    if effective_refine_geometry:
         refined_collision, render_geometry_centers, render_geometry_radii, geometry_stats = refined_geometry_overrides(
             bodies, base_collision_bodies, render_loss.base_assets,
             center_deltas, log_radius_deltas,
             max_center_delta=geometry_max_center_delta,
             max_log_radius_delta=geometry_max_log_radius_delta,
-            gradient_route=geometry_gradient_route,
+            gradient_route=effective_geometry_gradient_route,
         )
         dynamics.bodies = refined_collision
         refined_geometry_payload = {
@@ -901,7 +968,7 @@ def fit_native_image_only(
                 geometry_centers=render_geometry_centers,
                 geometry_radii=render_geometry_radii,
             )
-            if refine_geometry else render_loss.render_sequence(positions, quaternions)
+            if effective_refine_geometry else render_loss.render_sequence(positions, quaternions)
         )
         targets = render_loss.targets[: rendered.shape[0]]
         evaluation_l1 = torch.mean(torch.abs(rendered - targets))
@@ -992,16 +1059,14 @@ def fit_native_image_only(
         "actions": action_report,
         "collision_profile": {
             "type": (
-                "paper_lse_sigmoid_fixed_penetration"
-                if dynamics.config.plane_fixed_penetration else "legacy"
+                "paper_lse_sigmoid_fixed_penetration_gaussian_raw_plane"
+                if paper_supervision else "legacy"
             ),
             "smooth_min_temperature": float(dynamics.config.smooth_min_temperature),
             "inside_penalty": float(dynamics.config.inside_penalty),
             "inside_sharpness": float(dynamics.config.inside_sharpness),
-            "applies_to": (
-                ["gaussian_union", "analytic_plane"]
-                if dynamics.config.plane_fixed_penetration else ["gaussian_union"]
-            ),
+            "applies_to": ["gaussian_union"],
+            "analytic_plane_distance": "raw_signed_distance",
         },
         "contact_dynamics_profile": {
             "type": (
@@ -1014,6 +1079,7 @@ def fit_native_image_only(
             "implicit_matrix": "A=I+h*(h*K+D)*J_dual*M_inv*J_dual_T",
             "generalized_damping": list(dynamics.config.generalized_damping or ()),
             "observation_frame_dt": float(dynamics.observation_frame_dt),
+            "nominal_observation_frame_dt": float(dynamics.nominal_observation_frame_dt),
             "requested_physics_timestep": float(dynamics.requested_physics_timestep),
             "integration_dt": float(dynamics.config.dt),
             "substeps_per_frame": int(dynamics.frame_substeps),
@@ -1052,10 +1118,13 @@ def fit_native_image_only(
             "parameterization": "positive_mass_and_triangle_constrained_principal_inertia",
         },
         "geometry_refinement": {
-            "enabled": bool(refine_geometry),
-            "gradient_route": str(geometry_gradient_route),
+            "requested": bool(refine_geometry),
+            "enabled": bool(effective_refine_geometry),
+            "enabled_by_pipeline_mode": bool(paper_supervision and not refine_geometry),
+            "requested_gradient_route": requested_geometry_gradient_route,
+            "gradient_route": effective_geometry_gradient_route,
             "renderer_geometry_detached": bool(
-                refine_geometry and geometry_gradient_route == "collision_only"
+                effective_refine_geometry and effective_geometry_gradient_route == "collision_only"
             ),
             "center_l2": float(geometry_center_l2),
             "radius_l2": float(geometry_radius_l2),

@@ -235,6 +235,18 @@ def validate_scene_manifest(manifest: SceneManifest, *, check_paths: bool = True
     physics_timestep = manifest.simulation.get("physics_timestep")
     if physics_timestep is not None and float(physics_timestep) <= 0.0:
         errors.append("simulation.physics_timestep must be positive")
+    steps_per_frame = manifest.simulation.get("steps_per_frame")
+    if steps_per_frame is not None:
+        try:
+            valid_steps = (
+                not isinstance(steps_per_frame, bool)
+                and int(steps_per_frame) == float(steps_per_frame)
+                and int(steps_per_frame) >= 1
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid_steps = False
+        if not valid_steps:
+            errors.append("simulation.steps_per_frame must be a positive integer")
 
     known_ids = set(ids)
     seen_pairs: set[tuple[str, str]] = set()
@@ -290,6 +302,7 @@ def manifest_summary(manifest: SceneManifest) -> dict[str, Any]:
         ),
         "fps": manifest.observations.fps,
         "physics_timestep": manifest.simulation.get("physics_timestep"),
+        "steps_per_frame": manifest.simulation.get("steps_per_frame"),
         "has_timestamps": manifest.observations.timestamps is not None,
         "evaluation_trajectory": (
             None if manifest.evaluation_trajectory is None else str(manifest.evaluation_trajectory)

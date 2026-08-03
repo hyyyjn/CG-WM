@@ -49,7 +49,9 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
     @staticmethod
     def collision_body(*_, **__) -> GaussianCollisionBody:
         centers = torch.tensor([[0.0, 0.0, 0.0]])
-        return GaussianCollisionBody(centers, torch.tensor([0.05]), centers)
+        return GaussianCollisionBody(
+            centers, torch.tensor([0.05]), centers, torch.tensor([0])
+        )
 
     def test_builds_and_rolls_out_generic_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -68,7 +70,7 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             self.assertEqual(len(result["frames"]), 3)
             self.assertFalse(result["ground_truth_trajectory_used"])
 
-    def test_physics_timestep_creates_exact_frame_substeps(self):
+    def test_physics_timestep_preserves_recorded_fixed_step_cadence(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_manifest(Path(temporary))
             payload = json.loads(path.read_text())
@@ -79,9 +81,23 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
                 _, states, dynamics = build_native_runtime(manifest, device=torch.device("cpu"))
                 result = rollout_manifest(manifest, steps=1, device=torch.device("cpu"))
             self.assertEqual(dynamics.frame_substeps, 17)
-            self.assertAlmostEqual(dynamics.config.dt, (1.0 / 30.0) / 17.0)
-            self.assertAlmostEqual(dynamics.observation_frame_dt, 1.0 / 30.0)
+            self.assertAlmostEqual(dynamics.config.dt, 0.002)
+            self.assertAlmostEqual(dynamics.observation_frame_dt, 0.034)
+            self.assertAlmostEqual(dynamics.nominal_observation_frame_dt, 1.0 / 30.0)
             self.assertEqual(result["contact_dynamics_profile"]["substeps_per_frame"], 17)
+
+    def test_explicit_steps_per_frame_overrides_fps_rounding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_manifest(Path(temporary))
+            payload = json.loads(path.read_text())
+            payload["simulation"] = {"physics_timestep": 0.002, "steps_per_frame": 16}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = load_scene_manifest(path)
+            with patch("tools.run_native_multibody_manifest.load_gaussian_collision_body_from_ply", self.collision_body):
+                _, _, dynamics = build_native_runtime(manifest, device=torch.device("cpu"))
+            self.assertEqual(dynamics.frame_substeps, 16)
+            self.assertAlmostEqual(dynamics.config.dt, 0.002)
+            self.assertAlmostEqual(dynamics.observation_frame_dt, 0.032)
 
     def test_impedance_prior_maps_time_constant_to_mass_scaled_k_and_d(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -212,7 +228,7 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             self.assertEqual(len(dynamics.plane_contact_pairs), 1)
             self.assertEqual(len(diagnostics["plane_contacts"]), 1)
 
-    def test_paper_mode_applies_fixed_penetration_to_analytic_plane(self):
+    def test_paper_mode_rejects_analytic_plane_contact(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_manifest(Path(temporary))
             payload = json.loads(path.read_text())
@@ -220,20 +236,122 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             manifest = load_scene_manifest(path)
             with patch("tools.run_native_multibody_manifest.load_gaussian_collision_body_from_ply", self.collision_body):
-                _, states, dynamics = build_native_runtime(
+                with self.assertRaisesRegex(ValueError, "Gaussian-union geometry for both bodies"):
+                    build_native_runtime(
+                        manifest, device=torch.device("cpu"), pipeline_mode="paper_compatible"
+                    )
+
+    def test_paper_mode_rejects_experimental_collision_proxy_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_manifest(Path(temporary))
+            payload = json.loads(path.read_text())
+            payload["bodies"][0]["collision"].update({
+                "primitive_selection": "geometry_feature_support",
+                "geometry_feature_weight": 0.25,
+            })
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = load_scene_manifest(path)
+            with self.assertRaisesRegex(ValueError, "experimental collision proxy options"):
+                build_native_runtime(
                     manifest, device=torch.device("cpu"), pipeline_mode="paper_compatible"
                 )
-                _, diagnostics = dynamics.step(states)
-            contact = diagnostics["plane_contacts"][0]
-            self.assertTrue(contact["fixed_penetration_enabled"])
-            self.assertTrue(dynamics.config.plane_fixed_penetration)
-            self.assertTrue(contact["paper_closed_form_contact"])
-            self.assertEqual(contact["contact_model"], "dual_cone")
-            self.assertEqual(contact["dual_cone_lambda"].shape[-1], 4)
-            self.assertTrue(bool(torch.isfinite(contact["implicit_contact_matrix"]).all()))
-            torch.testing.assert_close(
-                contact["patch_force"], contact["normal_force"] + contact["friction_force"]
+
+    def test_paper_mode_rejects_collision_subsampling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_manifest(Path(temporary))
+            payload = json.loads(path.read_text())
+            payload["bodies"][0]["collision"]["max_primitives"] = 256
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = load_scene_manifest(path)
+            with self.assertRaisesRegex(ValueError, "max_primitives"):
+                build_native_runtime(
+                    manifest, device=torch.device("cpu"), pipeline_mode="paper_compatible"
+                )
+
+    def test_paper_mode_loads_all_filtered_stage1_gaussians(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = load_scene_manifest(self.make_manifest(Path(temporary)))
+            with patch(
+                "tools.run_native_multibody_manifest.load_gaussian_collision_body_from_ply",
+                side_effect=self.collision_body,
+            ) as loader:
+                build_native_runtime(
+                    manifest, device=torch.device("cpu"), pipeline_mode="paper_compatible"
+                )
+            self.assertIsNone(loader.call_args.kwargs["max_primitives"])
+            self.assertEqual(loader.call_args.kwargs["radius_convention"], "paper_r2s")
+
+    def test_paper_fit_enables_joint_geometry_refinement_by_default(self):
+        class FakeRenderLoss:
+            def __init__(self, **kwargs):
+                self.base_assets = [RenderableGaussianAsset(
+                    xyz=torch.zeros(1, 3), features_dc=torch.zeros(1, 1, 3),
+                    features_rest=torch.zeros(1, 0, 3), opacity=torch.zeros(1, 1),
+                    scaling=torch.zeros(1, 3), rotation=torch.tensor([[1.0, 0, 0, 0]]),
+                    features_geo=torch.zeros(1, 0), foreground_logit=torch.zeros(1, 1),
+                    object_ids=torch.zeros(1, dtype=torch.int32), sh_degree=0,
+                    source_indices=torch.tensor([0]),
+                ) for _ in kwargs["stage1_plys"]]
+                self.targets = torch.zeros(len(kwargs["frame_indices"]), 3, 2, 2)
+                self.masks = None
+
+            def __call__(self, positions, quaternions, **kwargs):
+                loss = positions.square().mean() + quaternions.square().mean() * 0.0
+                for centers in kwargs.get("geometry_centers") or []:
+                    if centers is not None:
+                        loss = loss + centers.square().mean() * 0.0
+                return loss, {"gaussian_render_loss": float(loss.detach())}
+
+            def render_sequence(self, positions, quaternions, **kwargs):
+                return torch.zeros(positions.shape[0], 3, 2, 2)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = load_scene_manifest(self.make_manifest(Path(temporary)))
+            with patch(
+                "tools.run_native_multibody_manifest.load_gaussian_collision_body_from_ply",
+                self.collision_body,
+            ):
+                result = fit_native_image_only(
+                    manifest, fit_iters=0, lr=0.01, stride=1, max_frames=1,
+                    width=2, height=2, image_loss="l1", device=torch.device("cpu"),
+                    render_loss_factory=FakeRenderLoss, pipeline_mode="paper_compatible",
+                )
+            self.assertTrue(result["geometry_refinement"]["enabled"])
+            self.assertTrue(result["geometry_refinement"]["enabled_by_pipeline_mode"])
+            self.assertEqual(
+                result["geometry_refinement"]["gradient_route"], "collision_and_render"
             )
+            self.assertFalse(result["geometry_refinement"]["renderer_geometry_detached"])
+            self.assertEqual(
+                result["geometry_refinement"]["refined_collision_geometry"]["alpha"]["source_indices"],
+                [0],
+            )
+
+    def test_paper_fit_rejects_frozen_mass_inertia(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = load_scene_manifest(self.make_manifest(Path(temporary)))
+            with self.assertRaisesRegex(ValueError, "mass/inertia cannot be frozen"):
+                fit_native_image_only(
+                    manifest, fit_iters=0, lr=0.01, stride=1, max_frames=1,
+                    width=2, height=2, image_loss="l1", device=torch.device("cpu"),
+                    render_loss_factory=lambda **_: None, pipeline_mode="paper_compatible",
+                    learn_mass_inertia=False,
+                )
+
+    def test_experimental_mode_keeps_feature_collision_proxy_available(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_manifest(Path(temporary))
+            payload = json.loads(path.read_text())
+            payload["bodies"][0]["collision"]["primitive_selection"] = "support_surface"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = load_scene_manifest(path)
+            with patch(
+                "tools.run_native_multibody_manifest.load_gaussian_collision_body_from_ply",
+                self.collision_body,
+            ):
+                build_native_runtime(
+                    manifest, device=torch.device("cpu"), pipeline_mode="experimental"
+                )
 
     def test_plane_contact_backpropagates_to_mass_and_inertia(self):
         def off_center_body(*_, **__):
@@ -320,15 +438,23 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             def __init__(self, frame_indices, **kwargs):
                 self.targets = torch.zeros((len(frame_indices), 3, 1, 1))
                 self.masks = None
+                self.base_assets = [RenderableGaussianAsset(
+                    xyz=torch.zeros(1, 3), features_dc=torch.zeros(1, 1, 3),
+                    features_rest=torch.zeros(1, 0, 3), opacity=torch.zeros(1, 1),
+                    scaling=torch.zeros(1, 3), rotation=torch.tensor([[1.0, 0, 0, 0]]),
+                    features_geo=torch.zeros(1, 0), foreground_logit=torch.zeros(1, 1),
+                    object_ids=torch.zeros(1, dtype=torch.int32), sh_degree=0,
+                    source_indices=torch.tensor([0]),
+                ) for _ in kwargs["stage1_plys"]]
                 type(self).received = kwargs
 
-            def render_sequence(self, positions, quaternions):
+            def render_sequence(self, positions, quaternions, **kwargs):
                 return positions.square().mean(dim=(1, 2), keepdim=True).reshape(
                     -1, 1, 1, 1
                 ).expand(-1, 3, 1, 1)
 
-            def __call__(self, positions, quaternions, target_indices=None):
-                loss = self.render_sequence(positions, quaternions).mean()
+            def __call__(self, positions, quaternions, target_indices=None, **kwargs):
+                loss = self.render_sequence(positions, quaternions, **kwargs).mean()
                 return loss, {"gaussian_render_loss": float(loss.detach())}
 
         with tempfile.TemporaryDirectory() as temporary:
