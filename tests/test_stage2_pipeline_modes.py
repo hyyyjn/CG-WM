@@ -19,26 +19,26 @@ class Stage2PipelineModeTests(unittest.TestCase):
             validate_stage2_mode_options(
                 resolve_stage2_mode("paper_compatible"),
                 prefit_initial_state=True, temporal_window_frames=0,
-                geometry_gradient_route="collision_and_render",
+                geometry_gradient_route="collision_only",
             )
         with self.assertRaisesRegex(ValueError, "experimental mode"):
             validate_stage2_mode_options(
                 resolve_stage2_mode("paper_compatible"),
                 prefit_initial_state=False, temporal_window_frames=8,
-                geometry_gradient_route="collision_and_render",
+                geometry_gradient_route="collision_only",
             )
 
-    def test_paper_mode_requires_joint_collision_and_render_geometry_gradient(self):
+    def test_paper_mode_requires_collision_only_geometry_gradient(self):
         validate_stage2_mode_options(
             resolve_stage2_mode("paper_compatible"),
             prefit_initial_state=False, temporal_window_frames=0,
-            geometry_gradient_route="collision_and_render",
+            geometry_gradient_route="collision_only",
         )
-        with self.assertRaisesRegex(ValueError, "collision_and_render"):
+        with self.assertRaisesRegex(ValueError, "collision_only"):
             validate_stage2_mode_options(
                 resolve_stage2_mode("paper_compatible"),
                 prefit_initial_state=False, temporal_window_frames=0,
-                geometry_gradient_route="collision_only",
+                geometry_gradient_route="collision_and_render",
             )
 
     def test_experimental_mode_allows_ablation_options(self):

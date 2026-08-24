@@ -5,11 +5,19 @@ import torch
 from stage2.differentiable_complementarity_free_contact_dynamics import (
     contact_delassus_matrix,
     contact_jacobian_rows,
+    regularized_contact_solve,
     rigid_inverse_mass_matrix,
 )
 
 
 class ContactJacobianTests(unittest.TestCase):
+    def test_regularized_contact_solve_handles_singular_redundant_facets(self):
+        matrix = torch.ones((3, 3), requires_grad=True)
+        solution = regularized_contact_solve(matrix, torch.ones((3, 1)))
+        self.assertTrue(bool(torch.isfinite(solution).all()))
+        solution.sum().backward()
+        self.assertTrue(bool(torch.isfinite(matrix.grad).all()))
+
     def test_off_center_contact_contains_angular_jacobian(self):
         direction = torch.tensor([[0.0, 0.0, 1.0]])
         lever = torch.tensor([[1.0, 0.0, 0.0]])

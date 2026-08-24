@@ -1,0 +1,13 @@
+{
+  "template_manifest": "scene_manifest.contact_test_v3.json",
+  "episodes": [
+    {
+      "id": "test_000",
+      "episode_root": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/test/cola_can/episode_000"
+    },
+    {
+      "id": "test_001",
+      "episode_root": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/test/cola_can/episode_001"
+    }
+  ]
+}

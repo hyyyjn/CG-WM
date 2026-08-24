@@ -1073,10 +1073,10 @@ log-radius를 contact parameter 및 초기 상태와 함께 학습할 수 있다
 `source_indices`를 filtered render asset의 원본 PLY index와 대조하므로 객체/opacity filter를
 사용해도 동일 Gaussian에만 보정이 적용된다. Center는 `tanh` bounded offset, radius는 bounded
 log-scale로 parameterize한다. Paper-compatible mode의 gradient route는
-`collision_and_render`이며 보정된 center/radius가 renderer와 collision/dynamics에
-동일한 live tensor로 전달된다. 따라서 image loss는 photometric renderer 경로와
-contact BPTT 경로 두 곳에서 geometry를 갱신한다. `collision_only`는
-image-only/experimental ablation에만 남겨둔다.
+`collision_only`이며 보정된 center/radius는 collision/dynamics에는 live tensor로,
+renderer에는 detached tensor로 전달된다. 따라서 image loss는 geometry를 직접적인
+photometric shortcut으로 갱신하지 않고 contact BPTT 경로를 통해 갱신한다.
+`collision_and_render`는 experimental ablation에서만 사용할 수 있다.
 
 ```bash
 conda run -n gaussian_splatting python tools/run_native_multibody_manifest.py \
@@ -1362,7 +1362,122 @@ actual_*/
 - ContactGaussian-WM 논문의 전체 공식 pipeline 재현은 아닙니다.
 - Stage 1의 SAM feature supervision은 데이터셋에 precomputed feature map이 있어야 합니다.
 - Gaussian renderer loss는 CUDA 환경에서만 실제 backward 검증이 가능합니다.
-- real-world video 입력과 논문 표 수준의 benchmark 자동화는 아직 정리 중입니다.
+- real-world LEAP Hand 입력과 DreamerV3/PIN-WM baseline은 아직 포함하지 않습니다.
+
+## 15-frame paper protocol benchmark
+
+`tools/run_paper_protocol_benchmark.py`는 하나의 train scene manifest에서 앞 15개
+관측 프레임만 사용해 학습하고, 학습된 contact parameter를 여러 unseen holdout
+manifest의 전체 open-loop sequence에 고정 적용한다. 같은 조건에서 초기 parameter를
+그대로 쓰는 `no_opt`와 seeded log-space CEM baseline도 평가한다. Evaluation trajectory가
+있으면 translation/rotation error를, 없으면 full-frame RGB L1/PSNR을 사용한다.
+
+Protocol JSON 형식:
+
+```json
+{
+  "train_manifest": "configs/train_scene.json",
+  "holdout_manifests": [
+    "configs/holdout_pose_01.json",
+    "configs/holdout_pose_02.json"
+  ]
+}
+```
+
+```bash
+conda run -n gaussian_splatting python tools/run_paper_protocol_benchmark.py \
+  --protocol configs/paper_protocol.json \
+  --output output/paper_protocol/report.json \
+  --fit_iters 250 --train_frames 15 --cem_candidates 100 --device cuda
+```
+
+Native image-only optimizer는 기본적으로 초기 20% iteration 동안 pose/velocity만
+맞춘 뒤 physics/geometry를 여는 curriculum을 사용한다. Contact-parameter prior,
+trajectory 폭주 penalty, 전체 parameter gradient clipping과 best-state 복원도 적용된다.
+
+### Contact-identification stability bundle
+
+Experimental/image-only fitting은 positive physics 값을 log-space
+`K=exp(log_K)`, `D=exp(log_D)`, `mu=exp(log_mu)`에서 최적화한다. 세 parameter는
+`--stiffness_lr`, `--damping_lr`, `--friction_lr`로 서로 다른 learning rate를 사용할 수
+있다. 각 iteration은 `physics_gradient_norms`에 parameter별 gradient norm을 기록한다.
+
+초기 model rollout의 contact gate로 접촉 frame을 추정하고, warm-up 이후
+`--contact_curriculum_frames`개의 pre/contact/post-contact 관측을 집중 sampling한다.
+선택된 frame과 batch 안의 contact frame은 loss history에 저장된다. GT trajectory는
+접촉 frame 선택에 사용하지 않는다.
+
+Mask가 있는 experimental fitting에는 `--silhouette_weight`로 asymmetric silhouette
+loss를 추가할 수 있다. 기본 false-positive weight는 2, false-negative weight는 1이므로
+예측 객체가 GT mask 밖이나 화면 경계로 이탈하는 것을 더 강하게 벌점화한다. Smooth
+occupancy를 사용해 foreground가 강한 pixel에서도 gradient가 포화되지 않는다.
+Paper-compatible mode는 논문의 full-image L1+LoFTR contract를 보존하기 위해 이 항을
+자동으로 비활성화한다.
+
+Silhouette 기본 weight는 `0.005`다. 아래 runner는 동일한 15-frame/50-iteration
+조건에서 안정화 적용 전후, K/D/mu learning-rate 4조합, silhouette weight 5조합을
+각각 학습한 뒤 protocol의 unseen holdout 전체를 고정된 physics로 평가한다. 개별
+실험 결과와 group별 최저 holdout score는 output 디렉터리의 JSON으로 저장된다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_contact_stability_ablations.py \
+  --protocol configs/paper_benchmark_analytic_protocol.json \
+  --output output/contact_stability_ablations --device cuda
+```
+
+중단된 sweep은 같은 명령에 `--resume`을 붙여 이어갈 수 있고, 예를 들어 안정화 비교만
+실행하려면 `--groups stabilization`을 사용한다.
+
+### Loss별 gradient attribution
+
+`--gradient_attribution`을 켜면 weighted image L1/SSIM/LoFTR, silhouette,
+geometry·mass·inertia·contact L2, trajectory stability 항이 각각 initial state,
+geometry, mass/inertia, log K, log D, log mu에 만드는 gradient norm을 iteration별
+`loss_gradient_attribution`에 기록한다. 측정에는 `autograd.grad`를 사용하므로 optimizer의
+실제 `.grad`를 변경하지 않는다. 비용을 줄이려면 예를 들어
+`--gradient_attribution_interval 5`로 매 5 iteration만 측정할 수 있다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_contact_stability_ablations.py \
+  --protocol configs/paper_benchmark_analytic_protocol.json \
+  --output output/contact_gradient_attribution --device cuda \
+  --groups lr --gradient_attribution --gradient_attribution_interval 1
+```
+
+Ablation runner는 개별 iteration 기록을 loss/parameter group별 mean, max,
+nonzero-iteration 수로 집계해 `loss_gradient_attribution_summary`에 저장한다.
+선정된 LR/silhouette 설정 하나만 50 iteration 진단하려면 전용
+`--groups attribution --gradient_attribution` 조합을 사용한다.
+
+Warm-up이 끝나면 experimental/image-only optimizer는 기본적으로 initial position,
+orientation, linear/angular velocity를 freeze하고 physics·mass/inertia·geometry만 갱신한다.
+각 iteration의 `frozen_parameter_groups`에서 실제 동결 대상을 확인할 수 있다. 기존처럼
+initial state를 끝까지 공동 최적화하는 ablation은
+`--keep_initial_state_trainable_after_warmup`으로 실행한다.
+
+### Multi-episode open-loop 평가
+
+`tools/run_multi_episode_evaluation.py`는 학습 결과의 contact physics를 고정하고 episode별
+초기상태에서 전체 sequence를 open-loop 평가한다. Protocol은 `test_001`과 최소 하나의
+추가 episode를 반드시 포함해야 한다. Episode별 score/RGB/trajectory metric 외에 전체
+평균, population 표준편차, min/max, worst episode를 저장한다.
+
+```bash
+conda run -n gaussian_splatting python tools/run_multi_episode_evaluation.py \
+  --protocol configs/multi_episode_test_protocol.json \
+  --physics_report output/contact_gradient_attribution/report.json \
+  --experiment gradient_attribution_recommended \
+  --output output/multi_episode_evaluation --device cuda
+```
+
+Episode layout의 embedded initial state, RGB, mask, trajectory를 기존 scene-manifest
+template에 자동 연결하며, 생성된 평가 manifest도 결과 디렉터리에 보존한다.
+
+현재 analytic protocol의 최종 100/250-iteration 비교와 선택은
+`configs/final_contact_fit_selection.json`에 고정되어 있다. Multi-episode mean score는
+100회가 0.37460, 250회가 0.40008이므로 현재 선택은 100회다. Best-state 복원은 서로
+다른 objective 구간을 비교하지 않도록 warm-up을 제외한 joint-physics checkpoint에만
+적용한다.
 
 ## 브랜치 업로드 예시
 

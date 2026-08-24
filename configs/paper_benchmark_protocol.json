@@ -1,0 +1,4 @@
+{
+  "train_manifest": "scene_manifest.paper_benchmark_train.json",
+  "holdout_manifests": ["scene_manifest.paper_benchmark_holdout.json"]
+}

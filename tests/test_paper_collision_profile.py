@@ -115,6 +115,23 @@ class PaperCollisionProfileTests(unittest.TestCase):
         self.assertGreater(float(full_loss), 0.0)
         self.assertEqual(float(masked_loss), 0.0)
 
+    def test_asymmetric_silhouette_keeps_false_positive_gradient(self):
+        rendered = torch.zeros((1, 3, 4, 4), requires_grad=True)
+        with torch.no_grad():
+            rendered[:, :, 0, 0] = 1.0
+        config = GaussianRenderLossConfig(
+            image_width=4, image_height=4, loss="l1", silhouette_weight=1.0,
+            silhouette_false_positive_weight=3.0,
+            silhouette_false_negative_weight=1.0,
+        )
+        loss, diagnostics = gaussian_image_loss(
+            rendered, torch.zeros_like(rendered), config=config,
+            masks=torch.zeros((1, 1, 4, 4)), background=torch.zeros(3),
+        )
+        loss.backward()
+        self.assertGreater(diagnostics["silhouette_false_positive"], 0.0)
+        self.assertGreater(float(rendered.grad.abs().sum()), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

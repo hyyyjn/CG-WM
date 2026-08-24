@@ -27,5 +27,6 @@
     "stiffness": {"initial": 30.0}, "damping": {"initial": 5.0},
     "friction": {"initial": 0.5}
   }],
-  "training": {"supervision": "image_only"}
+  "training": {"supervision": "image_only"},
+  "evaluation": {"trajectory": "../output/can_floor_contact_test_dataset_v3/stage2/fall_and_rebound/train/cola_can/episode_000/state/trajectory.json"}
 }

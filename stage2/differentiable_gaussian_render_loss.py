@@ -59,6 +59,9 @@ class GaussianRenderLossConfig:
     loftr_max_matches: int = 1024
     loftr_min_matches: int = 8
     loftr_patch_radius: int = 2
+    silhouette_weight: float = 0.0
+    silhouette_false_positive_weight: float = 1.0
+    silhouette_false_negative_weight: float = 1.0
 
 
 def mujoco_cam0_c2w_fov(cam_distance: float, cam_height: float, fovy_deg: float, width: int, height: int):
@@ -174,7 +177,26 @@ def gaussian_image_loss(
     masks: torch.Tensor | None = None,
     background: torch.Tensor | None = None,
     loftr_loss=None,
+    include_loss_terms: bool = False,
 ) -> tuple[torch.Tensor, dict]:
+    original_rendered = rendered
+    silhouette_loss = rendered.sum() * 0.0
+    silhouette_fp = rendered.sum() * 0.0
+    silhouette_fn = rendered.sum() * 0.0
+    if masks is not None and float(config.silhouette_weight) > 0.0:
+        if background is None:
+            raise ValueError("silhouette loss requires a background color")
+        bg = background.reshape(1, 3, 1, 1)
+        foreground_distance = torch.mean(
+            torch.abs(original_rendered - bg), dim=1, keepdim=True
+        )
+        predicted_occupancy = 1.0 - torch.exp(-4.0 * foreground_distance)
+        silhouette_fp = torch.mean(predicted_occupancy * (1.0 - masks))
+        silhouette_fn = torch.mean((1.0 - predicted_occupancy) * masks)
+        silhouette_loss = (
+            float(config.silhouette_false_positive_weight) * silhouette_fp
+            + float(config.silhouette_false_negative_weight) * silhouette_fn
+        )
     if masks is not None:
         if background is None:
             raise ValueError("masked image loss requires a background color")
@@ -183,26 +205,37 @@ def gaussian_image_loss(
         targets = targets * masks + bg * (1.0 - masks)
     l1_loss = F.l1_loss(rendered, targets)
     ssim_loss = 1.0 - ssim(rendered, targets)
+    zero = rendered.sum() * 0.0
+    loss_terms = {"image_l1": zero, "image_ssim": zero, "image_loftr": zero, "image_mse": zero}
     if config.loss == "mse":
-        loss = F.mse_loss(rendered, targets)
+        loss_terms["image_mse"] = F.mse_loss(rendered, targets)
     elif config.loss == "l1":
-        loss = l1_loss
+        loss_terms["image_l1"] = l1_loss
     elif config.loss == "l1_ssim":
         weight = min(max(float(config.ssim_weight), 0.0), 1.0)
-        loss = (1.0 - weight) * l1_loss + weight * ssim_loss
+        loss_terms["image_l1"] = (1.0 - weight) * l1_loss
+        loss_terms["image_ssim"] = weight * ssim_loss
     elif config.loss == "l1_loftr":
         if loftr_loss is None:
             raise ValueError("l1_loftr requires an initialized LoFTR loss module.")
         feature_loss, feature_diagnostics = loftr_loss(rendered, targets, masks=masks)
-        loss = l1_loss + float(config.loftr_weight) * feature_loss
+        loss_terms["image_l1"] = l1_loss
+        loss_terms["image_loftr"] = float(config.loftr_weight) * feature_loss
     else:
         raise ValueError(f"Unsupported Gaussian render loss: {config.loss!r}")
+    loss_terms["silhouette"] = float(config.silhouette_weight) * silhouette_loss
+    loss = sum(loss_terms.values())
     diagnostics = {
         "gaussian_render_loss": float(loss.detach().cpu().item()),
         "gaussian_render_l1": float(l1_loss.detach().cpu().item()),
         "gaussian_render_ssim": float((1.0 - ssim_loss).detach().cpu().item()),
         "gaussian_render_masked": masks is not None,
+        "silhouette_loss": float(silhouette_loss.detach().cpu()),
+        "silhouette_false_positive": float(silhouette_fp.detach().cpu()),
+        "silhouette_false_negative": float(silhouette_fn.detach().cpu()),
     }
+    if include_loss_terms:
+        diagnostics["_loss_terms"] = loss_terms
     if config.loss == "l1_loftr":
         diagnostics.update(feature_diagnostics)
         diagnostics["loftr_weight"] = float(config.loftr_weight)
@@ -361,7 +394,9 @@ class Stage2GaussianRenderLoss:
             masks=masks,
             background=self.background,
             loftr_loss=self.loftr_loss,
+            include_loss_terms=True,
         )
+        self.last_loss_terms = image_diagnostics.pop("_loss_terms")
         diagnostics = {
             **image_diagnostics,
             "gaussian_render_frames": int(rendered.shape[0]),

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "scene_id": "paper_benchmark_train_episode_000",
+  "bodies": [{
+    "id": "dynamic_0", "role": "dynamic",
+    "render": {"gaussian_ply": "../output/stage1_sggs_can_test_owned_complete/point_cloud/iteration_600/point_cloud.ply", "object_id": 1},
+    "collision": {"type": "gaussian_union", "radius_convention": "paper_r2s"},
+    "initialization": {"state_json": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/state/trajectory.json", "state_frame": 0, "canonical_offset": [0.0, 0.0, 0.1]},
+    "physics": {"mass": {"initial": 0.35}, "generalized_damping": {"initial": 0.05}}
+  }],
+  "environment": [{
+    "id": "static_0", "role": "static",
+    "render": {"gaussian_ply": "../output/floor_stage1_model/render_floor_grid_wide/point_cloud.ply"},
+    "collision": {"type": "gaussian_union", "radius_convention": "paper_r2s"},
+    "initialization": {"state_json": "static_state.example.json"}
+  }],
+  "observations": {
+    "rgb_dir": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/rgb",
+    "instance_mask_dir": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/masks",
+    "camera_manifest": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/episode_manifest.json", "fps": 30
+  },
+  "actions": {"type": "zero_wrench"},
+  "simulation": {"physics_timestep": 0.002, "steps_per_frame": 17},
+  "contact_pairs": [{"body_a": "dynamic_0", "body_b": "static_0", "model": "dual_cone", "impedance_prior": {"time_constant": 0.02, "damping_ratio": 1.0}, "friction": {"initial": 0.6}}],
+  "training": {"supervision": "paper_full_image", "camera": {"background_rgb": [0.807843, 0.862745, 0.929412]}, "paper_collision": {"smooth_min_temperature": 0.01, "inside_penalty": 0.02, "inside_sharpness": 50.0, "primitive_locality_margin": 0.05}},
+  "evaluation": {"trajectory": "../output/can_floor_dataset/contactwm/stage2/fall_and_rebound/train/cola_can/episode_000/state/trajectory.json"}
+}

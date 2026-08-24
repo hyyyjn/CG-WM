@@ -1,0 +1,34 @@
+{
+  "selected_iterations": 100,
+  "selection_metric": "multi_episode_mean_score",
+  "selection_rule": "minimize translation_error_mean_m + 0.1 * rotation_error_mean_rad",
+  "training": {
+    "train_frames": 15,
+    "train_stride": 5,
+    "image_loss": "l1_ssim",
+    "stiffness_lr": 0.002,
+    "damping_lr": 0.002,
+    "friction_lr": 0.002,
+    "silhouette_weight": 0.005,
+    "physics_warmup_fraction": 0.2,
+    "freeze_initial_state_after_warmup": true,
+    "contact_parameter_l2": 0.0001,
+    "trajectory_stability_weight": 0.0001,
+    "contact_curriculum_frames": 8,
+    "best_state_scope": "joint_physics_only"
+  },
+  "selected_artifact": "../output/final_contact_fit_100_corrected.json",
+  "selected_evaluation": "../output/multi_episode_evaluation_100/report.json",
+  "candidates": {
+    "100": {
+      "multi_episode_mean_score": 0.37459866553544996,
+      "translation_error_mean_m": 0.17667213827371597,
+      "rotation_error_mean_rad": 1.97926527261734
+    },
+    "250": {
+      "multi_episode_mean_score": 0.4000815033912659,
+      "translation_error_mean_m": 0.1726081371307373,
+      "rotation_error_mean_rad": 2.2747336626052856
+    }
+  }
+}

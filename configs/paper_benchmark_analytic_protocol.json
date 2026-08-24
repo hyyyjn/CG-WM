@@ -1,0 +1,4 @@
+{
+  "train_manifest": "scene_manifest.contact_test_v3.json",
+  "holdout_manifests": ["scene_manifest.realistic_contact_test.json"]
+}

@@ -13,12 +13,26 @@ from stage2.renderable_gaussian_asset import RenderableGaussianAsset
 from stage2.scene_manifest import load_scene_manifest
 from tools.run_native_multibody_manifest import (
     build_native_runtime, fit_native_image_only, prefit_native_initial_states,
-    refined_geometry_overrides, rollout_manifest, _temporal_window, _load_action_wrenches,
-    _step_observation_frame,
+    refined_geometry_overrides, rollout_manifest, _temporal_window,
+    _contact_curriculum_selection, _load_action_wrenches,
+    _step_observation_frame, loss_gradient_attribution,
 )
 
 
 class NativeMultiBodyManifestTests(unittest.TestCase):
+    def test_loss_gradient_attribution_separates_terms_and_groups(self):
+        x = torch.tensor(2.0, requires_grad=True)
+        y = torch.tensor(3.0, requires_grad=True)
+        attribution = loss_gradient_attribution(
+            {"image": x * y, "regularizer": x.square()},
+            {"x": [x], "y": [y], "empty": []},
+        )
+        self.assertAlmostEqual(attribution["image"]["x"], 3.0)
+        self.assertAlmostEqual(attribution["image"]["y"], 2.0)
+        self.assertAlmostEqual(attribution["regularizer"]["x"], 4.0)
+        self.assertEqual(attribution["regularizer"]["y"], 0.0)
+        self.assertEqual(attribution["image"]["empty"], 0.0)
+
     def make_manifest(self, root: Path) -> Path:
         (root / "rgb").mkdir()
         (root / "rgb" / "000000.png").write_bytes(b"x")
@@ -319,9 +333,9 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             self.assertTrue(result["geometry_refinement"]["enabled"])
             self.assertTrue(result["geometry_refinement"]["enabled_by_pipeline_mode"])
             self.assertEqual(
-                result["geometry_refinement"]["gradient_route"], "collision_and_render"
+                result["geometry_refinement"]["gradient_route"], "collision_only"
             )
-            self.assertFalse(result["geometry_refinement"]["renderer_geometry_detached"])
+            self.assertTrue(result["geometry_refinement"]["renderer_geometry_detached"])
             self.assertEqual(
                 result["geometry_refinement"]["refined_collision_geometry"]["alpha"]["source_indices"],
                 [0],
@@ -404,10 +418,22 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
                     manifest, fit_iters=2, lr=0.01, stride=1, max_frames=1,
                     width=16, height=16, image_loss="l1", device=torch.device("cpu"),
                     render_loss_factory=FakeRenderLoss,
+                    physics_warmup_fraction=0.5,
                 )
             self.assertEqual(result["supervision"], "image_only")
             self.assertFalse(result["ground_truth_trajectory_used_for_training"])
             self.assertEqual(len(result["loss_history"]), 2)
+            self.assertEqual(result["loss_history"][0]["curriculum_phase"], "state_warmup")
+            self.assertEqual(result["loss_history"][0]["frozen_parameter_groups"], ["physics"])
+            self.assertEqual(result["loss_history"][1]["curriculum_phase"], "joint_physics")
+            self.assertEqual(result["loss_history"][1]["frozen_parameter_groups"], ["initial_state"])
+            self.assertTrue(
+                result["optimization_stability"]["freeze_initial_state_after_warmup"]
+            )
+            self.assertEqual(
+                result["optimization_stability"]["best_state_scope"],
+                "joint_physics_only",
+            )
             self.assertEqual(result["learned_contact_pairs"][0]["body_a"], "alpha")
             physics = result["learned_body_physics"]
             self.assertTrue(physics["alpha"]["learned"])
@@ -430,6 +456,15 @@ class NativeMultiBodyManifestTests(unittest.TestCase):
             _temporal_window(frames, iteration=0, window_frames=0, window_step=1)[0],
             frames,
         )
+
+    def test_contact_curriculum_keeps_frames_around_predicted_contact(self):
+        frames = list(range(0, 75, 5))
+        selected, indices = _contact_curriculum_selection(
+            frames, [35], budget=5, iteration=0
+        )
+        self.assertEqual(len(selected), 5)
+        self.assertIn(35, selected)
+        self.assertEqual(selected, [frames[index] for index in indices])
 
     def test_paper_mode_keeps_manifest_initial_state_fixed(self):
         class FakeRenderLoss:

@@ -477,6 +477,17 @@ def _inertia_angular_delta(
     return torch.linalg.solve(matrix + regularizer, torque.unsqueeze(-1)).squeeze(-1)
 
 
+def regularized_contact_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve a redundant contact system with a differentiable numerical fallback."""
+    scale = torch.clamp(torch.mean(torch.abs(torch.diagonal(matrix))), min=1.0)
+    identity = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
+    regularized = matrix + (1e-6 * scale) * identity
+    solution, info = torch.linalg.solve_ex(regularized, rhs)
+    if int(info.detach().cpu().max()) == 0 and bool(torch.isfinite(solution).all().detach()):
+        return solution
+    return torch.matmul(torch.linalg.pinv(regularized), rhs)
+
+
 def _tangent_basis(normals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     abs_normals = torch.abs(normals)
     use_x = abs_normals[..., 0] < 0.9
@@ -1282,7 +1293,7 @@ class MultiBodyGaussianImpedanceDynamics:
                     rhs.numel(), dtype=dtype, device=device
                 ) + cfg.dt * (cfg.dt * K + D) * delassus
                 lambda_raw = F.softplus(
-                    torch.linalg.solve(implicit_matrix, rhs.unsqueeze(-1)).squeeze(-1)
+                    regularized_contact_solve(implicit_matrix, rhs.unsqueeze(-1)).squeeze(-1)
                 ).reshape_as(dual_velocity)
                 facet_lambdas = weights.unsqueeze(-1) * lambda_raw
                 patch_forces = torch.sum(
@@ -1424,7 +1435,7 @@ class MultiBodyGaussianImpedanceDynamics:
                     rhs.numel(), dtype=dtype, device=device
                 ) + cfg.dt * (cfg.dt * K + D) * plane_delassus
                 lambda_raw = F.softplus(
-                    torch.linalg.solve(implicit_matrix, rhs.unsqueeze(-1)).squeeze(-1)
+                    regularized_contact_solve(implicit_matrix, rhs.unsqueeze(-1)).squeeze(-1)
                 ).reshape_as(dual_velocity)
                 facet_lambdas = patch_weights.unsqueeze(-1) * contact_gate.unsqueeze(-1) * lambda_raw
                 patch_forces = torch.sum(

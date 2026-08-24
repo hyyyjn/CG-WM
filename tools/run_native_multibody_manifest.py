@@ -38,6 +38,7 @@ from stage2.initial_state_estimation import constant_velocity_poses
 from stage2.pipeline_modes import (
     Stage2PipelineMode, resolve_stage2_mode, validate_stage2_mode_options,
 )
+from stage2.video_observations import load_optional_evaluation_trajectory
 
 
 def _positive_raw(value: float) -> torch.Tensor:
@@ -502,6 +503,8 @@ def _render_config_from_manifest(
     loftr_weight: float = 0.1, loftr_pretrained: str = "outdoor",
     loftr_confidence_threshold: float = 0.2, loftr_max_matches: int = 1024,
     loftr_min_matches: int = 8, loftr_patch_radius: int = 2,
+    silhouette_weight: float = 0.0, silhouette_fp_weight: float = 1.0,
+    silhouette_fn_weight: float = 1.0,
 ):
     camera = {}
     if manifest.observations.camera_manifest is not None:
@@ -530,6 +533,9 @@ def _render_config_from_manifest(
         loftr_max_matches=int(loftr_max_matches),
         loftr_min_matches=int(loftr_min_matches),
         loftr_patch_radius=int(loftr_patch_radius),
+        silhouette_weight=float(silhouette_weight),
+        silhouette_false_positive_weight=float(silhouette_fp_weight),
+        silhouette_false_negative_weight=float(silhouette_fn_weight),
     )
 
 
@@ -567,6 +573,41 @@ def _temporal_window(
     start = starts[int(iteration) % len(starts)]
     local_indices = list(range(start, start + width))
     return [frame_indices[index] for index in local_indices], local_indices
+
+
+def _estimate_contact_frames(initial_states, dynamics, frame_indices, action_wrenches) -> list[int]:
+    """Estimate contact frames from the current model without reading pose labels."""
+    states = tuple(initial_states)
+    selected, maximum = set(frame_indices), max(frame_indices)
+    contacts = []
+    with torch.no_grad():
+        for frame in range(maximum):
+            wrench = None if action_wrenches is None else action_wrenches[frame]
+            states, diagnostics = _step_observation_frame(
+                states, dynamics, external_wrenches=wrench
+            )
+            plane_contacts = diagnostics.get("plane_contacts") or []
+            if plane_contacts:
+                is_contact = any(
+                    bool((entry["contact_gate"] > 0.5).any().detach())
+                    for entry in plane_contacts
+                )
+            else:
+                is_contact = bool(diagnostics.get("active_edges"))
+            if frame + 1 in selected and is_contact:
+                contacts.append(frame + 1)
+    return contacts
+
+
+def _contact_curriculum_selection(
+    frame_indices: list[int], contact_frames: list[int], *, budget: int, iteration: int,
+) -> tuple[list[int], list[int]]:
+    if budget <= 0 or budget >= len(frame_indices) or not contact_frames:
+        return list(frame_indices), list(range(len(frame_indices)))
+    anchor = contact_frames[iteration % len(contact_frames)]
+    ranked = sorted(range(len(frame_indices)), key=lambda idx: (abs(frame_indices[idx] - anchor), idx))
+    chosen = sorted(ranked[:max(3, int(budget))])
+    return [frame_indices[idx] for idx in chosen], chosen
 
 
 def prefit_native_initial_states(
@@ -737,6 +778,47 @@ def refined_geometry_overrides(
     return tuple(refined_collision), render_centers, render_radii, stats
 
 
+def loss_gradient_attribution(
+    loss_terms: dict[str, torch.Tensor],
+    parameter_groups: dict[str, list[torch.Tensor]],
+) -> dict[str, dict[str, float]]:
+    """Return per-loss gradient norms without modifying ``parameter.grad``."""
+    unique_parameters = []
+    parameter_indices = {}
+    group_indices = {}
+    for group_name, parameters in parameter_groups.items():
+        indices = []
+        for parameter in parameters:
+            if not parameter.requires_grad:
+                continue
+            identity = id(parameter)
+            if identity not in parameter_indices:
+                parameter_indices[identity] = len(unique_parameters)
+                unique_parameters.append(parameter)
+            indices.append(parameter_indices[identity])
+        group_indices[group_name] = indices
+    attribution = {}
+    for loss_name, term in loss_terms.items():
+        if unique_parameters and term.requires_grad:
+            gradients = torch.autograd.grad(
+                term, unique_parameters, retain_graph=True, allow_unused=True,
+            )
+        else:
+            gradients = (None,) * len(unique_parameters)
+        group_norms = {}
+        for group_name, indices in group_indices.items():
+            squared_norm = sum(
+                torch.sum(gradients[index].detach() ** 2)
+                for index in indices if gradients[index] is not None
+            )
+            group_norms[group_name] = (
+                0.0 if isinstance(squared_norm, int)
+                else float(torch.sqrt(squared_norm).cpu())
+            )
+        attribution[loss_name] = group_norms
+    return attribution
+
+
 def fit_native_image_only(
     manifest, *, fit_iters: int, lr: float, stride: int, max_frames: int,
     width: int, height: int, image_loss: str, device: torch.device,
@@ -755,8 +837,29 @@ def fit_native_image_only(
     learn_mass_inertia: bool = True, mass_inertia_lr: float | None = None,
     mass_l2: float = 1e-4, inertia_l2: float = 1e-4,
     temporal_window_frames: int = 0, temporal_window_step: int = 1,
+    physics_warmup_fraction: float = 0.2,
+    freeze_initial_state_after_warmup: bool = True,
+    contact_parameter_l2: float = 1e-4,
+    trajectory_stability_weight: float = 1e-4,
+    max_dynamic_displacement: float = 3.0,
+    stiffness_lr: float | None = None, damping_lr: float | None = None,
+    friction_lr: float | None = None, contact_curriculum_frames: int = 8,
+    silhouette_weight: float = 0.005, silhouette_fp_weight: float = 2.0,
+    silhouette_fn_weight: float = 1.0,
+    gradient_attribution: bool = False, gradient_attribution_interval: int = 1,
+    physics_override: dict | None = None,
+    learn_contact_parameters: bool = True,
+    evaluation_only: bool = False,
     pipeline_mode: str | None = None,
 ) -> dict:
+    if not 0.0 <= float(physics_warmup_fraction) <= 1.0:
+        raise ValueError("physics_warmup_fraction must be in [0, 1]")
+    if min(float(contact_parameter_l2), float(trajectory_stability_weight)) < 0.0:
+        raise ValueError("stability regularization weights must be non-negative")
+    if float(max_dynamic_displacement) <= 0.0:
+        raise ValueError("max_dynamic_displacement must be positive")
+    if int(gradient_attribution_interval) < 1:
+        raise ValueError("gradient_attribution_interval must be at least 1")
     if pipeline_mode is None:
         pipeline_mode = (
             "experimental"
@@ -766,7 +869,7 @@ def fit_native_image_only(
     mode_contract = resolve_stage2_mode(pipeline_mode)
     requested_geometry_gradient_route = str(geometry_gradient_route)
     effective_geometry_gradient_route = (
-        "collision_and_render"
+        "collision_only"
         if mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
         else requested_geometry_gradient_route
     )
@@ -776,7 +879,7 @@ def fit_native_image_only(
         geometry_gradient_route=effective_geometry_gradient_route,
     )
     paper_supervision = mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
-    if paper_supervision and not learn_mass_inertia:
+    if paper_supervision and not learn_mass_inertia and not evaluation_only:
         raise ValueError(
             "paper_compatible jointly optimizes M, mu, K, D and Gaussian geometry; "
             "mass/inertia cannot be frozen"
@@ -786,6 +889,23 @@ def fit_native_image_only(
     bodies, base_states, dynamics = build_native_runtime(
         manifest, device=device, pipeline_mode=mode_contract.mode.value
     )
+    if physics_override:
+        def inverse_softplus(value: float) -> torch.Tensor:
+            if value <= 0.0:
+                raise ValueError("fixed physics values must be positive")
+            tensor = torch.tensor(value, dtype=torch.float32, device=device)
+            return tensor if value > 20.0 else torch.log(torch.expm1(tensor))
+        pairs = physics_override.get("contact_pairs", [])
+        by_edge = {(item["body_a"], item["body_b"]): item for item in pairs}
+        for index, pair in enumerate(manifest.contact_pairs):
+            item = by_edge.get((pair.body_a, pair.body_b)) or by_edge.get((pair.body_b, pair.body_a))
+            if item:
+                for key, target in (
+                    ("stiffness", dynamics.stiffness), ("damping", dynamics.damping),
+                    ("friction", dynamics.friction_coefficient),
+                ):
+                    if key in item:
+                        target[index] = inverse_softplus(float(item[key]))
     missing_render = [body.id for body in bodies if body.render is None]
     if missing_render:
         raise ValueError(f"image-only fitting requires render.gaussian_ply for every body: {missing_render}")
@@ -808,6 +928,9 @@ def fit_native_image_only(
             loftr_confidence_threshold=loftr_confidence_threshold,
             loftr_max_matches=loftr_max_matches, loftr_min_matches=loftr_min_matches,
             loftr_patch_radius=loftr_patch_radius,
+            silhouette_weight=0.0 if paper_supervision else silhouette_weight,
+            silhouette_fp_weight=silhouette_fp_weight,
+            silhouette_fn_weight=silhouette_fn_weight,
         ),
         render_filters=[{
             "opacity_threshold": body.render.opacity_threshold,
@@ -838,10 +961,28 @@ def fit_native_image_only(
             state_parameters.append(values)
         else:
             state_parameters.append(None)
-    dynamics.stiffness = torch.nn.Parameter(dynamics.stiffness.detach().clone())
-    dynamics.damping = torch.nn.Parameter(dynamics.damping.detach().clone())
-    dynamics.friction_coefficient = torch.nn.Parameter(dynamics.friction_coefficient.detach().clone())
-    trainable.extend((dynamics.stiffness, dynamics.damping, dynamics.friction_coefficient))
+    initial_contact_values = tuple(
+        F.softplus(value.detach()).clone() for value in (
+            dynamics.stiffness, dynamics.damping, dynamics.friction_coefficient
+        )
+    )
+    log_stiffness, log_damping, log_friction = [
+        torch.nn.Parameter(torch.log(torch.clamp(value, min=1e-8)))
+        for value in initial_contact_values
+    ]
+    contact_log_parameters = [log_stiffness, log_damping, log_friction]
+
+    def sync_contact_parameters() -> None:
+        values = [torch.exp(parameter) for parameter in contact_log_parameters]
+        dynamics.stiffness, dynamics.damping, dynamics.friction_coefficient = [
+            torch.where(
+                value > 20.0, value,
+                torch.log(torch.expm1(torch.clamp(value, max=20.0))),
+            )
+            for value in values
+        ]
+
+    sync_contact_parameters()
     initial_mass_raw = dynamics.mass_parameters.detach().clone()
     initial_inertia_raw = dynamics.inertia_parameters.detach().clone()
     dynamics.mass_parameters = torch.nn.Parameter(initial_mass_raw.clone())
@@ -861,16 +1002,39 @@ def fit_native_image_only(
         else:
             center_deltas.append(None)
             log_radius_deltas.append(None)
-    optimizer = torch.optim.Adam([
+    parameter_groups = [group for group in (
         {"params": trainable, "lr": float(lr)},
         {"params": geometry_parameters, "lr": float(geometry_lr)},
         {"params": material_parameters, "lr": float(lr if mass_inertia_lr is None else mass_inertia_lr)},
-    ])
+    ) if group["params"]]
+    if learn_contact_parameters:
+        parameter_groups.extend((
+            {"params": [log_stiffness], "lr": float(lr if stiffness_lr is None else stiffness_lr)},
+            {"params": [log_damping], "lr": float(lr if damping_lr is None else damping_lr)},
+            {"params": [log_friction], "lr": float(lr if friction_lr is None else friction_lr)},
+        ))
+    optimizer = torch.optim.Adam(parameter_groups) if parameter_groups else None
+    all_parameters = [
+        parameter for group in ([] if optimizer is None else optimizer.param_groups)
+        for parameter in group["params"]
+    ]
+    initial_contact_logs = tuple(value.detach().clone() for value in contact_log_parameters)
+    warmup_iterations = min(
+        int(fit_iters), max(0, int(round(float(fit_iters) * float(physics_warmup_fraction))))
+    )
     history = []
+    best_loss = float("inf")
+    best_parameters = None
     base_collision_bodies = tuple(dynamics.bodies)
     geometry_stats = {}
+    estimated_contact_frames = _estimate_contact_frames(
+        base_states, dynamics, frame_indices, action_wrenches
+    )
     for iteration in range(int(fit_iters)):
+        if optimizer is None:
+            raise ValueError("fit_iters > 0 requires at least one learnable parameter")
         optimizer.zero_grad(set_to_none=True)
+        sync_contact_parameters()
         initial_states = []
         for base, params in zip(base_states, state_parameters):
             if params is None:
@@ -894,6 +1058,11 @@ def fit_native_image_only(
             frame_indices, iteration=iteration, window_frames=temporal_window_frames,
             window_step=temporal_window_step,
         )
+        if iteration >= warmup_iterations and temporal_window_frames <= 0:
+            training_frames, target_indices = _contact_curriculum_selection(
+                frame_indices, estimated_contact_frames,
+                budget=int(contact_curriculum_frames), iteration=iteration - warmup_iterations,
+            )
         positions, quaternions, _ = _rollout_selected(
             initial_states, dynamics, training_frames, action_wrenches
         )
@@ -908,29 +1077,113 @@ def fit_native_image_only(
             loss, diagnostics = render_loss(
                 positions, quaternions, target_indices=target_indices
             )
+        loss_terms = dict(getattr(render_loss, "last_loss_terms", {"image": loss}))
         if geometry_parameters:
             center_regularizer = torch.stack([torch.mean(value ** 2) for value in center_deltas if value is not None]).mean()
             radius_regularizer = torch.stack([torch.mean(value ** 2) for value in log_radius_deltas if value is not None]).mean()
-            loss = loss + float(geometry_center_l2) * center_regularizer + float(geometry_radius_l2) * radius_regularizer
+            loss_terms["geometry_center_l2"] = float(geometry_center_l2) * center_regularizer
+            loss_terms["geometry_radius_l2"] = float(geometry_radius_l2) * radius_regularizer
+            loss = loss + loss_terms["geometry_center_l2"] + loss_terms["geometry_radius_l2"]
         if material_parameters:
             dynamic_mask = torch.tensor(
                 [body.role == "dynamic" for body in bodies], device=device, dtype=torch.bool
             )
-            loss = loss + float(mass_l2) * torch.mean(
+            loss_terms["mass_l2"] = float(mass_l2) * torch.mean(
                 (dynamics.mass_parameters[dynamic_mask] - initial_mass_raw[dynamic_mask]) ** 2
             )
-            loss = loss + float(inertia_l2) * torch.mean(
+            loss_terms["inertia_l2"] = float(inertia_l2) * torch.mean(
                 (dynamics.inertia_parameters[dynamic_mask] - initial_inertia_raw[dynamic_mask]) ** 2
             )
+            loss = loss + loss_terms["mass_l2"] + loss_terms["inertia_l2"]
+        contact_regularizer = sum(
+            torch.mean((current - initial) ** 2)
+            for current, initial in zip(
+                contact_log_parameters, initial_contact_logs,
+            )
+        )
+        loss_terms["contact_parameter_l2"] = float(contact_parameter_l2) * contact_regularizer
+        loss = loss + loss_terms["contact_parameter_l2"]
+        dynamic_indices = [index for index, body in enumerate(bodies) if body.role == "dynamic"]
+        stability_regularizer = torch.zeros((), dtype=loss.dtype, device=loss.device)
+        if dynamic_indices and positions.shape[0] > 1:
+            dynamic_positions = positions[:, dynamic_indices]
+            origin = torch.stack([initial_states[index].position for index in dynamic_indices])
+            displacement = torch.linalg.norm(dynamic_positions - origin.unsqueeze(0), dim=-1)
+            excess = F.softplus(displacement - float(max_dynamic_displacement))
+            frame_steps = torch.tensor(
+                [max(1, training_frames[index + 1] - training_frames[index])
+                 for index in range(len(training_frames) - 1)],
+                dtype=loss.dtype, device=loss.device,
+            ).reshape(-1, 1, 1)
+            velocity = (dynamic_positions[1:] - dynamic_positions[:-1]) / frame_steps
+            stability_regularizer = torch.mean(excess ** 2) + 0.01 * torch.mean(velocity ** 2)
+            loss_terms["trajectory_stability"] = float(trajectory_stability_weight) * stability_regularizer
+            loss = loss + loss_terms["trajectory_stability"]
+        if not bool(torch.isfinite(loss).detach()):
+            raise FloatingPointError(f"non-finite Stage2 loss at iteration {iteration}")
+        attribution = None
+        if gradient_attribution and iteration % int(gradient_attribution_interval) == 0:
+            attribution = loss_gradient_attribution(loss_terms, {
+                "initial_state": trainable,
+                "geometry": geometry_parameters,
+                "mass_inertia": material_parameters,
+                "log_stiffness": [log_stiffness],
+                "log_damping": [log_damping],
+                "log_friction": [log_friction],
+            })
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=10.0)
+        curriculum_phase = "state_warmup" if iteration < warmup_iterations else "joint_physics"
+        frozen_parameter_groups = []
+        if iteration < warmup_iterations:
+            physics_parameters = [
+                *contact_log_parameters,
+                *material_parameters, *geometry_parameters,
+            ]
+            for parameter in physics_parameters:
+                parameter.grad = None
+            frozen_parameter_groups.append("physics")
+        elif freeze_initial_state_after_warmup:
+            for parameter in trainable:
+                parameter.grad = None
+            frozen_parameter_groups.append("initial_state")
+        gradient_norm = torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=10.0)
+        physics_gradient_norms = {
+            name: 0.0 if parameter.grad is None else float(parameter.grad.detach().norm().cpu())
+            for name, parameter in zip(
+                ("log_stiffness", "log_damping", "log_friction"), contact_log_parameters
+            )
+        }
+        current_loss = float(loss.detach().cpu())
+        # Warm-up and joint-physics losses are not comparable: they optimize
+        # different parameter groups and may use different frame curricula.
+        # Never restore a warm-up checkpoint over learned contact physics.
+        if iteration >= warmup_iterations and current_loss < best_loss:
+            best_loss = current_loss
+            best_parameters = [parameter.detach().clone() for parameter in all_parameters]
         optimizer.step()
         history.append({
-            "iteration": iteration, "loss": float(loss.detach().cpu()),
+            "iteration": iteration, "loss": current_loss,
+            "curriculum_phase": curriculum_phase,
+            "frozen_parameter_groups": frozen_parameter_groups,
+            "gradient_norm": float(gradient_norm.detach().cpu()),
+            "physics_gradient_norms": physics_gradient_norms,
+            "loss_gradient_attribution": attribution,
+            "contact_regularizer": float(contact_regularizer.detach().cpu()),
+            "trajectory_stability_regularizer": float(stability_regularizer.detach().cpu()),
             "training_frame_indices": training_frames,
             "training_target_indices": target_indices,
+            "estimated_contact_frames": estimated_contact_frames,
+            "contact_frames_in_batch": [
+                frame for frame in training_frames if frame in set(estimated_contact_frames)
+            ],
             **diagnostics,
         })
+
+    if best_parameters is not None:
+        with torch.no_grad():
+            for parameter, best_value in zip(all_parameters, best_parameters):
+                parameter.copy_(best_value)
+        sync_contact_parameters()
 
     fitted_states = []
     for base, params in zip(base_states, state_parameters):
@@ -982,6 +1235,39 @@ def fit_native_image_only(
             foreground_l1 = (torch.abs(rendered - targets) * masks).sum() / foreground_denominator
             foreground_mse = (((rendered - targets) ** 2) * masks).sum() / foreground_denominator
             foreground_psnr = -10.0 * torch.log10(torch.clamp(foreground_mse, min=1e-12))
+    trajectory_evaluation = None
+    evaluation_trajectory = load_optional_evaluation_trajectory(manifest.evaluation_trajectory)
+    if evaluation_trajectory is not None:
+        frame_to_target = {
+            frame: index for index, frame in enumerate(evaluation_trajectory.frame_indices)
+        }
+        matched = [
+            (pred_index, frame_to_target[frame]) for pred_index, frame in enumerate(frame_indices)
+            if frame in frame_to_target
+        ]
+        dynamic_indices = [index for index, body in enumerate(bodies) if body.role == "dynamic"]
+        if matched and dynamic_indices:
+            pred_indices = torch.tensor([item[0] for item in matched], device=device)
+            target_indices = torch.tensor([item[1] for item in matched])
+            predicted_position = positions[pred_indices, dynamic_indices[0]]
+            target_position = evaluation_trajectory.positions[target_indices].to(device)
+            predicted_quaternion = F.normalize(
+                quaternions[pred_indices, dynamic_indices[0]], dim=-1
+            )
+            target_quaternion = evaluation_trajectory.quaternions_wxyz[target_indices].to(device)
+            translation = torch.linalg.norm(predicted_position - target_position, dim=-1)
+            dots = torch.clamp(torch.abs(torch.sum(
+                predicted_quaternion * target_quaternion, dim=-1
+            )), max=1.0)
+            rotation = 2.0 * torch.acos(dots)
+            trajectory_evaluation = {
+                "body_id": bodies[dynamic_indices[0]].id,
+                "matched_frames": len(matched),
+                "translation_error_mean_m": float(translation.mean().detach().cpu()),
+                "translation_error_rmse_m": float(torch.sqrt(torch.mean(translation ** 2)).detach().cpu()),
+                "rotation_error_mean_rad": float(rotation.mean().detach().cpu()),
+                "rotation_error_rmse_rad": float(torch.sqrt(torch.mean(rotation ** 2)).detach().cpu()),
+            }
     artifacts = None
     if render_output_dir is not None:
         render_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1030,6 +1316,7 @@ def fit_native_image_only(
                     "lse_sigmoid_fixed_penetration_collision",
                     "complementarity_free_dual_cone_contact",
                     "full_image_l1_plus_loftr_supervision",
+                    "collision_only_geometry_gradient",
                 ]
                 if mode_contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE else []
             ),
@@ -1096,6 +1383,31 @@ def fit_native_image_only(
             "full_evaluation_frames": len(frame_indices),
         },
         "fit_iterations": int(fit_iters),
+        "optimization_stability": {
+            "physics_warmup_fraction": float(physics_warmup_fraction),
+            "physics_warmup_iterations": int(warmup_iterations),
+            "freeze_initial_state_after_warmup": bool(freeze_initial_state_after_warmup),
+            "contact_parameter_l2": float(contact_parameter_l2),
+            "trajectory_stability_weight": float(trajectory_stability_weight),
+            "max_dynamic_displacement": float(max_dynamic_displacement),
+            "best_loss_restored": best_parameters is not None,
+            "best_loss": None if best_parameters is None else float(best_loss),
+            "best_state_scope": "joint_physics_only",
+            "gradient_clip_norm": 10.0,
+            "learn_contact_parameters": bool(learn_contact_parameters),
+            "physics_override_applied": bool(physics_override),
+            "contact_parameterization": "log_positive",
+            "stiffness_lr": float(lr if stiffness_lr is None else stiffness_lr),
+            "damping_lr": float(lr if damping_lr is None else damping_lr),
+            "friction_lr": float(lr if friction_lr is None else friction_lr),
+            "estimated_contact_frames": estimated_contact_frames,
+            "contact_curriculum_frames": int(contact_curriculum_frames),
+            "silhouette_weight": 0.0 if paper_supervision else float(silhouette_weight),
+            "silhouette_false_positive_weight": float(silhouette_fp_weight),
+            "silhouette_false_negative_weight": float(silhouette_fn_weight),
+            "gradient_attribution": bool(gradient_attribution),
+            "gradient_attribution_interval": int(gradient_attribution_interval),
+        },
         "image_loss_config": {
             "requested_type": str(image_loss),
             "type": str(effective_image_loss),
@@ -1143,6 +1455,7 @@ def fit_native_image_only(
             "foreground_psnr": float(foreground_psnr.detach().cpu()),
             "uses_foreground_mask": masks is not None,
             "num_frames": len(frame_indices),
+            "trajectory": trajectory_evaluation,
         },
         "artifacts": artifacts,
         "render_gaussian_counts": {
@@ -1236,6 +1549,23 @@ def main() -> None:
     parser.add_argument("--inertia_l2", default=1e-4, type=float)
     parser.add_argument("--temporal_window_frames", default=0, type=int)
     parser.add_argument("--temporal_window_step", default=1, type=int)
+    parser.add_argument("--physics_warmup_fraction", default=0.2, type=float)
+    parser.add_argument(
+        "--keep_initial_state_trainable_after_warmup", action="store_true",
+        help="Disable the default initial-state freeze after physics warm-up.",
+    )
+    parser.add_argument("--contact_parameter_l2", default=1e-4, type=float)
+    parser.add_argument("--trajectory_stability_weight", default=1e-4, type=float)
+    parser.add_argument("--max_dynamic_displacement", default=3.0, type=float)
+    parser.add_argument("--stiffness_lr", default=None, type=float)
+    parser.add_argument("--damping_lr", default=None, type=float)
+    parser.add_argument("--friction_lr", default=None, type=float)
+    parser.add_argument("--contact_curriculum_frames", default=8, type=int)
+    parser.add_argument("--silhouette_weight", default=0.005, type=float)
+    parser.add_argument("--silhouette_fp_weight", default=2.0, type=float)
+    parser.add_argument("--silhouette_fn_weight", default=1.0, type=float)
+    parser.add_argument("--gradient_attribution", action="store_true")
+    parser.add_argument("--gradient_attribution_interval", default=1, type=int)
     parser.add_argument(
         "--geometry_gradient_route", default="collision_only",
         choices=("collision_only", "collision_and_render"),
@@ -1268,6 +1598,21 @@ def main() -> None:
             mass_l2=args.mass_l2, inertia_l2=args.inertia_l2,
             temporal_window_frames=args.temporal_window_frames,
             temporal_window_step=args.temporal_window_step,
+            physics_warmup_fraction=args.physics_warmup_fraction,
+            freeze_initial_state_after_warmup=(
+                not args.keep_initial_state_trainable_after_warmup
+            ),
+            contact_parameter_l2=args.contact_parameter_l2,
+            trajectory_stability_weight=args.trajectory_stability_weight,
+            max_dynamic_displacement=args.max_dynamic_displacement,
+            stiffness_lr=args.stiffness_lr, damping_lr=args.damping_lr,
+            friction_lr=args.friction_lr,
+            contact_curriculum_frames=args.contact_curriculum_frames,
+            silhouette_weight=args.silhouette_weight,
+            silhouette_fp_weight=args.silhouette_fp_weight,
+            silhouette_fn_weight=args.silhouette_fn_weight,
+            gradient_attribution=args.gradient_attribution,
+            gradient_attribution_interval=args.gradient_attribution_interval,
             pipeline_mode=args.pipeline_mode,
             loftr_weight=args.loftr_weight, loftr_pretrained=args.loftr_pretrained,
             loftr_confidence_threshold=args.loftr_confidence_threshold,

@@ -84,10 +84,11 @@ def validate_stage2_mode_options(
         )
     if (
         contract.mode is Stage2PipelineMode.PAPER_COMPATIBLE
-        and geometry_gradient_route != "collision_and_render"
+        and geometry_gradient_route != "collision_only"
     ):
         raise ValueError(
-            "paper_compatible requires geometry gradients through collision_and_render"
+            "paper_compatible requires collision_only geometry gradients; direct renderer "
+            "geometry gradients are excluded by the paper's Stage II contract"
         )
     if (
         contract.mode is not Stage2PipelineMode.PAPER_COMPATIBLE
