@@ -56,7 +56,37 @@ def parse_args():
     parser.add_argument("--max_points", default=200000, type=int)
     parser.add_argument("--chunk_size", default=262144, type=int)
     parser.add_argument("--skip_color", action="store_true")
+    parser.add_argument(
+        "--refine_passes", default=1, type=int,
+        help="Re-carve inside the previous hull's bounding box (plus two voxels) this many times.",
+    )
+    parser.add_argument(
+        "--support_plane", default="auto", type=str,
+        help="'auto' reads dataset_manifest.json support_plane; 'none' disables; or nx,ny,nz,height. "
+             "Points below the plane the object rests on are removed.",
+    )
     return parser.parse_args()
+
+
+def resolve_support_plane(source_path: Path, value: str):
+    value = str(value).strip().lower()
+    if value in ("", "none"):
+        return None
+    if value == "auto":
+        manifest_path = source_path / "dataset_manifest.json"
+        if not manifest_path.exists():
+            return None
+        import json
+        plane = json.loads(manifest_path.read_text(encoding="utf-8")).get("support_plane")
+        if not plane:
+            return None
+        normal = np.asarray(plane["normal"], dtype=np.float32)
+        return normal / np.linalg.norm(normal), float(plane.get("height", 0.0))
+    values = [float(item) for item in value.replace(",", " ").split()]
+    if len(values) != 4:
+        raise ValueError("--support_plane expects nx,ny,nz,height")
+    normal = np.asarray(values[:3], dtype=np.float32)
+    return normal / np.linalg.norm(normal), values[3]
 
 
 def parse_optional_vec3(value: str, name: str):
@@ -350,11 +380,20 @@ def main():
         bbox_min, bbox_max = explicit_bbox_min, explicit_bbox_max
     else:
         bbox_min, bbox_max = build_bounds(views, args.bounds_scale)
-    points, _ = generate_grid_points(bbox_min, bbox_max, args.grid_resolution)
-    keep = carve_visual_hull(points, views, masks_by_path, args.chunk_size)
-    hull_points = points[keep]
-    if hull_points.shape[0] == 0:
-        raise RuntimeError("Visual hull carving removed every voxel. Try a larger bounds_scale or lower mask_threshold.")
+    support_plane = resolve_support_plane(source_path, args.support_plane)
+    for refine_pass in range(max(0, int(args.refine_passes)) + 1):
+        points, axes = generate_grid_points(bbox_min, bbox_max, args.grid_resolution)
+        keep = carve_visual_hull(points, views, masks_by_path, args.chunk_size)
+        if support_plane is not None:
+            keep &= points @ support_plane[0] >= support_plane[1]
+        hull_points = points[keep]
+        if hull_points.shape[0] == 0:
+            raise RuntimeError("Visual hull carving removed every voxel. Try a larger bounds_scale or lower mask_threshold.")
+        if refine_pass < int(args.refine_passes):
+            voxel = np.array([axis[1] - axis[0] for axis in axes], dtype=np.float32)
+            bbox_min = hull_points.min(axis=0) - 2.0 * voxel
+            bbox_max = hull_points.max(axis=0) + 2.0 * voxel
+            print(f"Refine pass {refine_pass + 1}: bounds {bbox_min.tolist()} .. {bbox_max.tolist()}")
 
     if args.skip_color:
         hull_colors = np.full((hull_points.shape[0], 3), 0.7, dtype=np.float32)

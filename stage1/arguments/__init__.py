@@ -116,6 +116,14 @@ class OptimizationParams(ParamGroup):
         self.require_sam_features = False
         self.object_mask_weight = 0.0
         self.object_mask_bce_weight = 1.0
+        # Keep every collision sphere (r = 2s) inside the object silhouettes and
+        # above the declared support plane (see stage1/silhouette_geometry.py).
+        self.silhouette_geometry = False
+        self.silhouette_projection_interval = 100
+        # Fractions of the run at which hull-surface coverage Gaussians are added
+        # (always once more before saving).
+        self.surface_coverage_first = 0.4
+        self.surface_coverage_second = 0.7
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -9,6 +9,28 @@ from pathlib import Path
 import numpy as np
 
 
+# MuJoCo renders round primitives as prisms with ``numslices`` sides (default 28).  With 28 sides a
+# 7 cm cylinder is drawn up to 0.44 mm thinner than the analytic shape that collides, so the images
+# would show a different object than the one being simulated.
+RENDER_SLICES = 160
+
+# A segmentation render is binary at pixel centres, so a mask edge is only known to +-0.5 px.  The
+# object mask is rendered at this multiple of the image size and box-filtered to a pixel coverage.
+MASK_SUPERSAMPLE = 4
+
+
+def coverage_mask(renderer, data, camera, geom_ids, factor: int = MASK_SUPERSAMPLE) -> np.ndarray:
+    """Fraction of each pixel covered by ``geom_ids`` (``renderer`` is ``factor`` times the image size)."""
+    renderer.enable_segmentation_rendering()
+    renderer.update_scene(data, camera=camera)
+    segmentation = np.asarray(renderer.render())
+    renderer.disable_segmentation_rendering()
+    labels = segmentation if segmentation.ndim == 2 else segmentation[..., 0]
+    fine = np.isin(labels, geom_ids).astype(np.float32)
+    height, width = fine.shape[0] // factor, fine.shape[1] // factor
+    return fine.reshape(height, factor, width, factor).mean(axis=(1, 3))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a simple MuJoCo synthetic dataset in the Blender/NeRF format used by scene initialization."
@@ -23,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--object_type",
         default="box",
-        choices=["box", "sphere", "cylinder", "dice", "cola_can"],
+        choices=["box", "sphere", "cylinder", "dice", "cola_can", "textured_can"],
         help="Simple object primitive to render.",
     )
     parser.add_argument("--train_views", default=24, type=int, help="Number of train views on the orbit.")
@@ -34,6 +56,11 @@ def parse_args():
     parser.add_argument("--camera_radius", default=1.45, type=float, help="Distance from camera to object center.")
     parser.add_argument("--elevation_deg", default=25.0, type=float, help="Orbit elevation angle in degrees.")
     parser.add_argument("--camera_sampling", default="orbit", choices=("orbit", "hemisphere"))
+    parser.add_argument(
+        "--floating_object", action="store_true",
+        help="Object scan: hold the object in the air (no settling) so cameras with negative elevation "
+             "see its underside too. No support plane is recorded for such a capture.",
+    )
     parser.add_argument("--min_elevation_deg", default=12.0, type=float)
     parser.add_argument("--max_elevation_deg", default=70.0, type=float)
     parser.add_argument(
@@ -185,6 +212,52 @@ def dice_geom_xml(half_extent: float) -> str:
     """.strip()
 
 
+def write_can_cube_texture(path: Path, face: int = 128) -> Path:
+    """Six distinct faces (3x4 grid ``.U..LFRB.D..``) for a surface-flush can texture.
+
+    Every face carries a different mark so the texture fixes the rotation about
+    the can axis, while the collision cylinder stays the only geometry.
+    """
+    from PIL import Image, ImageDraw
+
+    red, white, dark = (209, 5, 5), (242, 242, 242), (40, 40, 40)
+    lid, base = (220, 220, 210), (189, 189, 179)
+    image = Image.new("RGB", (4 * face, 3 * face), red)
+    draw = ImageDraw.Draw(image)
+
+    def cell(row, col):
+        return col * face, row * face
+
+    f = face
+    x, y = cell(1, 0)  # L: two dots
+    for cx in (0.3, 0.7):
+        draw.ellipse((x + cx * f - 0.12 * f, y + 0.38 * f, x + cx * f + 0.12 * f, y + 0.62 * f), fill=white)
+    x, y = cell(1, 1)  # F: wide label
+    draw.rectangle((x + 0.18 * f, y + 0.22 * f, x + 0.82 * f, y + 0.78 * f), fill=white)
+    draw.rectangle((x + 0.30 * f, y + 0.45 * f, x + 0.70 * f, y + 0.55 * f), fill=red)
+    x, y = cell(1, 2)  # R: vertical bar
+    draw.rectangle((x + 0.40 * f, y + 0.08 * f, x + 0.60 * f, y + 0.92 * f), fill=white)
+    x, y = cell(1, 3)  # B: triangle
+    draw.polygon([(x + 0.5 * f, y + 0.18 * f), (x + 0.85 * f, y + 0.82 * f), (x + 0.15 * f, y + 0.82 * f)], fill=white)
+    x, y = cell(0, 1)  # U: lid with an off-center tab
+    draw.rectangle((x, y, x + f, y + f), fill=lid)
+    draw.rectangle((x + 0.45 * f, y + 0.15 * f, x + 0.85 * f, y + 0.35 * f), fill=dark)
+    x, y = cell(2, 1)  # D: base with a ring mark
+    draw.rectangle((x, y, x + f, y + f), fill=base)
+    draw.ellipse((x + 0.2 * f, y + 0.2 * f, x + 0.8 * f, y + 0.8 * f), outline=dark, width=max(2, f // 24))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+    return path
+
+
+def textured_can_geom_xml(radius: float = 0.07, half_height: float = 0.10) -> str:
+    """Cylinder whose visible surface is exactly its collision surface."""
+    return (
+        f'<geom name="target_geom" type="cylinder" size="{float(radius)} {float(half_height)}" '
+        f'material="can_mat" rgba="1 1 1 1"/>'
+    )
+
+
 def cola_can_geom_xml(radius: float = 0.07, half_height: float = 0.10) -> str:
     r = float(radius)
     h = float(half_height)
@@ -247,6 +320,16 @@ def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]
             """.strip(),
             0.10,
         )
+    if object_type == "textured_can":
+        return (
+            f"""
+        <body name="target_body" pos="0 0 0.10">
+          <freejoint/>
+          {textured_can_geom_xml(0.07, 0.10)}
+        </body>
+            """.strip(),
+            0.10,
+        )
     if object_type == "cola_can":
         geom_xml = cola_can_geom_xml(0.07, 0.10)
         return (
@@ -262,8 +345,18 @@ def object_geom_xml(object_type: str, box_face_colors: str) -> tuple[str, float]
 
 
 def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int,
-                    box_face_colors: str, appearance_preset: str = "legacy") -> str:
+                    box_face_colors: str, appearance_preset: str = "legacy",
+                    object_texture_path: Path | None = None) -> str:
     object_xml, _ = object_geom_xml(object_type, box_face_colors)
+    object_asset_xml = ""
+    if object_type == "textured_can":
+        if object_texture_path is None:
+            raise ValueError("textured_can requires object_texture_path")
+        object_asset_xml = (
+            f'<texture name="can_tex" type="cube" file="{Path(object_texture_path).resolve().as_posix()}" '
+            'gridsize="3 4" gridlayout=".U..LFRB.D.."/>\n'
+            '    <material name="can_mat" texture="can_tex" reflectance="0.1"/>'
+        )
     if appearance_preset == "realistic_contact":
         visual_xml = """
     <headlight ambient="0.22 0.22 0.22" diffuse="0.65 0.65 0.65" specular="0.18 0.18 0.18"/>
@@ -292,10 +385,12 @@ def build_model_xml(object_type: str, fovy_deg: float, width: int, height: int,
   <option timestep="0.002" gravity="0 0 -9.81"/>
   <visual>
     <global offwidth="{int(width)}" offheight="{int(height)}"/>
+    <quality numslices="{RENDER_SLICES}" numstacks="{RENDER_SLICES}" numquads="8"/>
     {visual_xml}
   </visual>
   <asset>
     {asset_xml}
+    {object_asset_xml}
   </asset>
   <worldbody>
     {light_xml}
@@ -354,8 +449,8 @@ def hemisphere_camera_positions(count: int, radius: float, min_elevation_deg: fl
         return []
     min_sin = math.sin(math.radians(float(min_elevation_deg)))
     max_sin = math.sin(math.radians(float(max_elevation_deg)))
-    if not 0.0 <= min_sin < max_sin <= 1.0:
-        raise ValueError("hemisphere elevations must satisfy 0 <= min < max <= 90 degrees")
+    if not -1.0 <= min_sin < max_sin <= 1.0:
+        raise ValueError("elevations must satisfy -90 <= min < max <= 90 degrees")
     golden_angle = math.pi * (3.0 - math.sqrt(5.0))
     positions = []
     for index in range(count):
@@ -435,6 +530,7 @@ def render_split(
     width: int,
     height: int,
     alpha_subject: str,
+    mask_renderer=None,
 ):
     image_dir = dataset_dir / "images" / split_name
     mask_dir = dataset_dir / "masks" / split_name
@@ -475,7 +571,11 @@ def render_split(
         # ``masks`` is the binary prior for the selected Stage-1 subject.
         save_png(imageio, mask_dir / f"{stem}.png", alpha_mask * 255)
         save_png(imageio, instance_mask_dir / f"{stem}.png", instance_mask)
-        save_png(imageio, object_mask_dir / f"{stem}.png", mask * 255)
+        if mask_renderer is None:
+            save_png(imageio, object_mask_dir / f"{stem}.png", mask * 255)
+        else:  # sub-pixel object silhouette: 8-bit pixel coverage
+            coverage = coverage_mask(mask_renderer, data, "render_cam", target_geom_ids)
+            save_png(imageio, object_mask_dir / f"{stem}.png", np.round(coverage * 255.0).astype(np.uint8))
         save_png(imageio, floor_mask_dir / f"{stem}.png", floor_mask.astype(np.uint8) * 255)
 
         c2w = camera_to_world_matrix(eye, lookat, np.array([0.0, 0.0, 1.0], dtype=np.float32))
@@ -511,9 +611,12 @@ def main():
     dataset_dir = Path(args.output_root).expanduser().resolve() / args.scene_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
+    texture_path = None
+    if args.object_type == "textured_can":
+        texture_path = write_can_cube_texture(dataset_dir / "textures" / "can_cube.png")
     xml = build_model_xml(
         args.object_type, args.fovy_deg, args.width, args.height,
-        args.box_face_colors, args.appearance_preset,
+        args.box_face_colors, args.appearance_preset, object_texture_path=texture_path,
     )
     (dataset_dir / "scene.xml").write_text(xml)
 
@@ -521,11 +624,20 @@ def main():
     data = mujoco.MjData(model)
 
     maybe_jitter_object_pose(mujoco, model, data, rng, args.add_pose_jitter)
-    for _ in range(int(args.settle_steps)):
-        mujoco.mj_step(model, data)
+    _, default_object_height = object_geom_xml(args.object_type, args.box_face_colors)
+    if args.floating_object:
+        # Kinematic placement: the object stays where it is put, clear of the floor.
+        data.qpos[2] = float(1.0 if args.object_height is None else args.object_height)
+        mujoco.mj_forward(model, data)
+    else:
+        for _ in range(int(args.settle_steps)):
+            mujoco.mj_step(model, data)
 
     try:
+        model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), MASK_SUPERSAMPLE * int(args.width))
+        model.vis.global_.offheight = max(int(model.vis.global_.offheight), MASK_SUPERSAMPLE * int(args.height))
         renderer = mujoco.Renderer(model, height=args.height, width=args.width)
+        mask_renderer = mujoco.Renderer(model, height=MASK_SUPERSAMPLE * args.height, width=MASK_SUPERSAMPLE * args.width)
     except Exception as exc:
         raise RuntimeError(
             "Failed to create a MuJoCo renderer. In a headless environment, try "
@@ -539,8 +651,9 @@ def main():
         if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) != "floor"
     ]
 
-    _, default_object_height = object_geom_xml(args.object_type, args.box_face_colors)
     object_height = float(default_object_height if args.object_height is None else args.object_height)
+    if args.floating_object:
+        object_height = float(data.qpos[2])
     lookat = np.array([0.0, 0.0, object_height], dtype=np.float32)
     if args.camera_sampling == "hemisphere":
         position_builder = lambda count: hemisphere_camera_positions(
@@ -570,6 +683,7 @@ def main():
         width=args.width,
         height=args.height,
         alpha_subject=args.alpha_subject,
+        mask_renderer=mask_renderer,
     )
     render_split(
         mujoco=mujoco,
@@ -586,11 +700,24 @@ def main():
         width=args.width,
         height=args.height,
         alpha_subject=args.alpha_subject,
+        mask_renderer=mask_renderer,
     )
 
+    target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_body")
     manifest = {
         "scene_name": args.scene_name,
         "object_type": args.object_type,
+        # Pose of the object's body frame in the Stage1 world after settling;
+        # it defines the object-local frame of the reconstructed Gaussians.
+        "object_pose_world": {
+            "position": [float(value) for value in data.xpos[target_body_id]],
+            "quaternion_wxyz": [float(value) for value in data.xquat[target_body_id]],
+        },
+        # The object rests on this plane in every view (floor geom, world z-up).
+        "support_plane": None if args.floating_object else {"normal": [0.0, 0.0, 1.0], "height": 0.0},
+        # The scene's floor geom (world z-up), independent of where the object was captured.
+        "floor_plane": {"normal": [0.0, 0.0, 1.0], "height": 0.0},
+        "floating_object": bool(args.floating_object),
         "train_views": args.train_views,
         "test_views": args.test_views,
         "width": args.width,

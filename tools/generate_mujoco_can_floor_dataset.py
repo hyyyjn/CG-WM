@@ -28,6 +28,17 @@ def parse_args():
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--camera_distance", type=float, default=1.8)
+    parser.add_argument("--camera_height", type=float, default=0.6)
+    parser.add_argument("--camera_target_z", type=float, default=0.6)
+    parser.add_argument("--drop_height_train", type=float, default=1.1)
+    parser.add_argument("--drop_height_test", type=float, default=1.1)
+    parser.add_argument("--max_tilt_deg_train", type=float, default=12.0)
+    parser.add_argument("--max_tilt_deg_test", type=float, default=12.0)
+    parser.add_argument("--spin_speed_train", type=float, default=5.0)
+    parser.add_argument("--spin_speed_test", type=float, default=5.0)
+    parser.add_argument("--planar_speed_train", type=float, default=0.5)
+    parser.add_argument("--planar_speed_test", type=float, default=0.5)
     parser.add_argument("--mujoco_gl", choices=("auto", "egl", "osmesa", "glfw"), default="auto")
     parser.add_argument("--skip_render", action="store_true", help="Physics/layout smoke test with placeholder frames.")
     parser.add_argument("--overwrite", action="store_true")
@@ -73,17 +84,24 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
 
     stage1_root = root / "stage1"
-    stage1_scene = stage1_root / "can_floor"
+    stage1_scene = stage1_root / "can"
     stage1_command = [
         sys.executable, "-m", "stage1.generate_mujoco_synthetic_dataset",
-        "--output_root", str(stage1_root), "--scene_name", "can_floor",
-        "--object_type", "cola_can", "--alpha_subject", "scene",
+        "--output_root", str(stage1_root), "--scene_name", "can",
+        "--object_type", "textured_can", "--alpha_subject", "object",
+        "--appearance_preset", "realistic_contact",
+        "--camera_sampling", "hemisphere", "--min_elevation_deg", "12", "--max_elevation_deg", "70",
         "--train_views", str(args.train_views), "--test_views", str(args.test_views),
         "--width", str(args.width), "--height", str(args.height),
-        "--camera_radius", "0.75", "--elevation_deg", "28",
+        "--camera_radius", "0.75",
         "--mujoco_gl", args.mujoco_gl, "--seed", str(args.seed),
     ]
     run(stage1_command, repo)
+    # Same scene and cameras, alpha = floor: the environment's Stage1 input.
+    floor_command = list(stage1_command)
+    floor_command[floor_command.index("--scene_name") + 1] = "floor"
+    floor_command[floor_command.index("--alpha_subject") + 1] = "floor"
+    run(floor_command, repo)
 
     # Stage 1 training will create this PLY. Keeping the intended path in the
     # asset manifest makes the Stage 2 dataset immediately reusable afterward.
@@ -91,8 +109,8 @@ def main():
     asset_path = root / "can_asset.json"
     write_json(asset_path, {
         "object_name": "cola_can",
-        "object_type": "cola_can",
-        "visual_model": "cola_can",
+        "object_type": "textured_can",
+        "visual_model": "textured_can",
         "physics_shape": "cylinder",
         "mesh_path": str(stage1_scene / "scene.xml"),
         "stage1_dataset_path": str(stage1_scene),
@@ -114,9 +132,14 @@ def main():
     rollout_command = [
         sys.executable, "tools/generate_mujoco_fall_dataset.py",
         "--dataset_root", str(stage2_root), "--object_name", "cola_can", "--split", "all",
+        "--scene_xml", str(stage1_scene / "scene.xml"),
         "--fps", str(args.fps), "--seed", str(args.seed),
-        "--camera_distance", "1.25", "--camera_height", "0.65", "--camera_target_z", "0.65",
-        "--drop_height_train", "1.1", "--drop_height_test", "1.35",
+        "--camera_distance", str(args.camera_distance), "--camera_height", str(args.camera_height),
+        "--camera_target_z", str(args.camera_target_z),
+        "--drop_height_train", str(args.drop_height_train), "--drop_height_test", str(args.drop_height_test),
+        "--max_tilt_deg_train", str(args.max_tilt_deg_train), "--max_tilt_deg_test", str(args.max_tilt_deg_test),
+        "--spin_speed_train", str(args.spin_speed_train), "--spin_speed_test", str(args.spin_speed_test),
+        "--planar_speed_train", str(args.planar_speed_train), "--planar_speed_test", str(args.planar_speed_test),
     ]
     if args.skip_render:
         rollout_command.append("--skip_render")

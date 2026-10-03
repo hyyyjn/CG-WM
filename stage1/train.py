@@ -231,6 +231,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    silhouette_geometry = None
+    hull_surface = None
+    silhouette_log_path = os.path.join(dataset.model_path, "silhouette_geometry.jsonl")
+    if opt.silhouette_geometry:
+        from stage1.silhouette_geometry import SilhouetteGeometry, load_support_plane
+        support_plane = load_support_plane(dataset.source_path)
+        silhouette_geometry = SilhouetteGeometry(scene.getTrainCameras(), support_plane=support_plane)
+        hull_surface, hull_normals = silhouette_geometry.hull_surface_samples(gaussians.get_xyz.detach())
+        coverage_iterations = {max(1, int(round(float(fraction) * opt.iterations)))
+                               for fraction in (opt.surface_coverage_first, opt.surface_coverage_second)}
+        stats = silhouette_geometry.project(gaussians)
+        stats["hull_surface_samples"] = int(hull_surface.shape[0])
+        stats["hull_surface_residual_mm"] = 1e3 * silhouette_geometry.surface_residual
+        append_jsonl(silhouette_log_path, {
+            "iteration": int(first_iter), "support_plane": None if support_plane is None
+            else {"normal": support_plane[0].tolist(), "height": support_plane[1]},
+            "views": len(silhouette_geometry.views), **stats,
+        })
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -458,7 +476,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/appearance_loss', appearance_loss_value, iteration)
                 tb_writer.add_scalar('train_loss_patches/geometry_feature_loss', geometry_feature_loss_value, iteration)
                 tb_writer.add_scalar('train_loss_patches/object_mask_loss', object_mask_loss_value, iteration)
-            if (iteration in saving_iterations):
+            # With silhouette geometry the save happens at the end of the
+            # iteration, after the projection (pruning here would desync the
+            # densification buffers of this iteration's render).
+            if (iteration in saving_iterations) and silhouette_geometry is None:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -533,6 +554,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     else:
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if silhouette_geometry is not None and (iteration in coverage_iterations or iteration in saving_iterations):
+                coverage = silhouette_geometry.add_surface_coverage(gaussians, hull_surface, hull_normals)
+                append_jsonl(silhouette_log_path, {"iteration": int(iteration), **coverage})
+                if iteration in saving_iterations:
+                    # Exact extreme points (edges, corners) of the hull for plane contact; added
+                    # last so that no optimizer step moves them.
+                    append_jsonl(silhouette_log_path, {
+                        "iteration": int(iteration), **silhouette_geometry.add_support_points(gaussians)})
+            if silhouette_geometry is not None and (
+                iteration % max(1, int(opt.silhouette_projection_interval)) == 0 or iteration in saving_iterations
+            ):
+                stats = silhouette_geometry.project(gaussians)
+                if iteration % 1000 == 0 or iteration in saving_iterations:
+                    append_jsonl(silhouette_log_path, {"iteration": int(iteration), **stats})
+                if iteration in saving_iterations:
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

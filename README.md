@@ -4,6 +4,78 @@ ContactGaussian-WM 논문 아이디어를 바탕으로 Stage 1 Gaussian scene in
 
 현재 코드는 논문 전체를 완전히 재현한 공식 구현체가 아니라, 주사위/박스 같은 rigid object를 대상으로 object-aware Gaussian proxy를 만들고, 그 proxy를 이용해 differentiable collision/contact dynamics를 검증하는 프로토타입입니다.
 
+## MuJoCo 데이터셋 → Stage 1 → Stage 2 (수동 조정 없는 경로)
+
+데이터셋마다 값(canonical offset, 배경색, K/D 초기값, 관성, 카메라 거리, 손실 가중치 등)을 손으로
+맞추지 않고, 데이터와 Stage 1 결과에서 모두 자동으로 유도하는 경로다. GT 궤적은 평가에만 사용한다.
+
+```bash
+# 1) 물체 스캔(공중에 띄운 캔, 위·아래 포함 96뷰)과 낙하 영상
+python -m stage1.generate_mujoco_synthetic_dataset --output_root output/cgwm_scan2/stage1 --scene_name can \
+  --object_type textured_can --alpha_subject object --appearance_preset realistic_contact \
+  --camera_sampling hemisphere --min_elevation_deg -70 --max_elevation_deg 70 --floating_object \
+  --train_views 96 --test_views 12 --width 640 --height 480 --camera_radius 0.75 --mujoco_gl glfw --seed 7
+python tools/generate_mujoco_fall_dataset.py --dataset_root output/cgwm_v3_dynamic/contactwm --object_name cola_can \
+  --split all --scene_xml output/cgwm_v2/stage1/can/scene.xml --seed 31 ...   # 장면별 인자는 output/run_final.ps1 참고
+
+# 2) Stage1: visual hull 초기화 + 실루엣 일관 충돌 형상
+python -m stage1.build_visual_hull --source_path output/cgwm_scan2/stage1/can \
+  --masks_dir output/cgwm_scan2/stage1/can/object_masks --grid_resolution 160 --refine_passes 1 --max_points 150000
+python -m stage1.train -s output/cgwm_scan2/stage1/can -m output/cgwm_scan2/stage1_can \
+  --masks_dir output/cgwm_scan2/stage1/can/object_masks --init_mode visual_hull \
+  --object_mask_weight 1.0 --silhouette_geometry --iterations 7000 --eval --disable_viewer
+
+# 3) Stage2: 영상 → 프레임별 포즈 추적(GPU, 캐시) → 물리 학습(CPU 병렬) → 미사용 에피소드 평가
+python tools/run_video_physics_pipeline.py --dataset_root output/cgwm_v3_dynamic \
+  --stage1_ply output/cgwm_scan2/stage1_can/point_cloud/iteration_7000/point_cloud.ply \
+  --stage1_dataset output/cgwm_scan2/stage1/can --output_dir output/cgwm_v3_dynamic/stage2_final --train_episodes 0,1,2,3
+python tools/render_video_fit_comparison.py --report output/cgwm_v3_dynamic/stage2_final/report.json \
+  --output_dir output/cgwm_v3_dynamic/stage2_final/gifs --source rolling_forecast   # 또는 open_loop
+```
+
+핵심 구성:
+
+- **데이터셋**: 낙하 영상은 Stage1 장면의 `scene.xml`(조명·재질)을 재사용하고, 정확한 카메라 행렬,
+  물리 timestep/steps_per_frame, world-frame 각속도를 기록한다. 원통은 160각형으로 그린다(기본 28각형은
+  충돌 원통보다 최대 0.44 mm 가늘게 보인다). 물체 마스크는 4배 해상도 분할 렌더를 평균한 픽셀
+  커버리지(부분 픽셀 경계)다.
+- **Stage1 형상** (`stage1/silhouette_geometry.py`): 충돌 구(`r=2s`)를 모든 학습 뷰 실루엣 안으로
+  가지치기/clamp 하고(실루엣 거리는 커버리지 마스크의 0.5 등고선, 픽셀 중심은 index 좌표), 껍질 표면을
+  덮는 구를 추가하며, 마지막에 실루엣 껍질의 극점(모서리·꼭짓점)에 0.2 mm 구를 둔다. 평면 접촉 후보
+  (`stage2/object_geometry.plane_support_indices`)에서는 실루엣 해상도(스캔 거리에서 0.5 px)보다 작게
+  볼록한 평면 내부를 빼서, 평평한 면이 테두리로 지지되게 한다.
+- **Stage2 추적** (`stage2/video_physics_fit.py`): 위치는 실루엣의 중심·면적으로 닫힌 형태로 맞추고,
+  회전은 등속 외삽 + 주변 회전 후보 탐색, 모든 갱신은 "화면에서 몇 픽셀 움직이는가" 단위다. 색 손실은
+  밝기를 나눈 색도(chromaticity) — 스캔에 구워진 음영이 물체가 돌면 달라지기 때문이다. 첫 프레임은
+  256방향 탐색 + 주축 180° 뒤집기 후보 + 10프레임 look-ahead로 정한다.
+- **Stage2 물리** (`stage2/pose_space_fit.py`): 추적된 포즈에 multiple shooting(10프레임 창마다 시작 상태,
+  물리는 공유)으로 맞춘다. 잔차는 픽셀 단위(시선 수직 `f/거리`, 시선 방향 `R_px/거리`, 회전 `R_px`)라
+  가중치를 손으로 정하지 않는다. 창들은 프로세스 풀에서 병렬로 굴린다. 접촉은 MuJoCo solref/solimp
+  임피던스를 dual-cone facet에 적용한 `soft_constraint` 모델이며, 학습 파라미터는 time constant,
+  damping ratio, 마찰, generalized damping. 관성은 가우시안이 감싸는 solid에서 계산한다.
+- **평가**: 미사용 에피소드에서 (a) 10프레임 관측 후 0.5초 예측, (b) 예측들을 이어 붙인 "5–14프레임 앞"
+  연속 예측, (c) 첫 창에서 끝까지 open loop. 같은 평가를 MuJoCo 정답 파라미터로도 돌려(참고값) 학습된
+  물리가 정답 물리만큼 예측하는지 비교한다. 위치 오차는 화면상(시선 수직) 성분을 따로 보고한다.
+- **검증**: `tests/test_mujoco_parity.py`(MuJoCo와 궤적 직접 비교), `tests/test_video_pose_fit.py`.
+
+결과 (2026-10-03, 학습 에피소드 4개, 평가 에피소드 4개, `output/<dataset>/stage2_final/`, 표 전체는
+`output/stage2_final_summary_tables.md`):
+
+| 데이터셋 | 학습 물리 / 정답 (τ, ζ, μ, damping) | 0.5초 예측 평균·중앙값 [cm] (정답 물리로는) | open loop 평균 [cm] (정답 물리로는) |
+|---|---|---|---|
+| v2 기본 낙하 | ×0.89, ×1.41, ×0.49, ×0.12 | 0.85 · 0.13 (0.38 · 0.06) | 4.4 (2.0) |
+| v3 역동적 | ×2.48, ×0.79, ×1.05, ×0.66 | 1.40 · 0.54 (0.94 · 0.48) | 18.3 (7.3) |
+| v4 과격 | ×1.61, ×1.51, ×0.73, ×0.72 | 6.36 · 3.48 (4.57 · 2.08) | 84 (113) |
+
+- 추적(이미지만으로 포즈): 평가 에피소드 평균 0.4 cm / 0.3°(v2·v3), 1.0 cm / 0.8°(v4). 오차는 대부분 시선 방향(깊이)이다.
+- 정답 상태에서 시작해 정답 물리로 굴려도 0.5초 뒤 v3 평균 0.7 cm, v4 1.7 cm가 남는다. 원통 모서리를
+  정확히 둔 이상적 형상이면 0.07 / 0.15 cm(MuJoCo 자체 0.5 mm 섭동 수준)이므로, 남은 오차는 Stage1
+  충돌 형상(모서리 −0.6 mm, 실루엣 해상도 0.65 mm)에서 온다.
+- 물리 파라미터는 부분적으로만 복원된다: τ는 일관되게 크게(1.6–2.5배), damping은 작게 나오고, 미끄러짐이
+  거의 없는 v2에서는 μ가 식별되지 않는다. v2의 damping(×0.12)은 10프레임 창으로는 거의 보이지 않아
+  open loop가 정답 물리보다 나쁘다(이전 단일 shooting 방식에서는 0.133/0.143로 복원됐었다).
+- 튀고 구르는 장면의 open loop는 혼돈 한계에 묶인다(정답 물리로도 v3 7 cm, v4 1 m 이상).
+
 ## ContactGaussian-WM 재현 단계 1–12
 
 현재 구현한 Stage-II 재현 범위는 다음과 같습니다.

@@ -53,6 +53,10 @@ def load_object_mask_prior(masks_dir, cam_info):
         mask = np.asarray(mask)
         if mask.ndim == 3:
             mask = mask[..., 0]
+        # 8-bit masks are pixel coverages (anti-aliased edges keep their sub-pixel
+        # position); label/boolean masks stay binary.
+        if mask.dtype == np.uint8 and mask.max() > 1:
+            return mask.astype(np.float32) / 255.0
         return (mask > 0).astype(np.float32)
 
     return None

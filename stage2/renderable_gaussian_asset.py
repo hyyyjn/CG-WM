@@ -212,7 +212,11 @@ def load_renderable_gaussian_asset(
     features_rest_flat = _stack_properties(vertex, f_rest_names)
     sh_degree = infer_sh_degree(features_rest_flat.shape[1])
     if features_rest_flat.shape[1] > 0:
-        features_rest_np = features_rest_flat.reshape(xyz_np.shape[0], -1, 3)
+        # 3DGS stores f_rest channel-major ([N, 3, K] flattened, see
+        # GaussianModel.save_ply); the renderer expects [N, K, 3].
+        features_rest_np = np.ascontiguousarray(
+            features_rest_flat.reshape(xyz_np.shape[0], 3, -1).transpose(0, 2, 1)
+        )
     else:
         features_rest_np = np.zeros((xyz_np.shape[0], 0, 3), dtype=np.float32)
 

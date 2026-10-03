@@ -93,7 +93,7 @@ class Camera(nn.Module):
             object_mask_map = cv2.resize(
                 object_mask_map.astype(np.float32, copy=False),
                 resolution,
-                interpolation=cv2.INTER_NEAREST,
+                interpolation=cv2.INTER_AREA,
             )
             object_mask_map = np.clip(object_mask_map, 0.0, 1.0)
             self.object_mask = torch.from_numpy(object_mask_map[None]).float().to(self.data_device)

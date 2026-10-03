@@ -20,6 +20,11 @@ def parse_args():
     )
     parser.add_argument("--dataset_root", required=True, type=str)
     parser.add_argument("--object_name", required=True, type=str)
+    parser.add_argument(
+        "--scene_xml", default="", type=str,
+        help="Stage1 dataset scene.xml to reuse (lights, floor, sky and object visuals), so "
+             "Stage1 multiview and Stage2 rollouts are rendered from one scene.",
+    )
     parser.add_argument("--split", default="all", choices=("all", "train", "test"))
     parser.add_argument("--camera_count", default=1, type=int)
     parser.add_argument("--fps", default=30, type=int)
@@ -83,6 +88,8 @@ def parse_args():
     parser.add_argument("--box_solref", default="", type=str)
     parser.add_argument("--cylinder_solref", default="", type=str)
     parser.add_argument("--floor_solref", default="", type=str)
+    parser.add_argument("--floor_friction", default="", type=str,
+                        help="floor geom friction; MuJoCo uses the element-wise max of the two geoms")
     parser.add_argument("--sphere_friction", default="0.02 0.001 0.0001", type=str)
     parser.add_argument("--box_friction", default="0.35 0.01 0.001", type=str)
     parser.add_argument("--cylinder_friction", default="0.55 0.02 0.001", type=str)
@@ -331,6 +338,112 @@ def build_mjcf(
 """.strip()
 
 
+def look_at_xyaxes(camera_distance, camera_height, target):
+    """MuJoCo ``xyaxes`` of a camera at (0, -distance, height) looking at ``target``."""
+    eye = np.array([0.0, -float(camera_distance), float(camera_height)])
+    forward = np.asarray(target, dtype=np.float64) - eye
+    forward /= max(float(np.linalg.norm(forward)), 1e-9)
+    right = np.array([forward[1], -forward[0], 0.0])
+    right /= max(float(np.linalg.norm(right)), 1e-9)
+    up = np.cross(right, forward)
+    return eye, f"{right[0]:.6f} {right[1]:.6f} {right[2]:.6f} {up[0]:.6f} {up[1]:.6f} {up[2]:.6f}"
+
+
+def build_mjcf_from_scene_xml(
+    scene_xml: str,
+    *,
+    object_mass: float,
+    object_friction: str,
+    object_solref: str,
+    floor_friction: str,
+    floor_solref: str,
+    freejoint_damping: float,
+    timestep: float,
+    gravity: float,
+    camera_distance: float,
+    camera_height: float,
+    camera_target,
+    camera_fovy: float,
+    width: int,
+    height: int,
+) -> str:
+    """Turn a Stage1 dataset ``scene.xml`` into the Stage2 rollout model.
+
+    Appearance (lights, sky, floor material, object visuals) is kept verbatim;
+    only physics attributes and the episode camera are added.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(scene_xml)
+    option = root.find("option")
+    if option is None:
+        option = ET.SubElement(root, "option")
+    option.set("timestep", f"{float(timestep)}")
+    option.set("gravity", f"0 0 {float(gravity)}")
+    option.set("integrator", "Euler")
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.SubElement(root, "visual")
+    global_visual = visual.find("global")
+    if global_visual is None:
+        global_visual = ET.SubElement(visual, "global")
+    global_visual.set("offwidth", str(max(int(width), int(global_visual.get("offwidth", 0)))))
+    global_visual.set("offheight", str(max(int(height), int(global_visual.get("offheight", 0)))))
+    # Round primitives are drawn as prisms; use enough sides that the rendered
+    # shape is the analytic one that collides (default 28 sides: 0.44 mm off for the can).
+    quality = visual.find("quality")
+    if quality is None:
+        quality = ET.SubElement(visual, "quality")
+    quality.set("numslices", "160")
+    quality.set("numstacks", "160")
+    worldbody = root.find("worldbody")
+    body = worldbody.find(".//body[@name='target_body']")
+    if body is None:
+        raise ValueError("scene_xml must contain a body named 'target_body'")
+    for free in list(body.findall("freejoint")) + list(body.findall("joint")):
+        body.remove(free)
+    joint = ET.Element("joint", {"name": "root_free", "type": "free", "damping": f"{float(freejoint_damping)}"})
+    body.insert(0, joint)
+    target = body.find("geom[@name='target_geom']")
+    if target is None:
+        raise ValueError("scene_xml target_body must contain a geom named 'target_geom'")
+    target.set("mass", f"{float(object_mass)}")
+    target.attrib.pop("density", None)
+    if str(object_friction).strip():
+        target.set("friction", str(object_friction))
+    if str(object_solref).strip():
+        target.set("solref", str(object_solref))
+    floor = worldbody.find("geom[@name='floor']")
+    if floor is not None:
+        if str(floor_friction).strip():
+            floor.set("friction", str(floor_friction))
+        if str(floor_solref).strip():
+            floor.set("solref", str(floor_solref))
+    eye, xyaxes = look_at_xyaxes(camera_distance, camera_height, camera_target)
+    for existing in worldbody.findall("camera[@name='cam0']"):
+        worldbody.remove(existing)
+    ET.SubElement(worldbody, "camera", {
+        "name": "cam0", "pos": f"{eye[0]} {eye[1]} {eye[2]}",
+        "xyaxes": xyaxes, "fovy": f"{float(camera_fovy)}",
+    })
+    return ET.tostring(root, encoding="unicode")
+
+
+def camera_record(model, data, camera_name: str, width: int, height: int) -> dict:
+    """Exact camera used for rendering: MuJoCo frame (x right, y up, looking along -z)."""
+    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    c2w = np.eye(4)
+    c2w[:3, :3] = np.asarray(data.cam_xmat[cam_id], dtype=np.float64).reshape(3, 3)
+    c2w[:3, 3] = np.asarray(data.cam_xpos[cam_id], dtype=np.float64)
+    return {
+        "name": camera_name,
+        "convention": "mujoco_camera_x_right_y_up_looks_along_minus_z",
+        "c2w": c2w.tolist(),
+        "fovy_deg": float(model.cam_fovy[cam_id]),
+        "image_size": [int(width), int(height)],
+    }
+
+
 def save_rgb(path: Path, rgb):
     Image.fromarray(rgb).save(path)
 
@@ -349,9 +462,15 @@ def save_rollout_gif(rgb_dir: Path, output_path: Path, fps: int):
     )
 
 
-def save_mask(path: Path, segmentation, object_geom_ids):
-    mask = np.isin(segmentation[..., 0], object_geom_ids).astype(np.uint8) * 255
-    Image.fromarray(mask, mode="L").save(path)
+MASK_SUPERSAMPLE = 4  # object masks are pixel coverages from a segmentation render at this multiple of the image size
+
+
+def save_mask(path: Path, segmentation, object_geom_ids, factor: int = 1):
+    """8-bit object mask; with ``factor > 1`` the segmentation is box-filtered to a pixel coverage."""
+    fine = np.isin(segmentation[..., 0], object_geom_ids).astype(np.float32)
+    height, width = fine.shape[0] // factor, fine.shape[1] // factor
+    coverage = fine.reshape(height, factor, width, factor).mean(axis=(1, 3))
+    Image.fromarray(np.round(coverage * 255.0).astype(np.uint8), mode="L").save(path)
 
 
 def save_placeholder_frame(path: Path, mask_path: Path, position, image_size):
@@ -448,6 +567,9 @@ def rollout_episode(
     for frame_idx in range(frames_per_episode):
         for _ in range(steps_per_frame):
             mujoco.mj_step(model, data)
+        # mj_step leaves the body poses of the step's start in ``data``; refresh
+        # them so the rendered frame and the recorded state are the same instant.
+        mujoco.mj_forward(model, data)
 
         stem = f"{frame_idx:06d}"
         if renderer is None:
@@ -467,14 +589,19 @@ def rollout_episode(
             if rgb.ndim == 3 and rgb.shape[2] == 3:
                 rgb[(rgb.sum(axis=-1) == 0)] = bg_rgb
 
-            renderer.enable_segmentation_rendering()
-            renderer.update_scene(data, camera=camera_name)
-            segmentation = np.asarray(renderer.render(), dtype=np.int32)
-            renderer.disable_segmentation_rendering()
+            mask_renderer = renderer.mask_renderer  # same camera, MASK_SUPERSAMPLE x the image size
+            mask_renderer.enable_segmentation_rendering()
+            mask_renderer.update_scene(data, camera=camera_name)
+            segmentation = np.asarray(mask_renderer.render(), dtype=np.int32)
+            mask_renderer.disable_segmentation_rendering()
 
             save_rgb(rgb_dir / f"{stem}.png", rgb)
-            save_mask(mask_dir / f"{stem}.png", segmentation, object_geom_ids)
+            save_mask(mask_dir / f"{stem}.png", segmentation, object_geom_ids, MASK_SUPERSAMPLE)
 
+        # MuJoCo free joints store the angular velocity in the body frame.
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, data.qpos[3:7])
+        angular_velocity_world = rotation.reshape(3, 3) @ data.qvel[3:6]
         states.append(
             {
                 "frame_index": frame_idx,
@@ -484,7 +611,8 @@ def rollout_episode(
                 "position": data.qpos[:3].tolist(),
                 "quaternion_wxyz": data.qpos[3:7].tolist(),
                 "linear_velocity": data.qvel[:3].tolist(),
-                "angular_velocity": data.qvel[3:6].tolist(),
+                "angular_velocity": angular_velocity_world.tolist(),
+                "angular_velocity_body": data.qvel[3:6].tolist(),
             }
         )
         actions.append(
@@ -495,18 +623,29 @@ def rollout_episode(
             }
         )
 
-    write_json(state_dir / "trajectory.json", {"states": states})
+    timing = {
+        "physics_timestep": float(model.opt.timestep),
+        "steps_per_frame": int(steps_per_frame),
+        "frame_dt": float(steps_per_frame * model.opt.timestep),
+        # The simulator is stepped before each frame is rendered, so frame 0
+        # is one frame interval after the released initial state.
+        "first_frame_time": float(steps_per_frame * model.opt.timestep),
+    }
+    write_json(state_dir / "trajectory.json", {
+        "angular_velocity_frame": "world", "timing": timing, "states": states,
+    })
     write_json(action_dir / "trajectory.json", {"actions": actions})
 
     manifest["generator"] = {
         "name": "generate_mujoco_fall_dataset.py",
         "camera_name": camera_name,
     }
+    manifest["timing"] = timing
     manifest["initial_state"] = {
         "position": initial_pos.tolist(),
         "quaternion_wxyz": initial_quat.tolist(),
         "linear_velocity": initial_linvel.tolist(),
-        "angular_velocity": initial_angvel.tolist(),
+        "angular_velocity_body": initial_angvel.tolist(),
     }
     write_json(episode_root / "episode_manifest.json", manifest)
     return states
@@ -528,7 +667,60 @@ def main():
     if object_mass <= 0.0:
         raise ValueError("object_manifest physics_prior.mass_kg must be positive")
 
-    mjcf = build_mjcf(
+    scenario_manifest = read_json(dataset_root / "stage2" / "fall_and_rebound" / "scenario_manifest.json")
+    width, height = scenario_manifest["image_size"]
+    if str(args.scene_xml).strip():
+        scene_xml_path = Path(args.scene_xml).expanduser().resolve()
+        shape_friction = {
+            "sphere": args.sphere_friction, "cylinder": args.cylinder_friction,
+        }.get(physics_shape, args.box_friction)
+        shape_solref = {
+            "sphere": args.sphere_solref, "cylinder": args.cylinder_solref,
+        }.get(physics_shape, args.box_solref)
+        mjcf = build_mjcf_from_scene_xml(
+            scene_xml_path.read_text(encoding="utf-8"),
+            object_mass=object_mass, object_friction=shape_friction, object_solref=shape_solref,
+            floor_friction=args.floor_friction, floor_solref=args.floor_solref,
+            freejoint_damping=args.freejoint_damping, timestep=args.timestep, gravity=args.gravity,
+            camera_distance=args.camera_distance, camera_height=args.camera_height,
+            camera_target=(args.camera_target_x, args.camera_target_y, args.camera_target_z),
+            camera_fovy=args.camera_fovy, width=int(width), height=int(height),
+        )
+    else:
+        scene_xml_path = None
+        mjcf = legacy_mjcf(args, half_extents, physics_shape, object_mass, visual_model)
+    (dataset_root / "stage2" / "fall_and_rebound" / "rollout_model.xml").write_text(mjcf, encoding="utf-8")
+    model = mujoco.MjModel.from_xml_string(mjcf)
+    moving_body_id = int(model.jnt_bodyid[0])
+    actual_mass = float(model.body_mass[moving_body_id])
+    actual_inertia = [float(value) for value in model.body_inertia[moving_body_id]]
+    if not math.isclose(actual_mass, object_mass, rel_tol=1e-6, abs_tol=1e-8):
+        raise RuntimeError(
+            f"MuJoCo body mass {actual_mass} does not match requested mass {object_mass}"
+        )
+    object_geom_ids = [
+        geom_id
+        for geom_id in range(model.ngeom)
+        if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) != "floor"
+    ]
+
+    renderer = None
+    if not bool(args.skip_render):
+        model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), MASK_SUPERSAMPLE * int(width))
+        model.vis.global_.offheight = max(int(model.vis.global_.offheight), MASK_SUPERSAMPLE * int(height))
+        renderer = mujoco.Renderer(model, height=int(height), width=int(width))
+        renderer.mask_renderer = mujoco.Renderer(model, height=MASK_SUPERSAMPLE * int(height),
+                                                 width=MASK_SUPERSAMPLE * int(width))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    exact_camera = camera_record(model, data, "cam0", int(width), int(height))
+    run_episodes(args, dataset_root, model, data, renderer, object_geom_ids, physics_shape,
+                 half_extents, object_mass, actual_mass, actual_inertia, moving_body_id,
+                 exact_camera, scene_xml_path)
+
+
+def legacy_mjcf(args, half_extents, physics_shape, object_mass, visual_model):
+    return build_mjcf(
         half_extents=half_extents,
         physics_shape=physics_shape,
         object_mass=object_mass,
@@ -561,25 +753,11 @@ def main():
         sky_rgb1=args.sky_rgb1,
         sky_rgb2=args.sky_rgb2,
     )
-    model = mujoco.MjModel.from_xml_string(mjcf)
-    moving_body_id = int(model.jnt_bodyid[0])
-    actual_mass = float(model.body_mass[moving_body_id])
-    actual_inertia = [float(value) for value in model.body_inertia[moving_body_id]]
-    if not math.isclose(actual_mass, object_mass, rel_tol=1e-6, abs_tol=1e-8):
-        raise RuntimeError(
-            f"MuJoCo body mass {actual_mass} does not match requested mass {object_mass}"
-        )
-    object_geom_ids = [
-        geom_id
-        for geom_id in range(model.ngeom)
-        if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) != "floor"
-    ]
 
-    scenario_manifest = read_json(dataset_root / "stage2" / "fall_and_rebound" / "scenario_manifest.json")
-    width, height = scenario_manifest["image_size"]
-    renderer = None if bool(args.skip_render) else mujoco.Renderer(model, height=int(height), width=int(width))
-    data = mujoco.MjData(model)
 
+def run_episodes(args, dataset_root, model, data, renderer, object_geom_ids, physics_shape,
+                 half_extents, object_mass, actual_mass, actual_inertia, moving_body_id,
+                 exact_camera, scene_xml_path):
     rng = np.random.default_rng(args.seed)
     fixed_position = parse_optional_vec3(args.initial_position, "--initial_position")
     fixed_euler_deg = parse_optional_vec3(args.initial_euler_deg, "--initial_euler_deg")
@@ -682,10 +860,12 @@ def main():
             "duration_seconds": len(states) / float(args.fps),
         }
         episode_manifest["camera"] = {
-            "name": "cam0", "distance": args.camera_distance, "height": args.camera_height,
+            **exact_camera,
+            "distance": args.camera_distance, "height": args.camera_height,
             "target": [args.camera_target_x, args.camera_target_y, args.camera_target_z],
-            "fovy_deg": float(model.cam_fovy[0]),
         }
+        if scene_xml_path is not None:
+            episode_manifest["scene_xml"] = str(scene_xml_path)
         episode_manifest["mujoco_body_properties"] = {
             "body_id": int(moving_body_id),
             "requested_mass_kg": object_mass,
@@ -693,6 +873,24 @@ def main():
             "inertia_diagonal_kg_m2": actual_inertia,
             "freejoint_damping": float(args.freejoint_damping),
             "internal_timestep": float(model.opt.timestep),
+        }
+        # Ground-truth contact physics, for evaluation only (MuJoCo mixes a
+        # geom pair by taking the element-wise max friction).
+        target_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "target_geom")
+        if target_geom < 0:
+            target_geom = object_geom_ids[0]
+        floor_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        episode_manifest["mujoco_contact_properties"] = {
+            "object_friction": model.geom_friction[target_geom].tolist(),
+            "floor_friction": None if floor_geom < 0 else model.geom_friction[floor_geom].tolist(),
+            "effective_sliding_friction": float(max(
+                model.geom_friction[target_geom][0],
+                0.0 if floor_geom < 0 else model.geom_friction[floor_geom][0],
+            )),
+            "object_solref": model.geom_solref[target_geom].tolist(),
+            "floor_solref": None if floor_geom < 0 else model.geom_solref[floor_geom].tolist(),
+            "solimp": model.geom_solimp[target_geom].tolist(),
+            "cone": "pyramidal" if int(model.opt.cone) == 0 else "elliptic",
         }
         write_json(episode_root / "episode_manifest.json", episode_manifest)
         save_rollout_gif(episode_root / "rgb", episode_root / "rollout.gif", args.fps)

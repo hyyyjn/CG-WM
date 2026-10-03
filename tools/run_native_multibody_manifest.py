@@ -28,6 +28,7 @@ from stage2.differentiable_complementarity_free_contact_dynamics import (
     MultiBodyGaussianImpedanceDynamics,
     MultiBodyImpedanceDynamicsConfig,
     RigidBodyState,
+    angular_velocity_body_to_world,
 )
 from stage2.scene_manifest import load_scene_manifest, manifest_summary
 from stage2.differentiable_gaussian_render_loss import (
@@ -130,6 +131,14 @@ def _state_path(manifest, body) -> Path:
 def _load_state(manifest, body, *, device: torch.device) -> RigidBodyState:
     payload = json.loads(_state_path(manifest, body).read_text(encoding="utf-8"))
     state_frame = body.initialization.get("state_frame")
+    # MuJoCo free joints store qvel[3:6] in the body frame; exports that carry
+    # raw ``qvel`` without an explicit ``angular_velocity_frame`` used that
+    # convention for ``angular_velocity`` as well.
+    body_frame_omega = (
+        payload.get("angular_velocity_frame") == "body"
+        or ("states" in payload and payload.get("angular_velocity_frame") is None
+            and any("qvel" in state for state in payload["states"][:1]))
+    )
     if "states" in payload:
         if state_frame is None:
             raise ValueError(
@@ -153,9 +162,13 @@ def _load_state(manifest, body, *, device: torch.device) -> RigidBodyState:
         )
     def tensor(name, default):
         return torch.tensor(payload.get(name, default), dtype=torch.float32, device=device)
+    quaternion = tensor("quaternion_wxyz", [1, 0, 0, 0])
+    angular_velocity = tensor("angular_velocity", [0, 0, 0])
+    if body_frame_omega:
+        angular_velocity = angular_velocity_body_to_world(quaternion, angular_velocity)
     return RigidBodyState(
-        tensor("position", [0, 0, 0]), tensor("quaternion_wxyz", [1, 0, 0, 0]),
-        tensor("linear_velocity", [0, 0, 0]), tensor("angular_velocity", [0, 0, 0]),
+        tensor("position", [0, 0, 0]), quaternion,
+        tensor("linear_velocity", [0, 0, 0]), angular_velocity,
     )
 
 
